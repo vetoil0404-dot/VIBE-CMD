@@ -40,13 +40,13 @@ Total Commander остаётся самым быстрым способом дв
 ## Скриншоты
 
 
-![Панели](docsFoto_1.jpg)
-![Панели](docsFoto_2.jpg)
-![Панели](docsFoto_3.jpg)
-![Панели](docsFoto_4.jpg)
-![Панели](docsFoto_5.jpg)
-![Панели](docsFoto_6.jpg)
-![Панели](docsFoto_7.jpg)
+![Панели](docs/Foto_1.jpg)
+![Панели](docs/Foto_2.jpg)
+![Панели](docs/Foto_3.jpg)
+![Панели](docs/Foto_4.jpg)
+![Панели](docs/Foto_5.jpg)
+![Панели](docs/Foto_6.jpg)
+![Панели](docs/Foto_7.jpg)
 
 
 
