@@ -1,379 +1,374 @@
 # V!BE CMD
 
-Двухпанельный файловый менеджер для Windows. Fluent-окно, выделение как в Total Commander, Quick View, который показывает файл, а не иконку.
+A dual-pane file manager for Windows. Fluent chrome, Total Commander–style selection, and a Quick View that shows the file — not just an icon.
 
+![Panels](docs/Foto.jpg)
 
-![Панели](docs/Foto.jpg)
+Windows · Delphi / FireMonkey · a daily driver, not a skin on top of `TListView`.
 
-
-Windows · Delphi / FireMonkey · повседневный инструмент, не демо-скин поверх `TListView`.
+Also: [Українською](README.uk.md) · [По-русски](README.ru.md)
 
 ---
 
-## Содержание
+## Contents
 
-- [Зачем](#зачем)
-- [Скриншоты](#скриншоты)
-- [Интерфейс](#интерфейс)
-- [Возможности](#возможности)
+- [Why](#why)
+- [Screenshots](#screenshots)
+- [Interface](#interface)
+- [Features](#features)
 - [Quick View](#quick-view)
-- [Горячие клавиши](#горячие-клавиши)
-- [Файловые операции](#файловые-операции)
-- [Настройки](#настройки)
-- [Стек](#стек)
-- [Сборка](#сборка)
-- [Зависимости рядом с exe](#зависимости-рядом-с-exe)
-- [Настройки на диске](#настройки-на-диске)
-- [Статус](#статус)
-- [Лицензия](#лицензия)
+- [Keyboard](#keyboard)
+- [File operations](#file-operations)
+- [Settings](#settings)
+- [Stack](#stack)
+- [Build](#build)
+- [Dependencies next to the exe](#dependencies-next-to-the-exe)
+- [On-disk settings](#on-disk-settings)
+- [Status](#status)
+- [License](#license)
 
 ---
 
-## Зачем
+## Why
 
-Total Commander остаётся самым быстрым способом двигать файлы. Проводник — оболочка, в которой живут все остальные. V!BE CMD стоит между ними: две панели, клавиатура первой, современная рамка, превью без фриза UI.
+Total Commander is still the fastest way to move files. Explorer is the shell everyone else lives in. V!BE CMD sits between them: two panes, keyboard first, a modern frame, previews that do not freeze the UI.
 
-Панели рисуются сами (`TPaintBox` + виртуальный список). Иконки и метаданные не читаются в цикле отрисовки.
-
----
-
-## Скриншоты
-
-
-![Панели](docs/Foto_1.jpg)
-![Панели](docs/Foto_2.jpg)
-![Панели](docs/Foto_3.jpg)
-![Панели](docs/Foto_4.jpg)
-![Панели](docs/Foto_5.jpg)
-![Панели](docs/Foto_6.jpg)
-![Панели](docs/Foto_7.jpg)
-
-
+Panes paint themselves (`TPaintBox` + a virtual list). Icons and metadata are not read on the paint path.
 
 ---
 
-## Интерфейс
+## Screenshots
 
-### Хром окна
+![Panels](docs/Foto_1.jpg)
+![Panels](docs/Foto_2.jpg)
+![Panels](docs/Foto_3.jpg)
+![Panels](docs/Foto_4.jpg)
+![Panels](docs/Foto_5.jpg)
+![Panels](docs/Foto_6.jpg)
+![Panels](docs/Foto_7.jpg)
 
-- Кастомный title bar в стиле Fluent: иконка, заголовок, быстрый поиск по центру, настройки, свернуть / развернуть / закрыть.
-- Тема: как в системе / светлая / тёмная. Акцент Windows подхватывается.
-- Материал окна: обычный / акрил / Mica (Windows 11).
-- Скруглённые углы через DWM.
+---
 
-### Макет
+## Interface
 
-Сверху вниз:
+### Window chrome
 
-1. **Title bar** — быстрый фильтр активной панели (`Ctrl+F` / `Ctrl+E`), история запросов.
-2. **Dock** — крупная полоса ярлыков (папки, файлы, exe). Принимает DnD, перестановка мышью, разделители, свои подписи и картинки. Битый путь (флешка / сеть пропала) — серая иконка, можно снять вручную. ЛКМ по папке открывает её в активной панели.
-3. **Drive bar** — диски и свободное место; помнит последний путь на каждом томе.
-4. **Две панели** с вкладками в стиле Chrome / Explorer (`+`, закрытие, перетаскивание).
-5. **Средняя колонка команд** — копировать, переместить, удалить, архив, новая папка, QV.
-6. **Строка статуса** — объект под курсором, размер выделения, диск.
+- Custom Fluent title bar: icon, caption, quick search in the center, settings, minimize / maximize / close.
+- Theme: follow system / light / dark. Windows accent color is picked up.
+- Window material: normal / Acrylic / Mica (Windows 11).
+- Rounded corners via DWM.
 
-Каждая панель независима: путь, вид, зум, сортировка, курсор сохраняются на вкладку и пишутся в ini.
+### Layout
 
-### Панель файлов
+Top to bottom:
 
-Два вида на одном компоненте:
+1. **Title bar** — live filter for the active pane (`Ctrl+F` / `Ctrl+E`), query history.
+2. **Dock** — large pin strip (folders, files, apps). Accepts drag-and-drop, mouse reorder, separators, custom captions and images. A dead path (USB / network gone) is a grey icon you can remove by hand. Left-click a folder pin to open it in the active pane.
+3. **Drive bar** — volumes and free space; remembers the last path per volume.
+4. **Two panes** with Chrome / Explorer-style tabs (`+`, close, drag-reorder).
+5. **Mid command column** — copy, move, delete, archive, new folder, QV.
+6. **Status bar** — item under the cursor, selection size, disk.
 
-| Вид | Поведение |
+Each pane is independent: path, view, zoom, sort, and cursor are stored per tab and written to the ini.
+
+### File pane
+
+Two views on one control:
+
+| View | Behavior |
 | --- | --- |
-| **Подробно** | иконка + имя без расширения слева; тип / размер / дата справа. При сужении окна дата сжимается (`дд.мм.гггг чч:мм` → `дд.мм.гг чч:мм` → `дд.мм.гг`), затем мета уходит на вторую строку, заголовки центрируются как у плиток. Колонка имени резиновая. |
-| **Плитки** | эскиз (`GetFileThumbnail` / кэш) + подпись. Для картинок на плитке — размер (`1200×1600`), для медиа — длительность. |
+| **Details** | Icon + name without extension on the left; type / size / date on the right. As the pane shrinks, the date compresses (`dd.mm.yyyy hh:mm` → `dd.mm.yy hh:mm` → `dd.mm.yy`), then metadata wraps to a second line and headers center like tiles. The name column is elastic. |
+| **Tiles** | Thumbnail (`GetFileThumbnail` / cache) + caption. Image tiles show size (`1200×1600`); media tiles show duration. |
 
-Общее:
+Shared:
 
-- `..` всегда первой строкой, если есть родитель.
-- Скрытые и системные — полупрозрачная иконка (если включены в настройках).
-- Живой зум отдельно для подробно и для плиток.
-- Breadcrumbs + правка пути на месте.
-- История назад / вперёд (`Alt+←` / `Alt+→`, кнопки мыши).
-- Фильтр с title bar применяется к активной панели мгновенно.
-- Owner-draw + пул видимых строк: на экране десятки элементов, не десять тысяч контролов.
-- Сетевые UNC (`\\host\share\…`) грузятся в фоне чанками. При обрыве список не сбрасывается на ноль; на строке `..` — статус «подключение / сервер не отвечает» и действие «пропустить».
-- Архивы открываются как папки (ZIP / TAR / GZ / 7z / RAR при наличии 7-Zip).
+- `..` is always the first row when a parent exists.
+- Hidden / system items use a dimmed icon (if enabled in settings).
+- Live zoom, separate for details and tiles.
+- Breadcrumbs + in-place path edit.
+- History back / forward (`Alt+←` / `Alt+→`, mouse buttons).
+- Title-bar filter applies to the active pane immediately.
+- Owner-draw + a pool of visible rows: dozens of items on screen, not ten thousand controls.
+- UNC shares (`\\host\share\…`) load in the background in chunks. On a drop-out the list is not reset to zero; the `..` row shows “connecting / server not responding” and a skip action.
+- Archives open as folders (ZIP / TAR / GZ / 7z / RAR when 7-Zip is present).
 
 ---
 
-## Возможности
+## Features
 
-### Выделение (правила Total Commander)
+### Selection (Total Commander rules)
 
-Курсор и мультивыделение разделены. Фокус не прыгает после `Insert`.
+Cursor and multi-select are separate. Focus does not jump after `Insert`.
 
-- `Insert` / `Space` — переключить и сдвинуть
-- `Shift` — диапазон, `Ctrl` — точечно
-- `+` / `-` — маска (`*.pas;*.inc`)
-- `Alt++` / `Alt+-` — тот же тип, что у курсора
-- `*` — инвертировать
-- `Ctrl+A` / `Ctrl+-` — всё / снять
-- Сравнить каталоги панелей
+- `Insert` / `Space` — toggle and step
+- `Shift` — range, `Ctrl` — pick
+- `+` / `-` — mask (`*.pas;*.inc`)
+- `Alt++` / `Alt+-` — same type as the cursor
+- `*` — invert
+- `Ctrl+A` / `Ctrl+-` — all / none
+- Compare pane directories
 
 ### Dock
 
-- Пины: папка, файл, приложение, разделитель
-- Drop на папку дока → копирование в неё
-- Drop на exe → открыть этими файлами
-- Свои иконки: сначала из exe / `.ico` / `desktop.ini` папки, без рамки, крупно. Пункт меню «Изменить картинку» (растр; SVG если Skia на месте)
-- Tooltip с подписью и полным путём
-- Выравнивание: влево / центр / свободно
-- Состояние пишется в ini без блокировки UI
+- Pins: folder, file, app, separator
+- Drop onto a dock folder → copy into it
+- Drop onto an exe → open with that app
+- Custom icons: prefer exe / `.ico` / folder `desktop.ini`, no frame, large. Context menu “Change picture” (raster; SVG if Skia is present)
+- Tooltip with caption and full path
+- Align: left / center / free
+- State is written to ini without blocking the UI
 
-### Поиск (`F4` / `Alt+F7`)
+### Search (`F4` / `Alt+F7`)
 
-Fluent-окно в стиле настроек, не системный `TEdit`.
+A Fluent window in the same style as Settings, not a stock `TEdit`.
 
-- Маска `*` `?` `;`
-- Рекурсия, диапазон дат изменения
-- Текст внутри файла (UTF-8 / ANSI)
-- Список результатов owner-draw
-- «Перейти» — активная панель на файл
-- «Файлы на панель» — виртуальный список хитов
-- «В фоне» — окно прячется, поиск идёт дальше
+- Mask `*` `?` `;`
+- Recurse, last-write date range
+- Text inside the file (UTF-8 / ANSI)
+- Owner-drawn result list
+- “Go” — active pane jumps to the hit
+- “Files to pane” — virtual list of hits
+- “Background” — window hides, search keeps running
 
-### Переименование
+### Rename
 
-- `F2` / `F9` — inline одно имя
-- Несколько выделенных → пакетное окно: маски `[N]`, `[C]`, даты, найти/заменить, коллизии видны до применения
+- `F2` / `F9` — inline single name
+- Several selected → batch window: masks `[N]`, `[C]`, dates, find/replace, collisions visible before apply
 
-### Буфер и DnD
+### Clipboard and drag-and-drop
 
-- `Ctrl+C` / `X` / `V` — файлы как в Проводнике
-- `Ctrl+V` над панелью, если в буфере картинка / PrintScreen — создать файл изображения в текущей папке и сразу превью для плитки
-- Drag между панелями, в Explorer, из браузера (URL / картинка качается в фоне)
-- Исходящий drag через `SHDoDragDrop`
+- `Ctrl+C` / `X` / `V` — files like Explorer
+- `Ctrl+V` over a pane with an image / PrintScreen in the clipboard — create an image file in the current folder and a tile preview
+- Drag between panes, to Explorer, from a browser (URL / image fetched in the background)
+- Outgoing drag via `SHDoDragDrop`
 
-### Архивы
+### Archives
 
-Виртуальная ФС внутри архива. Запись: ZIP, TAR, GZ, TGZ, 7z. RAR — чтение при наличии 7-Zip. `Alt+F5` пакует выделенное в архив на другую панель.
+Virtual file system inside the archive. Write: ZIP, TAR, GZ, TGZ, 7z. RAR — read if 7-Zip is present. `Alt+F5` packs the selection into an archive on the other pane.
 
-### Корзина
+### Recycle Bin
 
-Удаление через Shell `FOF_ALLOWUNDO`, если режим это позволяет. `Shift+Del` / настройка «навсегда» — без корзины.
+Delete goes through Shell `FOF_ALLOWUNDO` when the mode allows it. `Shift+Del` / “permanent” setting — no Recycle Bin.
 
 ---
 
 ## Quick View
 
-Два места: колонка внутри окна (`Ctrl+Q`) и отдельное окно (`F3`). Смена файла в панели сбрасывает несохранённые правки картинки тостом, не модалкой.
+Two places: an in-window column (`Ctrl+Q`) and a floating window (`F3`). Switching the file in the pane drops unsaved image edits with a toast, not a modal.
 
-| Семья | Что видно |
+| Family | What you see |
 | --- | --- |
-| Растр | JPEG / PNG / BMP / GIF / TIFF / WebP / TGA / ICO / CUR / HEIC / AVIF / JXL (если WIC/Skia есть) |
-| Вектор | SVG / SVGZ — Skia, зум векторный |
-| PDF / AI | PDFium, страницы, зум |
-| PSD / PSB | встроенный превью-ресурс |
-| Таблицы | свой грид xlsx / xlsm / xlsb / xls / csv / tsv — лимиты памяти, без падения на кривых книгах |
-| Документы | DOCX / ODT / RTF / Markdown страницами-листами |
-| Текст и код | два режима: листы А4 и моноширинный код (Cascadia / Consolas), подсветка JSON / XML / MD / Pas / JS, выделение и копирование |
-| HTML | WebView2 (Edge), страница как в браузере; исходник — текстовый режим |
-| Шрифты | карта глифов |
-| Архивы | листинг |
-| Медиа | MFPlay (видео в дочернем HWND с пропорциями). Аудио без окна. Вырезка фрагмента: WAV lossless / Media Foundation / `ffmpeg.exe` рядом с программой |
-| Hex | дамп, если тип не угадан |
-| Папка | карточка каталога: иконка, путь, размер, счётчики |
+| Raster | JPEG / PNG / BMP / GIF / TIFF / WebP / TGA / ICO / CUR / HEIC / AVIF / JXL (if WIC/Skia is there) |
+| Vector | SVG / SVGZ — Skia, vector zoom |
+| PDF / AI | PDFium, pages, zoom |
+| PSD / PSB | embedded preview resource |
+| Spreadsheets | own grid for xlsx / xlsm / xlsb / xls / csv / tsv — memory caps, no crash on broken workbooks |
+| Documents | DOCX / ODT / RTF / Markdown as page sheets |
+| Text and code | two modes: A4 sheets and monospace code (Cascadia / Consolas), highlight for JSON / XML / MD / Pas / JS, select and copy |
+| HTML | WebView2 (Edge), page as in a browser; source is the text mode |
+| Fonts | glyph map |
+| Archives | listing |
+| Media | MFPlay (video in a child HWND, aspect preserved). Audio with no window. Clip export: lossless WAV / Media Foundation / `ffmpeg.exe` next to the app |
+| Hex | dump if the type is unknown |
+| Folder | directory card: icon, path, size, counts |
 
-Плитки используют те же конвейеры через `uThumbCache` (RAM LRU + stamp по размеру/дате). Текст на плитке — мини-лист А4, как у DOCX.
+Tiles use the same pipelines through `uThumbCache` (RAM LRU + size/date stamp). A text tile is a mini A4 sheet, same as DOCX.
 
-### Мини-редактор картинки (в QV)
+### Mini image editor (in QV)
 
-Правки идут в буфер `FImgWork`. Исходник на диске не трогается, пока нет Save.
+Edits go into the `FImgWork` buffer. The file on disk is untouched until Save.
 
-- Поворот 90° L/R, отражение H/V
-- Размер с lock пропорций
-- Кроп прямоугольником (Enter / Esc)
-- Save As: PNG / JPEG / BMP / WEBP, SVG→PDF, сборка ICO 16/32/48/256
-- Лента кадров ICO/CUR
-- Если сигнатура не совпадает с расширением — баннер «переименовать»
+- Rotate 90° L/R, flip H/V
+- Resize with aspect lock
+- Rectangle crop (Enter / Esc)
+- Save As: PNG / JPEG / BMP / WEBP, SVG→PDF, ICO build 16/32/48/256
+- ICO/CUR frame strip
+- If the signature does not match the extension — a “rename” banner
 
 ---
 
-## Горячие клавиши
+## Keyboard
 
-| Клавиша | Действие |
+| Key | Action |
 | --- | --- |
-| `Tab` | Другая панель |
-| `Enter` / `Backspace` | Войти / вверх |
-| `F2` / `F9` | Переименовать (пакет, если выделено много) |
-| `F3` | Окно Quick View |
-| `F4` / `Alt+F7` | Поиск файлов |
-| `F5` / `F6` | Копировать / переместить |
-| `Alt+F5` | В архив |
-| `F7` | Новая папка |
-| `F8` / `Del` | Удалить (`Shift` — навсегда) |
-| `Ctrl+Q` | QV колонкой |
-| `Ctrl+F` / `Ctrl+E` | Быстрый фильтр на title bar |
-| `Ctrl+A` / `Ctrl+-` | Выделить всё / снять |
-| `+` / `-` | Маска выделить / снять |
-| `Alt++` / `Alt+-` | Тот же тип |
-| `*` | Инвертировать |
-| `Insert` / `Space` | Toggle + шаг |
-| `Alt+←` / `Alt+→` | История панели |
-| `Ctrl+Shift+F1` | Подробно ↔ плитки |
-| `Ctrl+C` `X` `V` | Буфер |
-| `Esc` | Закрыть диалог / отмена операции |
+| `Tab` | Other pane |
+| `Enter` / `Backspace` | Open / up |
+| `F2` / `F9` | Rename (batch if many selected) |
+| `F3` | Quick View window |
+| `F4` / `Alt+F7` | File search |
+| `F5` / `F6` | Copy / move |
+| `Alt+F5` | Pack to archive |
+| `F7` | New folder |
+| `F8` / `Del` | Delete (`Shift` — permanent) |
+| `Ctrl+Q` | In-pane QV |
+| `Ctrl+F` / `Ctrl+E` | Quick filter on the title bar |
+| `Ctrl+A` / `Ctrl+-` | Select all / none |
+| `+` / `-` | Mask select / unselect |
+| `Alt++` / `Alt+-` | Same type |
+| `*` | Invert |
+| `Insert` / `Space` | Toggle + step |
+| `Alt+←` / `Alt+→` | Pane history |
+| `Ctrl+Shift+F1` | Details ↔ tiles |
+| `Ctrl+C` `X` `V` | Clipboard |
+| `Esc` | Close dialog / cancel operation |
 
-В окне конфликта V!be: `R` заменить, `S` пропустить, `A` автоимя, `N` новее, `Esc` отмена.
+In the V!be conflict window: `R` replace, `S` skip, `A` auto-name, `N` newer, `Esc` cancel.
 
 ---
 
-## Файловые операции
+## File operations
 
-Три режима в настройках:
+Three modes in settings:
 
-| Режим | Поведение |
+| Mode | Behavior |
 | --- | --- |
-| **V!be** (по умолчанию) | Свой движок + плавающее окно прогресса: пауза, пропуск, фон, очередь. Конфликт имени на том же окне: два превью, «новее», «для всех». |
-| **Тихий** | Без progress и без диалогов Shell. Пачка конфликтов — `uConflictDialog` с превью. Сначала уходят файлы без коллизий, конфликты — вторым проходом. |
-| **Проводник** | `SHFileOperation` с родными окнами Windows. |
+| **V!be** (default) | Own engine + floating progress: pause, skip, background, queue. Name conflict on the same window: two previews, “newer”, “apply to all”. |
+| **Quiet** | No progress and no Shell dialogs. Conflict batch uses `uConflictDialog` with previews. Clean files go first; collisions are a second pass. |
+| **Explorer** | `SHFileOperation` with native Windows dialogs. |
 
-Общая логика копирования списков:
+Copying a list:
 
-1. Обычные файлы идут сразу.
-2. Коллизия имени — в очередь конфликтов, не останавливает пачку.
-3. После успеха выделение с исходника снимается.
-4. DnD-копирование показывает лоадер на кнопке и снимает выделение по мере файлов.
+1. Ordinary files go immediately.
+2. A name clash is queued — it does not stop the batch.
+3. After success, selection is cleared on the source.
+4. Drag-copy shows a loader on the copy button and clears selection as files finish.
 
-Нельзя перезаписать исходник самим собой. Офисные `~$lock` не копируются как полезные объекты.
-
----
-
-## Настройки
-
-Окно карточками, без VCL-контролов.
-
-- Тема и материал окна
-- Показ дока / дисков / mid-bar / статуса / Fn
-- Скрытые и системные файлы
-- Шрифт списка (Segoe UI, 10–22)
-- Иконки на вкладках, равная ширина вкладок
-- Кэш превью: вкл/выкл, лимит 50–4000
-- Режим файловых операций
-- Геометрия окна и позиция сплиттера
-
-Файл: `VibeSetting.ini` рядом с exe. Старый `TCClone.ini` читается как одна вкладка на панель.
+A file cannot overwrite itself. Office `~$lock` files are not treated as useful objects.
 
 ---
 
-## Стек
+## Settings
+
+Card-based window, no VCL edits.
+
+- Theme and window material
+- Show dock / drives / mid-bar / status / Fn
+- Hidden and system files
+- List font (Segoe UI, 10–22)
+- Icons on tabs, equal tab width
+- Thumb cache: on/off, limit 50–4000
+- File-operation mode
+- Window geometry and splitter position
+
+File: `VibeSetting.ini` next to the exe. Legacy `TCClone.ini` is read as one tab per pane.
+
+---
+
+## Stack
 
 ```
-uMain                 окно, mid-bar, клавиши, title search
-uFilePanel            owner-draw панель + вкладки + двухстрочный details
-uCustomTabs           вкладки Chrome / Explorer
-uFileModel            поток листинга, shell / zip / UNC / MTP
-FileSelectionManager  курсор ≠ выделение
-uLaunchDock           док
-uFilePreview          маршрутизатор QV
-uQuickViewForm        отдельное окно F3
-uThumbCache           асинхронные эскизы
-uIconCache            иконки по расширению (горячий путь отрисовки)
-uMetaCache            WxH и длительность для плиток
-uSpreadsheet*         xlsx / csv грид
-uDocument*            docx / odt / страницы
-uTextCode / uCodeView текст и код
+uMain                 window, mid-bar, keys, title search
+uFilePanel            owner-draw pane + tabs + two-line details
+uCustomTabs           Chrome / Explorer tabs
+uFileModel            listing thread, shell / zip / UNC / MTP
+FileSelectionManager  cursor ≠ selection
+uLaunchDock           dock
+uFilePreview          QV router
+uQuickViewForm        floating F3 window
+uThumbCache           async thumbs
+uIconCache            icons by extension (paint hot path)
+uMetaCache            WxH and duration for tiles
+uSpreadsheet*         xlsx / csv grid
+uDocument*            docx / odt / pages
+uTextCode / uCodeView text and code
 uPdfium               pdf / ai
 uPsdPreview           psd / psb
 uMpvPlayer            MFPlay + MCI wav
-uArchiveEngine        виртуальная ФС архива
-uFileOps + Engine     три режима операций
-uConflictDialog       тихие конфликты
-uFileOpProgressForm   прогресс V!be
+uArchiveEngine        virtual archive FS
+uFileOps + Engine     three operation modes
+uConflictDialog       quiet conflicts
+uFileOpProgressForm   V!be progress
 uSearchForm           Alt+F7
 uFluent*              edit, combo, date, chrome, scrollbar
-uThemeManager         свет / тьма / акцент
+uThemeManager         light / dark / accent
 uAppSettings          ini
 uDirWatcher           FindFirstChangeNotification
-uWinShellMenu         контекстное меню оболочки
-uWinFileDrag          исходящий drag
-uWinBrowserDrop       drop из браузера
-uClipboardImage       PrintScreen → файл
-uImageSniff           сигнатура vs расширение
+uWinShellMenu         shell context menu
+uWinFileDrag          outgoing drag
+uWinBrowserDrop       drop from a browser
+uClipboardImage       PrintScreen → file
+uImageSniff           signature vs extension
 ```
 
-Delphi 12 / 13 · FMX Win32 или Win64. Shell и `IFileOperation` остаются на Win32. В paint-пути нет `SHGetFileInfo`.
+Delphi 12 / 13 · FMX Win32 or Win64. Shell and `IFileOperation` stay on Win32. There is no `SHGetFileInfo` on the paint path.
 
 ---
 
-## Сборка
+## Build
 
-1. RAD Studio 12 или 13, платформа **Windows 32/64 — FireMonkey**.
-2. Открой `.dpr` / project group.
-3. Skia4Delphi — если в проекте включён `GlobalUseSkia` (SVG, часть превью).
-4. Собери Release. Отладчик на больших сетевых папках будет врать про скорость — мерить в Run without debugging.
-
-Минимальный набор юнитов — снимок `artifacts/vibe_final_2026-09-25/`: `part1` база, `part2` и `part3` перекрывают более новые копии одноимённых файлов.
+1. RAD Studio 12 or 13, target **Windows 32/64 — FireMonkey**.
+2. Open the `.dpr` / project group.
+3. Skia4Delphi — if the project has `GlobalUseSkia` (SVG, part of preview).
+4. Build Release. The debugger lies about speed on large network folders — measure with Run without debugging.
 
 ---
 
-## Зависимости рядом с exe
+## Dependencies next to the exe
 
-Ничего из этого не обязательно для старта панелей.
+None of these are required to start the panes.
 
-| Файл | Зачем |
+| File | Why |
 | --- | --- |
-| `pdfium.dll` | PDF / AI в QV и на плитках |
-| Skia runtime | SVG, часть растра, анимации webp/gif/lottie |
-| `ffmpeg.exe` | вырезка медиа в исходном контейнере (gyan.dev essentials) |
-| `7z.exe` / `7za.exe` | 7z / rar листинг и упаковка |
+| `pdfium.dll` | PDF / AI in QV and on tiles |
+| Skia runtime | SVG, some raster, webp/gif/lottie animation |
+| `ffmpeg.exe` | media clip in the source container (gyan.dev essentials) |
+| `7z.exe` / `7za.exe` | 7z / rar listing and packing |
 
-Без них соответствующие форматы деградируют в иконку + info, программа не падает.
+Without them those formats fall back to an icon + info. The app does not crash.
 
-WebView2 Runtime нужен для HTML-страницы в QV. Если движка нет — показывается исходник.
+WebView2 Runtime is needed for an HTML *page* in QV. If the engine is missing, source view is used.
 
 ---
 
-## Настройки на диске
+## On-disk settings
 
 ```
-VibeSetting.ini     тема, панели, вкладки, док, история поиска
+VibeSetting.ini     theme, panes, tabs, dock, search history
 ```
 
-Кэш превью — в памяти процесса (LRU). На диск дамп таблиц не пишется: превью листа считается заново, полный грид — только в QV.
+The thumb cache lives in process memory (LRU). Spreadsheet dumps are not written to disk: a sheet thumb is recomputed; the full grid exists only in QV.
 
 ---
 
-## Статус
+## Status
 
-Рабочий дневной инструмент. Панели, док, QV, поиск и операции используются постоянно.
+A working daily tool. Panes, dock, QV, search, and operations are in regular use.
 
-Известные края:
+Known edges:
 
-- Очень большие UNC (тысячи фото) — фон + догрузка, не мгновенный полный листинг как у локального SSD.
-- Часть системных folder-thumbnails приходит от Shell с чёрным/белым фоном — это поведение Windows, не только V!BE.
-- Старый IE-fallback для HTML не целевой; цель — Edge WebView2.
-
----
-
-## Имя
-
-**V!BE CMD** — commander с пульсом. Восклицательный знак — акцент, его оставлять в логотипе.
+- Very large UNC folders (thousands of photos) — background + incremental fill, not an instant full listing like a local SSD.
+- Some system folder thumbnails come from the Shell with a black/white background — that is Windows, not only V!BE.
+- The old IE fallback for HTML is not the target; Edge WebView2 is.
 
 ---
 
-## Лицензия
+## Name
 
-MIT. См. [LICENSE](LICENSE).
+**V!BE CMD** — a commander with a pulse. Keep the bang in the logo.
 
-Иконки Segoe Fluent Icons — часть Windows. PDFium / Skia / ffmpeg / 7-Zip живут под своими лицензиями, в репозиторий исходников они не входят.
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Segoe Fluent Icons are part of Windows. PDFium / Skia / ffmpeg / 7-Zip keep their own licenses and are not part of the source tree.
 
 ---
 
 ## Contributing
 
-Пока репозиторий личный. Если открываешь issue:
+The repo is personal for now. If you open an issue, include:
 
-- Windows-версия и Delphi
-- локальный диск или UNC
-- режим панели (подробно / плитки) и режим операций (V!be / тихий / проводник)
-- файл, на котором падает QV, если можно отдать
+- Windows version and Delphi
+- local disk or UNC
+- pane mode (details / tiles) and operation mode (V!be / quiet / Explorer)
+- a file that crashes QV, if you can share it
 
-Не присылай пароли, токены и чужие документы с персональными данными.
+Do not send passwords, tokens, or other people’s documents with personal data.
 
 ---
 
 <p align="center">
-  <sub>Харків · для тех, кто живёт в двух панелях</sub>
+  <sub>Kharkiv · built for people who live in two panes</sub>
 </p>
