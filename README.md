@@ -6,7 +6,7 @@ A dual-pane file manager for Windows. Fluent chrome, Total Commander–style sel
 
 Windows · Delphi / FireMonkey · a daily driver, not a skin on top of `TListView`.
 
-Also: [Українською](README.uk.md) · [По-русски](README.ru.md)
+Also: [Українською](README.ua.md) ·
 
 ---
 
