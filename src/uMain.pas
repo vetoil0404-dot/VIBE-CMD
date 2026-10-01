@@ -6,15 +6,17 @@ uses
 Winapi.Windows, Winapi.Messages, Winapi.DwmApi, Winapi.UxTheme,
   Winapi.ShlObj, System.Win.ComObj, FMX.Platform.Win,
   System.SysUtils, System.Classes, System.UITypes, System.IOUtils, System.Types,
+  System.Generics.Collections,
   FMX.Forms, FMX.Types, FMX.Layouts, FMX.StdCtrls, FMX.Objects,
   FMX.Controls, FMX.ListBox, FMX.Graphics, FMX.Dialogs, System.Math,
+  FMX.TextLayout, FMX.Effects,
   FileSelectionManager,
 
   uAppSettings, uThemeManager, uFluentChrome, uFluentEdit, uFluentComboBox,
   uFilePanel, uThumbCache,
   uIconCache, uMetaCache,
   uQuickViewForm, uLaunchDock,
-  uSettingsForm, uFileOps, uFileModel, UCoreEngine, uMultiRenameForm, uSearchForm
+  uSettingsForm, uFileOps, uFileOpEngine, uFileModel, UCoreEngine, uMultiRenameForm, uSearchForm
   , uWinBrowserDrop;
 
 type
@@ -58,6 +60,18 @@ type
     FCmdSelect: TFluentButton;
     FSelMenu: TFluentPopupMenu;
     FLastSelectMask: string;
+    FOpPill: TRectangle;
+    FOpPillIcon: TText;
+    FOpPillText: TText;
+    FOpPillArc: TPaintBox;
+    FOpPop: TPopup;
+    FOpHost: TRectangle;
+    FOpBody: TLayout;
+    FOpRows: TObjectList<TObject>;
+    FOpTimer: TTimer;
+    FOpScrollY: Single;
+    FOpViewH: Single;
+    FMidStackH: Single;
 
     FFnBar: TRectangle;
     FFnCells: array[0..6] of TLayout;
@@ -120,6 +134,24 @@ type
     procedure ApplyLeftPanelWidth(AWidth: Single);
     function CenterBandWidth: Single;
     procedure ApplyCenterBandLayout;
+    procedure BuildOpPill;
+    procedure LayoutMidButtons;
+    procedure LayoutOpPill;
+    procedure RefreshOpUi;
+    procedure OpHubChanged(Sender: TObject);
+    procedure OpTick(Sender: TObject);
+    procedure OpPillClick(Sender: TObject);
+    procedure OpPillPaint(Sender: TObject; Canvas: TCanvas);
+    procedure ToggleOpPop;
+    procedure OpenOpPop;
+    procedure SyncOpRows;
+    procedure OpRowClick(Sender: TObject);
+    procedure OpRowCloseClick(Sender: TObject);
+    procedure OpRowEnter(Sender: TObject);
+    procedure OpRowLeave(Sender: TObject);
+    procedure OpWheel(Sender: TObject; Shift: TShiftState; WheelDelta: Integer;
+      var Handled: Boolean);
+    function OpenBackgroundKind(AKind: TFileOpKind): Boolean;
     function MakeMidButton(const AIcon, AHint: string; AOnClick: TNotifyEvent): TFluentButton;
     function MakeSideSplitter(AAlign: TAlignLayout): TRectangle;
 
@@ -246,6 +278,9 @@ function TryActivateRunningInstance: Boolean;
 procedure StartupLog(const AStage: string);
 
 implementation
+
+uses
+  uFileOpProgressForm;
 
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
@@ -409,10 +444,17 @@ begin
   FStaleTimer.OnTimer := StartupStaleTick;
   FQuickView := nil;
   FChromeWatch := nil;
+  SetFileOpHubChanged(OpHubChanged);
+  if Assigned(FOpTimer) then
+    FOpTimer.Enabled := True;
 end;
 
 destructor TMainForm.Destroy;
 begin
+  SetFileOpHubChanged(nil);
+  if Assigned(FOpTimer) then
+    FOpTimer.Enabled := False;
+  FreeAndNil(FOpRows);
   CancelListFileOps;
   if Assigned(FSearchForm) then
   begin
@@ -1552,6 +1594,8 @@ begin
   UpdateViewButtons;
   if AFocus and APanel.CanFocus then
     APanel.SetFocus;
+  if Assigned(FOpPill) and FOpPill.Visible and (FOpPill.Parent <> FMidBar) then
+    LayoutOpPill;
 end;
 
 procedure TMainForm.SearchChanged(Sender: TObject);
@@ -1843,6 +1887,727 @@ begin
     FSplitGripR := Grip;
 end;
 
+type
+  TOpRow = class
+  public
+    Id: Integer;
+    Box: TRectangle;
+    Ico: TText;
+    Title: TText;
+    Sub: TText;
+    Pct: TText;
+    Track: TRectangle;
+    Fill: TRectangle;
+    XBtn: TRectangle;
+  end;
+
+function MeasurePillText(const AText: string; ASize: Single): Single;
+var
+  L: TTextLayout;
+begin
+  Result := 40;
+  if AText = '' then
+    Exit;
+  L := TTextLayoutManager.DefaultTextLayout.Create;
+  try
+    L.Font.Family := FluentFontFamily;
+    L.Font.Size := ASize;
+    L.Text := AText;
+    Result := L.TextWidth;
+  finally
+    L.Free;
+  end;
+end;
+
+function OpCountWord(N: Integer): string;
+var
+  M: Integer;
+begin
+  M := N mod 100;
+  if (M >= 11) and (M <= 14) then
+    Result := Format('%d операций', [N])
+  else
+    case N mod 10 of
+      1: Result := Format('%d операция', [N]);
+      2, 3, 4: Result := Format('%d операции', [N]);
+    else
+      Result := Format('%d операций', [N]);
+    end;
+end;
+
+procedure TMainForm.OpHubChanged(Sender: TObject);
+begin
+  RefreshOpUi;
+end;
+
+procedure TMainForm.OpTick(Sender: TObject);
+begin
+  FileOpHubPumpViews;
+  RefreshOpUi;
+end;
+
+procedure TMainForm.RefreshOpUi;
+begin
+  LayoutOpPill;
+  if Assigned(FOpPop) and FOpPop.IsOpen then
+    SyncOpRows;
+end;
+
+procedure TMainForm.LayoutMidButtons;
+var
+  Y0, Avail, Y: Single;
+begin
+  if not Assigned(FMidBar) or not Assigned(FMidGroup) then
+    Exit;
+  Y0 := 4;
+  if Assigned(FOpPill) and FOpPill.Visible and (FOpPill.Parent = FMidBar) then
+    Y0 := 4 + 28 + 6;
+  if FMidStackH <= 0 then
+    FMidStackH := FMidGroup.Height;
+  Avail := FMidBar.Height - Y0;
+  if Avail < FMidStackH then
+    Y := Y0
+  else
+    Y := Y0 + (Avail - FMidStackH) / 2;
+  FMidGroup.Align := TAlignLayout.None;
+  FMidGroup.SetBounds(0, Y, MIDBAR_WIDTH, FMidStackH);
+end;
+
+procedure TMainForm.OpPillClick(Sender: TObject);
+begin
+  ToggleOpPop;
+end;
+
+procedure TMainForm.ToggleOpPop;
+begin
+  if not Assigned(FOpPop) then
+    Exit;
+  if FOpPop.IsOpen then
+    FOpPop.IsOpen := False
+  else
+    OpenOpPop;
+end;
+
+function TMainForm.OpenBackgroundKind(AKind: TFileOpKind): Boolean;
+begin
+  Result := (GetFileOpMode = fomVibe) and FileOpHubHasBackground(AKind);
+  if Result then
+    ToggleOpPop;
+end;
+
+procedure TMainForm.OpPillPaint(Sender: TObject; Canvas: TCanvas);
+var
+  R: TRectF;
+  V: TFileOpJobView;
+  StartA, Sweep: Single;
+begin
+  if not Assigned(FOpPillArc) or not FOpPillArc.Visible then
+    Exit;
+  if FileOpHubCount <> 1 then
+    Exit;
+  V := FileOpHubView(0);
+  if V.Danger then
+    Exit;
+  R := TRectF.Create(2, 2, FOpPillArc.Width - 2, FOpPillArc.Height - 2);
+  Canvas.Stroke.Kind := TBrushKind.Solid;
+  Canvas.Stroke.Thickness := 2;
+  Canvas.Stroke.Color := FColors.SelectionColor;
+  Canvas.Fill.Kind := TBrushKind.None;
+  if V.Indeterminate then
+  begin
+    StartA := FileOpHubSpin;
+    Sweep := 90;
+  end
+  else
+  begin
+    StartA := -90;
+    Sweep := 360 * V.Percent / 100;
+    if Sweep < 2 then
+      Sweep := 2;
+  end;
+  Canvas.DrawArc(R.CenterPoint, TPointF.Create(R.Width / 2, R.Height / 2),
+    StartA, Sweep, 1);
+end;
+
+procedure TMainForm.OpRowEnter(Sender: TObject);
+begin
+  if Sender is TRectangle then
+    TRectangle(Sender).Fill.Color := FColors.ItemHover;
+end;
+
+procedure TMainForm.OpRowLeave(Sender: TObject);
+begin
+  if Sender is TRectangle then
+    TRectangle(Sender).Fill.Color := TAlphaColors.Null;
+end;
+
+procedure TMainForm.OpRowClick(Sender: TObject);
+var
+  Id: Integer;
+begin
+  if not (Sender is TFmxObject) then
+    Exit;
+  Id := TFmxObject(Sender).Tag;
+  if Assigned(FOpPop) then
+    FOpPop.IsOpen := False;
+  FileOpHubRestore(Id);
+end;
+
+procedure TMainForm.OpRowCloseClick(Sender: TObject);
+var
+  Id: Integer;
+begin
+  if not (Sender is TFmxObject) then
+    Exit;
+  Id := TFmxObject(Sender).Tag;
+  FileOpHubDismiss(Id);
+  RefreshOpUi;
+end;
+
+procedure TMainForm.OpWheel(Sender: TObject; Shift: TShiftState;
+  WheelDelta: Integer; var Handled: Boolean);
+var
+  MaxY: Single;
+begin
+  Handled := True;
+  if FileOpHubCount <= 1 then
+    Exit;
+  if WheelDelta > 0 then
+    FOpScrollY := FOpScrollY - 56
+  else
+    FOpScrollY := FOpScrollY + 56;
+  MaxY := FileOpHubCount * 56 - FOpViewH;
+  if MaxY < 0 then
+    MaxY := 0;
+  if FOpScrollY < 0 then
+    FOpScrollY := 0;
+  if FOpScrollY > MaxY then
+    FOpScrollY := MaxY;
+  if Assigned(FOpBody) then
+    FOpBody.Position.Y := -FOpScrollY;
+end;
+
+procedure TMainForm.SyncOpRows;
+const
+  RowH = 56;
+  BodyW = 320;
+var
+  I, N: Integer;
+  V: TFileOpJobView;
+  R: TOpRow;
+  Same: Boolean;
+  XCap: TText;
+  BarW: Single;
+begin
+  if not Assigned(FOpBody) or not Assigned(FOpRows) then
+    Exit;
+  N := FileOpHubCount;
+  Same := FOpRows.Count = N;
+  if Same then
+    for I := 0 to N - 1 do
+      if TOpRow(FOpRows[I]).Id <> FileOpHubView(I).Id then
+      begin
+        Same := False;
+        Break;
+      end;
+  if not Same then
+  begin
+    for I := FOpRows.Count - 1 downto 0 do
+    begin
+      R := TOpRow(FOpRows[I]);
+      FreeAndNil(R.Box);
+    end;
+    FOpRows.Clear;
+    for I := 0 to N - 1 do
+    begin
+      V := FileOpHubView(I);
+      R := TOpRow.Create;
+      R.Id := V.Id;
+      R.Box := TRectangle.Create(Self);
+      R.Box.Parent := FOpBody;
+      R.Box.Align := TAlignLayout.None;
+      R.Box.Stroke.Kind := TBrushKind.None;
+      R.Box.Fill.Color := TAlphaColors.Null;
+      R.Box.HitTest := True;
+      R.Box.Cursor := crHandPoint;
+      R.Box.Tag := V.Id;
+      R.Box.OnClick := OpRowClick;
+      R.Box.OnMouseEnter := OpRowEnter;
+      R.Box.OnMouseLeave := OpRowLeave;
+      R.Box.OnMouseWheel := OpWheel;
+
+      R.Ico := TText.Create(Self);
+      R.Ico.Parent := R.Box;
+      R.Ico.Align := TAlignLayout.None;
+      R.Ico.HitTest := False;
+      R.Ico.SetBounds(8, 8, 18, 18);
+      R.Ico.TextSettings.Font.Family := FluentIconFamily;
+      R.Ico.TextSettings.Font.Size := 14;
+      R.Ico.TextSettings.HorzAlign := TTextAlign.Center;
+      R.Ico.TextSettings.VertAlign := TTextAlign.Center;
+
+      R.Title := TText.Create(Self);
+      R.Title.Parent := R.Box;
+      R.Title.Align := TAlignLayout.None;
+      R.Title.HitTest := False;
+      R.Title.SetBounds(32, 6, BodyW - 120, 18);
+      ApplyFluentText(R.Title, 13, True);
+      R.Title.TextSettings.HorzAlign := TTextAlign.Leading;
+      R.Title.TextSettings.VertAlign := TTextAlign.Center;
+      R.Title.TextSettings.Trimming := TTextTrimming.Character;
+      R.Title.TextSettings.WordWrap := False;
+
+      R.Sub := TText.Create(Self);
+      R.Sub.Parent := R.Box;
+      R.Sub.Align := TAlignLayout.None;
+      R.Sub.HitTest := False;
+      R.Sub.SetBounds(32, 24, BodyW - 48, 16);
+      ApplyFluentText(R.Sub, 11, False);
+      R.Sub.TextSettings.HorzAlign := TTextAlign.Leading;
+      R.Sub.TextSettings.VertAlign := TTextAlign.Center;
+      R.Sub.TextSettings.Trimming := TTextTrimming.Character;
+      R.Sub.TextSettings.WordWrap := False;
+
+      R.Pct := TText.Create(Self);
+      R.Pct.Parent := R.Box;
+      R.Pct.Align := TAlignLayout.None;
+      R.Pct.HitTest := False;
+      R.Pct.SetBounds(BodyW - 78, 8, 42, 16);
+      ApplyFluentText(R.Pct, 11, False);
+      R.Pct.TextSettings.HorzAlign := TTextAlign.Trailing;
+      R.Pct.TextSettings.VertAlign := TTextAlign.Center;
+
+      R.XBtn := TRectangle.Create(Self);
+      R.XBtn.Parent := R.Box;
+      R.XBtn.Align := TAlignLayout.None;
+      R.XBtn.SetBounds(BodyW - 30, 6, 22, 22);
+      R.XBtn.XRadius := 4;
+      R.XBtn.YRadius := 4;
+      R.XBtn.Stroke.Kind := TBrushKind.None;
+      R.XBtn.Fill.Color := TAlphaColors.Null;
+      R.XBtn.HitTest := True;
+      R.XBtn.Cursor := crHandPoint;
+      R.XBtn.Tag := V.Id;
+      R.XBtn.OnClick := OpRowCloseClick;
+      XCap := TText.Create(Self);
+      XCap.Parent := R.XBtn;
+      XCap.Align := TAlignLayout.Client;
+      XCap.HitTest := False;
+      XCap.Text := #$E8BB;
+      XCap.TextSettings.Font.Family := FluentIconFamily;
+      XCap.TextSettings.Font.Size := 10;
+      XCap.TextSettings.HorzAlign := TTextAlign.Center;
+      XCap.TextSettings.VertAlign := TTextAlign.Center;
+
+      R.Track := TRectangle.Create(Self);
+      R.Track.Parent := R.Box;
+      R.Track.Align := TAlignLayout.None;
+      R.Track.SetBounds(32, 48, BodyW - 44, 3);
+      R.Track.XRadius := 1.5;
+      R.Track.YRadius := 1.5;
+      R.Track.Stroke.Kind := TBrushKind.None;
+      R.Track.HitTest := False;
+      R.Track.ClipChildren := True;
+      R.Fill := TRectangle.Create(Self);
+      R.Fill.Parent := R.Track;
+      R.Fill.Align := TAlignLayout.Left;
+      R.Fill.Width := 0;
+      R.Fill.Stroke.Kind := TBrushKind.None;
+      R.Fill.HitTest := False;
+      FOpRows.Add(R);
+    end;
+  end;
+
+  FOpBody.Width := BodyW;
+  FOpBody.Height := N * RowH;
+  if FOpBody.Position.Y <> -FOpScrollY then
+    FOpBody.Position.Y := -FOpScrollY;
+  for I := 0 to FOpRows.Count - 1 do
+  begin
+    R := TOpRow(FOpRows[I]);
+    if I > N - 1 then
+      Continue;
+    V := FileOpHubView(I);
+    R.Box.SetBounds(0, I * RowH, BodyW, RowH);
+    R.Ico.Text := V.IconText;
+    R.Title.Text := V.Title;
+    R.Sub.Text := V.Detail;
+    R.Pct.Text := V.PercentText;
+    R.Title.TextSettings.FontColor := FColors.TextColor;
+    R.Sub.TextSettings.FontColor := FColors.SubTextColor;
+    R.Pct.TextSettings.FontColor := FColors.SubTextColor;
+    R.Ico.TextSettings.FontColor := FColors.TextColor;
+    if Assigned(R.XBtn) and (R.XBtn.ChildrenCount > 0) and
+       (R.XBtn.Children[0] is TText) then
+      TText(R.XBtn.Children[0]).TextSettings.FontColor := FColors.SubTextColor;
+    if V.Danger then
+    begin
+      R.Title.TextSettings.FontColor := FColors.DangerColor;
+      R.Fill.Fill.Color := FColors.DangerColor;
+    end
+    else
+      R.Fill.Fill.Color := FColors.SelectionColor;
+    R.Track.Fill.Color := FColors.ControlFill;
+    BarW := R.Track.Width;
+    if V.State = jsQueued then
+      R.Fill.Width := 0
+    else if V.Indeterminate then
+      R.Fill.Width := BarW * 0.25
+    else
+      R.Fill.Width := BarW * V.Percent / 100;
+  end;
+end;
+
+procedure TMainForm.OpenOpPop;
+const
+  BodyW = 320;
+  RowH = 56;
+  PadL = 18;
+  PadT = 14;
+  PadR = 18;
+  PadB = 22;
+var
+  N, Vis: Integer;
+  H, Room: Single;
+  OpenRight: Boolean;
+begin
+  N := FileOpHubCount;
+  if (N = 0) or not Assigned(FOpPop) or not Assigned(FOpPill) then
+    Exit;
+  FOpScrollY := 0;
+  Vis := N;
+  if Vis > 5 then
+    Vis := 5;
+  H := Vis * RowH;
+  if FOpPill.Parent <> FMidBar then
+  begin
+    Room := FOpPill.AbsoluteRect.Top - 12;
+    if (Room > RowH) and (H > Room) then
+      H := Room;
+  end;
+  FOpViewH := H;
+  SyncOpRows;
+  FOpPop.Width := BodyW + PadL + PadR;
+  FOpPop.Height := H + PadT + PadB;
+  FOpPop.PlacementTarget := FOpPill;
+  if FOpPill.Parent = FMidBar then
+  begin
+    OpenRight := Assigned(FActivePanel) and (FActivePanel = FLeftPanel);
+    if OpenRight then
+      FOpPop.Placement := TPlacement.RightCenter
+    else
+      FOpPop.Placement := TPlacement.LeftCenter;
+    FOpPop.HorizontalOffset := -(PadL - 2);
+    FOpPop.VerticalOffset := (PadB - PadT) / 2;
+  end
+  else
+  begin
+    FOpPop.Placement := TPlacement.Top;
+    FOpPop.HorizontalOffset := 0;
+    FOpPop.VerticalOffset := -(PadB - 4);
+  end;
+  FOpPop.IsOpen := True;
+end;
+
+procedure TMainForm.LayoutOpPill;
+var
+  N, I, RunN, QueN, BadN: Integer;
+  V: TFileOpJobView;
+  OnRail: Boolean;
+  Cap: string;
+  W, Foot, TopY, BtnLeft, TextEnd, GapL, GapR, X: Single;
+  Panel: TFilePanel;
+  Host: TFmxObject;
+
+  procedure ClearFootInsets;
+  begin
+    if Assigned(FLeftPanel) then
+      FLeftPanel.SetStatusRightInset(4);
+    if Assigned(FRightPanel) then
+      FRightPanel.SetStatusRightInset(4);
+  end;
+
+begin
+  if not Assigned(FOpPill) then
+    Exit;
+  N := FileOpHubCount;
+  if N = 0 then
+  begin
+    FOpPill.Visible := False;
+    if Assigned(FOpPop) and FOpPop.IsOpen then
+      FOpPop.IsOpen := False;
+    ClearFootInsets;
+    LayoutMidButtons;
+    Exit;
+  end;
+  RunN := 0;
+  QueN := 0;
+  BadN := 0;
+  for I := 0 to N - 1 do
+  begin
+    V := FileOpHubView(I);
+    if V.Danger then
+      Inc(BadN)
+    else if V.State = jsQueued then
+      Inc(QueN)
+    else
+      Inc(RunN);
+  end;
+  OnRail := Assigned(FMidBar) and FMidBar.Visible and
+    not (Assigned(FSettings) and not FSettings.ShowMidBar);
+  FOpPill.Visible := True;
+  FOpPill.Align := TAlignLayout.None;
+  if OnRail then
+  begin
+    if FOpPill.Parent <> FMidBar then
+      FOpPill.Parent := FMidBar;
+    FOpPill.SetBounds(4, 4, MIDBAR_WIDTH - 8, 28);
+    FOpPillText.Visible := False;
+    FOpPillArc.Visible := (N = 1) and (BadN = 0);
+    FOpPillIcon.Visible := True;
+    FOpPillIcon.SetBounds(0, 0, FOpPill.Width, FOpPill.Height);
+    if N = 1 then
+    begin
+      V := FileOpHubView(0);
+      FOpPillIcon.Text := V.IconText;
+      FOpPillIcon.TextSettings.Font.Family := FluentIconFamily;
+      FOpPillIcon.TextSettings.Font.Size := 14;
+      FOpPillIcon.TextSettings.Font.Style := [];
+      if V.PercentText <> '' then
+        FOpPill.Hint := V.Title + ' · ' + V.PercentText
+      else
+        FOpPill.Hint := V.Title;
+    end
+    else
+    begin
+      if BadN > 0 then
+        FOpPillIcon.Text := '!'
+      else
+        FOpPillIcon.Text := IntToStr(N);
+      FOpPillIcon.TextSettings.Font.Family := FluentFontFamily;
+      FOpPillIcon.TextSettings.Font.Size := 12;
+      FOpPillIcon.TextSettings.Font.Style := [TFontStyle.fsBold];
+      FOpPill.Hint := 'Фоновые операции';
+    end;
+    ClearFootInsets;
+  end
+  else
+  begin
+    Panel := FActivePanel;
+    if not Assigned(Panel) then
+      Panel := FLeftPanel;
+    Host := nil;
+    Foot := 32;
+    BtnLeft := 0;
+    if Assigned(Panel) then
+    begin
+      Host := Panel.FooterHost;
+      Foot := Panel.FooterOffset;
+      BtnLeft := Panel.ViewButtonsLeft;
+    end;
+    if Host = nil then
+    begin
+      if Assigned(Panel) then
+        Host := Panel.CardHost;
+      if Host = nil then
+      begin
+        FOpPill.Visible := False;
+        ClearFootInsets;
+        LayoutMidButtons;
+        Exit;
+      end;
+    end;
+    if FOpPill.Parent <> Host then
+      FOpPill.Parent := Host;
+    if (BadN > 0) and (N = 1) then
+    begin
+      V := FileOpHubView(0);
+      Cap := V.Title;
+    end
+    else if N = 1 then
+    begin
+      V := FileOpHubView(0);
+      Cap := V.Title;
+      if V.PercentText <> '' then
+        Cap := Cap + '  ' + V.PercentText;
+    end
+    else if (RunN = 0) and (BadN = 0) then
+      Cap := Format('В очереди %d', [QueN])
+    else
+      Cap := OpCountWord(N);
+    W := 36 + MeasurePillText(Cap, 12);
+    if W < 132 then
+      W := 132;
+    if W > 220 then
+      W := 220;
+    if Panel.FooterHost = nil then
+    begin
+      ClearFootInsets;
+      TopY := Panel.Height - Foot - 8 - 28;
+      if TopY < 8 then
+        TopY := 8;
+      FOpPill.SetBounds(10, TopY, W, 28);
+    end
+    else
+    begin
+      if (BtnLeft < W + 16) and (Host is TControl) and
+         (TControl(Host).Width > 140) then
+        BtnLeft := TControl(Host).Width - 102;
+      TextEnd := 12 + MeasurePillText(Panel.StatusCaption, 11);
+      if TextEnd > BtnLeft - 16 then
+        TextEnd := BtnLeft - 16;
+      if TextEnd < 12 then
+        TextEnd := 12;
+      GapL := TextEnd + 8;
+      GapR := BtnLeft - 8;
+      if GapR - GapL >= W then
+        X := GapL + (GapR - GapL - W) / 2
+      else
+      begin
+        X := GapR - W;
+        if W > GapR - 8 then
+          W := GapR - 8;
+        if W < 96 then
+          W := 96;
+        X := GapR - W;
+      end;
+      if X < 6 then
+        X := 6;
+      TopY := (Foot - 28) / 2;
+      if TopY < 1 then
+        TopY := 1;
+      FOpPill.SetBounds(X, TopY, W, 28);
+      if Assigned(FLeftPanel) and (FLeftPanel <> Panel) then
+        FLeftPanel.SetStatusRightInset(4);
+      if Assigned(FRightPanel) and (FRightPanel <> Panel) then
+        FRightPanel.SetStatusRightInset(4);
+      if Host is TControl then
+        Panel.SetStatusRightInset(TControl(Host).Width - X + 8)
+      else
+        Panel.SetStatusRightInset(BtnLeft - X + 8);
+    end;
+    FOpPillArc.Visible := False;
+    FOpPillIcon.Visible := True;
+    FOpPillIcon.SetBounds(8, 0, 18, 28);
+    FOpPillIcon.TextSettings.Font.Family := FluentIconFamily;
+    FOpPillIcon.TextSettings.Font.Size := 14;
+    FOpPillIcon.TextSettings.Font.Style := [];
+    if N = 1 then
+      FOpPillIcon.Text := FileOpHubView(0).IconText
+    else if BadN > 0 then
+      FOpPillIcon.Text := '!'
+    else
+      FOpPillIcon.Text := #$E8B7;
+    FOpPillText.Visible := True;
+    FOpPillText.SetBounds(30, 0, W - 40, 28);
+    FOpPillText.Text := Cap;
+    if N = 1 then
+      FOpPill.Hint := Cap
+    else
+      FOpPill.Hint := 'Фоновые операции';
+  end;
+  if BadN > 0 then
+  begin
+    FOpPill.Fill.Color := FColors.DangerColor;
+    FOpPillIcon.TextSettings.FontColor := FColors.OnAccentTextColor;
+    FOpPillText.TextSettings.FontColor := FColors.OnAccentTextColor;
+  end
+  else if (not OnRail) or (N >= 2) then
+  begin
+    FOpPill.Fill.Color := FColors.AccentSubtle;
+    FOpPillIcon.TextSettings.FontColor := FColors.TextColor;
+    FOpPillText.TextSettings.FontColor := FColors.TextColor;
+  end
+  else
+  begin
+    FOpPill.Fill.Color := FColors.ControlFill;
+    FOpPillIcon.TextSettings.FontColor := FColors.TextColor;
+    FOpPillText.TextSettings.FontColor := FColors.TextColor;
+  end;
+  FOpPill.Stroke.Color := FColors.CardStroke;
+  FOpPill.BringToFront;
+  if FOpPillArc.Visible then
+    FOpPillArc.Repaint;
+  LayoutMidButtons;
+end;
+
+procedure TMainForm.BuildOpPill;
+var
+  Fx: TShadowEffect;
+begin
+  if not Assigned(FOpRows) then
+    FOpRows := TObjectList<TObject>.Create(True);
+  FOpPill := TRectangle.Create(Self);
+  FOpPill.Parent := FMidBar;
+  FOpPill.Align := TAlignLayout.None;
+  FOpPill.Visible := False;
+  FOpPill.HitTest := True;
+  FOpPill.Cursor := crHandPoint;
+  FOpPill.XRadius := 8;
+  FOpPill.YRadius := 8;
+  FOpPill.Stroke.Kind := TBrushKind.Solid;
+  FOpPill.Stroke.Thickness := 1;
+  FOpPill.Fill.Color := FColors.ControlFill;
+  FOpPill.OnClick := OpPillClick;
+  FOpPill.ShowHint := True;
+  FOpPill.Hint := 'Фоновые операции';
+
+  FOpPillArc := TPaintBox.Create(Self);
+  FOpPillArc.Parent := FOpPill;
+  FOpPillArc.Align := TAlignLayout.Client;
+  FOpPillArc.HitTest := False;
+  FOpPillArc.OnPaint := OpPillPaint;
+
+  FOpPillIcon := TText.Create(Self);
+  FOpPillIcon.Parent := FOpPill;
+  FOpPillIcon.Align := TAlignLayout.None;
+  FOpPillIcon.HitTest := False;
+  FOpPillIcon.TextSettings.HorzAlign := TTextAlign.Center;
+  FOpPillIcon.TextSettings.VertAlign := TTextAlign.Center;
+
+  FOpPillText := TText.Create(Self);
+  FOpPillText.Parent := FOpPill;
+  FOpPillText.Align := TAlignLayout.None;
+  FOpPillText.HitTest := False;
+  FOpPillText.Visible := False;
+  ApplyFluentText(FOpPillText, 12, False);
+  FOpPillText.TextSettings.HorzAlign := TTextAlign.Leading;
+  FOpPillText.TextSettings.VertAlign := TTextAlign.Center;
+  FOpPillText.TextSettings.Trimming := TTextTrimming.Character;
+  FOpPillText.TextSettings.WordWrap := False;
+
+  FOpPop := TPopup.Create(Self);
+  FOpPop.Parent := Self;
+  FOpPop.Placement := TPlacement.RightCenter;
+  FOpHost := TRectangle.Create(Self);
+  FOpHost.Parent := FOpPop;
+  FOpHost.Align := TAlignLayout.Client;
+  FOpHost.Margins.Rect := TRectF.Create(18, 14, 18, 22);
+  FOpHost.XRadius := 8;
+  FOpHost.YRadius := 8;
+  FOpHost.Stroke.Kind := TBrushKind.Solid;
+  FOpHost.Stroke.Thickness := 1;
+  FOpHost.Fill.Color := FColors.CardBackground;
+  FOpHost.Stroke.Color := FColors.CardStroke;
+  FOpHost.ClipChildren := True;
+  FOpHost.OnMouseWheel := OpWheel;
+  Fx := TShadowEffect.Create(FOpHost);
+  Fx.Parent := FOpHost;
+  ApplyFluentShadow(Fx, FColors.IsDark);
+
+  FOpBody := TLayout.Create(Self);
+  FOpBody.Parent := FOpHost;
+  FOpBody.Align := TAlignLayout.None;
+  FOpBody.SetBounds(0, 0, 320, 0);
+  FOpBody.HitTest := False;
+  FOpBody.OnMouseWheel := OpWheel;
+
+  FOpTimer := TTimer.Create(Self);
+  FOpTimer.Interval := 150;
+  FOpTimer.OnTimer := OpTick;
+  FOpTimer.Enabled := True;
+end;
+
 procedure TMainForm.BuildMidBar;
 const
   BTN_H = 32;
@@ -1886,7 +2651,7 @@ begin
 
   FMidGroup := TLayout.Create(Self);
   FMidGroup.Parent := FMidBar;
-  FMidGroup.Align := TAlignLayout.VertCenter;
+  FMidGroup.Align := TAlignLayout.None;
   FMidGroup.Width := MIDBAR_WIDTH;
 
   Y := 0;
@@ -1894,23 +2659,25 @@ begin
   PlaceBtn(FCmdCopy);
   FCmdMove := MakeMidButton('', 'Переместить (F6)', OnBtnMoveClick);
   PlaceBtn(FCmdMove);
-  FCmdDelete := MakeMidButton('', 'Удалить (F8)', OnBtnDeleteClick);
-  PlaceBtn(FCmdDelete);
-  AddDivider;
+
   FCmdRename := MakeMidButton('', 'Переименовать (F2)', OnBtnRenameClick);
   PlaceBtn(FCmdRename);
   FCmdArchive := MakeMidButton('', 'Архивировать (Alt+F5)', OnBtnArchiveClick);
   PlaceBtn(FCmdArchive);
   AddDivider;
+  FCmdDelete := MakeMidButton('', 'Удалить (F8)', OnBtnDeleteClick);
+  PlaceBtn(FCmdDelete);
+  AddDivider;
   FCmdNewFolder := MakeMidButton('', 'Новая папка (F7)', OnBtnNewFolderClick);
   PlaceBtn(FCmdNewFolder);
+  AddDivider;
   FCmdSearch := MakeMidButton('', 'Поиск (F4)', OnBtnSearchClick);
   PlaceBtn(FCmdSearch);
   FCmdSelect := MakeMidButton(#$E9D5, 'Выделение', OnBtnSelectClick);
   PlaceBtn(FCmdSelect);
-  AddDivider;
   FCmdRefresh := MakeMidButton('', 'Обновить', OnBtnRefreshClick);
   PlaceBtn(FCmdRefresh);
+  AddDivider;
   FCmdQuickView := MakeMidButton('', 'Быстрый просмотр (Ctrl+Q)', OnBtnQuickViewToggle);
   PlaceBtn(FCmdQuickView);
   FCmdDetails := MakeMidButton('', 'Подробно', OnBtnViewDetailsClick);
@@ -1919,6 +2686,9 @@ begin
   PlaceBtn(FCmdTiles);
 
   FMidGroup.Height := Y;
+  FMidStackH := Y;
+  BuildOpPill;
+  LayoutMidButtons;
 
   FLastSelectMask := '*.*';
   FSelMenu := TFluentPopupMenu.Create(Self);
@@ -2106,6 +2876,7 @@ begin
     end;
     FCenterCluster.Width := CENTER_CLUSTER_WIDTH;
   end;
+  LayoutOpPill;
 end;
 
 procedure TMainForm.LayoutWorkArea;
@@ -2137,6 +2908,7 @@ begin
   FCenterCluster.SetBounds(X, WORK_PAD_T, BandW, InnerH);
   X := X + BandW;
   FRightPanel.SetBounds(X, WORK_PAD_T, RightW, InnerH);
+  LayoutOpPill;
 end;
 
 procedure TMainForm.ApplyLeftPanelWidth(AWidth: Single);
@@ -2524,6 +3296,16 @@ begin
     FCmdSelect.ApplyTheme(AColors);
   if Assigned(FSelMenu) then
     FSelMenu.ApplyTheme(AColors);
+  if Assigned(FOpHost) then
+  begin
+    FOpHost.Fill.Color := AColors.CardBackground;
+    FOpHost.Stroke.Color := AColors.CardStroke;
+    for var Si := 0 to FOpHost.ChildrenCount - 1 do
+      if FOpHost.Children[Si] is TShadowEffect then
+        ApplyFluentShadow(TShadowEffect(FOpHost.Children[Si]), AColors.IsDark);
+  end;
+  if Assigned(FOpPill) and FOpPill.Visible then
+    LayoutOpPill;
 
   if Assigned(FMidGroup) then
     for I := 0 to FMidGroup.ControlsCount - 1 do
@@ -2571,21 +3353,10 @@ end;
 procedure TMainForm.RunCopyMove(const ASources: TArray<string>; const ADestDir: string;
   AMove: Boolean; ASrcPanel, ADestPanel: TFilePanel);
 var
-  Btn: TFluentButton;
-  N, I: Integer;
-  FolderRoots: TArray<string>;
   FocusPath: string;
   Src, Dest: TFilePanel;
 begin
   if Length(ASources) = 0 then
-    Exit;
-  if AMove then
-    Btn := FCmdMove
-  else
-    Btn := FCmdCopy;
-  if Assigned(Btn) and Btn.Busy then
-    Exit;
-  if ListFileOpBusy then
     Exit;
 
   Src := ASrcPanel;
@@ -2600,29 +3371,6 @@ begin
     Dest.ShowNotice('Нет связи');
     Exit;
   end;
-  SetLength(FolderRoots, 0);
-  for I := 0 to High(ASources) do
-    if (not IsRemotePath(ASources[I])) and TDirectory.Exists(ASources[I]) then
-    begin
-      SetLength(FolderRoots, Length(FolderRoots) + 1);
-      FolderRoots[High(FolderRoots)] := ASources[I];
-    end;
-
-  N := 0;
-  for I := 0 to High(ASources) do
-    if IsRemotePath(ASources[I]) then
-    begin
-      N := 1;
-      Break;
-    end;
-  if (N = 0) and IsRemotePath(ADestDir) then
-    N := 1;
-  if N = 0 then
-    N := CountOpLeaves(ASources)
-  else
-    N := Max(Length(ASources), 1);
-  if Assigned(Btn) then
-    Btn.StartBusy(Max(N, 1));
 
   FocusPath := '';
   if AMove and Assigned(Src) then
@@ -2632,9 +3380,6 @@ begin
     MovePathsAsync(ASources, ADestDir,
       procedure(Success: Boolean; const ErrorMsg: string)
       begin
-        if Assigned(Btn) then
-          while Btn.Busy do
-            Btn.EndBusy;
         if Assigned(Dest) then
           Dest.Refresh;
         if Assigned(Src) then
@@ -2648,32 +3393,14 @@ begin
         end;
       end,
       procedure(const APath: string; AStatus: TOpItemStatus)
-      var
-        J: Integer;
-        IsFolder: Boolean;
       begin
-        { Снять выделение после копирования / после ответа в окне конфликта. }
         if (AStatus in [oisOk, oisSkipped]) and Assigned(Src) then
           Src.DeselectByPath(APath);
-        if AStatus = oisConflictPending then
-          Exit;
-        IsFolder := False;
-        for J := 0 to High(FolderRoots) do
-          if SameText(FolderRoots[J], APath) then
-          begin
-            IsFolder := True;
-            Break;
-          end;
-        if (not IsFolder) and Assigned(Btn) then
-          Btn.EndBusy;
       end)
   else
     CopyPathsAsync(ASources, ADestDir,
       procedure(Success: Boolean; const ErrorMsg: string)
       begin
-        if Assigned(Btn) then
-          while Btn.Busy do
-            Btn.EndBusy;
         if Assigned(Dest) then
           Dest.Refresh;
         if Assigned(Src) then
@@ -2687,24 +3414,9 @@ begin
         end;
       end,
       procedure(const APath: string; AStatus: TOpItemStatus)
-      var
-        J: Integer;
-        IsFolder: Boolean;
       begin
-        { Снять выделение после копирования / после ответа в окне конфликта. }
         if (AStatus in [oisOk, oisSkipped]) and Assigned(Src) then
           Src.DeselectByPath(APath);
-        if AStatus = oisConflictPending then
-          Exit;
-        IsFolder := False;
-        for J := 0 to High(FolderRoots) do
-          if SameText(FolderRoots[J], APath) then
-          begin
-            IsFolder := True;
-            Break;
-          end;
-        if (not IsFolder) and Assigned(Btn) then
-          Btn.EndBusy;
       end);
 end;
 
@@ -2745,10 +3457,11 @@ var
   Paths: TArray<string>;
   I: Integer;
 begin
-  if (GetFileOpMode = fomVibe) and RestoreVibeCopyFromBackground then
-    Exit;
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
+  begin
+    OpenBackgroundKind(okCopy);
     Exit;
+  end;
   Entries := FActivePanel.SelectedEntries;
   if Length(Entries) = 0 then
     Exit;
@@ -2766,7 +3479,10 @@ var
   I: Integer;
 begin
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
+  begin
+    OpenBackgroundKind(okMove);
     Exit;
+  end;
   Entries := FActivePanel.SelectedEntries;
   if Length(Entries) = 0 then
     Exit;
@@ -2786,9 +3502,11 @@ var
   FocusPath: string;
   I: Integer;
 begin
-  if (GetFileOpMode = fomVibe) and RestoreVibeDeleteFromBackground then
+  if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
+  begin
+    OpenBackgroundKind(okDelete);
     Exit;
-  if not FActivePanel.HasSelection then Exit;
+  end;
   Entries := FActivePanel.SelectedEntries;
   if Length(Entries) = 0 then Exit;
   Panel := FActivePanel;
@@ -2802,14 +3520,12 @@ begin
     Paths[I] := Entries[I].FullPath;
   FocusPath := Panel.FocusPathAfterRemove(Paths);
 
-  FCmdDelete.StartBusy(1);
   DeletePathsAsync(Paths,
     procedure(Success: Boolean; const ErrorMsg: string)
     begin
       Panel.Refresh(FocusPath);
       if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
         Panel.ShowNotice(ErrorMsg);
-      FCmdDelete.EndBusy;
     end, Permanent);
 end;
 
@@ -2887,7 +3603,11 @@ var
   I: Integer;
   Panel: TFilePanel;
 begin
-  if not Assigned(FActivePanel) or not FActivePanel.HasSelection then Exit;
+  if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
+  begin
+    OpenBackgroundKind(okArchive);
+    Exit;
+  end;
   Entries := FActivePanel.SelectedEntries;
   if Length(Entries) = 0 then Exit;
 
@@ -2904,7 +3624,6 @@ begin
   DestDir := OtherPanel(Panel).CurrentPath;
   ZipPath := IncludeTrailingPathDelimiter(DestDir) + ZipName;
 
-  FCmdArchive.StartBusy(1);
   ArchivePathsAsync(Paths, ZipPath,
     procedure(Success: Boolean; const ErrorMsg: string)
     begin
@@ -2913,7 +3632,6 @@ begin
         Panel.ClearSelection;
         OtherPanel(Panel).Refresh;
       end;
-      FCmdArchive.EndBusy;
     end);
 end;
 
@@ -3108,6 +3826,13 @@ end;
 
 procedure TMainForm.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
 begin
+  if (Key = vkEscape) and Assigned(FOpPop) and FOpPop.IsOpen then
+  begin
+    FOpPop.IsOpen := False;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
   var ShiftStr := '';
   if ssCtrl in Shift then ShiftStr := ShiftStr + 'Ctrl + ';
   if ssAlt in Shift then ShiftStr := ShiftStr + 'Alt + ';
@@ -3131,6 +3856,26 @@ begin
   begin
     OnBtnSearchClick(nil);
     Key := 0;
+    Exit;
+  end;
+  if (Key = vkF5) and not (ssAlt in Shift) and
+     not (Assigned(FActivePanel) and
+       (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+     not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    OnBtnCopyClick(nil);
+    Exit;
+  end;
+  if (Key = vkF6) and not (ssAlt in Shift) and
+     not (Assigned(FActivePanel) and
+       (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+     not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    OnBtnMoveClick(nil);
     Exit;
   end;
   if (Key = vkLeft) and (ssAlt in Shift) then
@@ -3253,11 +3998,6 @@ begin
       OnBtnArchiveClick(nil)
     else
       OnBtnCopyClick(nil);
-    Key := 0;
-  end
-  else if Key = vkF6 then
-  begin
-    OnBtnMoveClick(nil);
     Key := 0;
   end
   else if Key = vkF7 then

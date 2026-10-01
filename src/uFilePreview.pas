@@ -3434,13 +3434,8 @@ begin
     end;
     if ExtIn(Ext, ['.psd', '.psb']) then
     begin
-      W := Max(400, Round(FBody.Width * 1.4));
-      H := Max(400, Round(FBody.Height * 1.4));
-      if W < 800 then
-        W := 1600;
-      if H < 600 then
-        H := 1200;
-      if LoadPsdPreview(APath, W, H, FImage.Bitmap, SrcW, SrcH) then
+      { 0,0 — пиксели как в заголовке PSD, не размер панели и не DPI экрана. }
+      if LoadPsdPreview(APath, 0, 0, FImage.Bitmap, SrcW, SrcH) then
       begin
         ShowRasterImage;
         if SrcW > 0 then

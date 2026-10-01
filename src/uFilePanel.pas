@@ -521,6 +521,12 @@ type
     procedure MoveEnd(const AShift: TShiftState);
     procedure MovePage(ADirection: Integer; const AShift: TShiftState);
     procedure ToggleCurrentAndMove;
+    function CardHost: TFmxObject;
+    function FooterHost: TFmxObject;
+    function FooterOffset: Single;
+    function ViewButtonsLeft: Single;
+    function StatusCaption: string;
+    procedure SetStatusRightInset(ARight: Single);
   end;
 
 implementation
@@ -5864,6 +5870,67 @@ begin
   ViewMode := AMode;
 end;
 
+function TFilePanel.CardHost: TFmxObject;
+begin
+  Result := FCard;
+end;
+
+function TFilePanel.FooterHost: TFmxObject;
+begin
+  if Assigned(FFooterPanel) and FFooterPanel.Visible and (FFooterPanel.Height >= 20) then
+    Result := FFooterPanel
+  else
+    Result := nil;
+end;
+
+function TFilePanel.ViewButtonsLeft: Single;
+var
+  Box: TControl;
+begin
+  Result := 0;
+  if not Assigned(FFooterPanel) then
+    Exit;
+  Box := nil;
+  if Assigned(FBtnDetails) and (FBtnDetails.Parent is TControl) and
+     (FBtnDetails.Parent.Parent = FFooterPanel) then
+    Box := TControl(FBtnDetails.Parent);
+  if Assigned(Box) and (Box.Position.X > 24) then
+    Result := Box.Position.X
+  else if FFooterPanel.Width > 140 then
+    Result := FFooterPanel.Width - 102;
+end;
+
+function TFilePanel.StatusCaption: string;
+begin
+  if Assigned(FStatusText) then
+    Result := FStatusText.Text
+  else
+    Result := '';
+end;
+
+procedure TFilePanel.SetStatusRightInset(ARight: Single);
+begin
+  if not Assigned(FStatusText) then
+    Exit;
+  if ARight < 4 then
+    ARight := 4;
+  if Abs(FStatusText.Margins.Right - ARight) < 0.5 then
+    Exit;
+  FStatusText.Margins.Right := ARight;
+  if ARight > 12 then
+    FStatusText.TextSettings.Trimming := TTextTrimming.Character
+  else
+    FStatusText.TextSettings.Trimming := TTextTrimming.None;
+end;
+
+function TFilePanel.FooterOffset: Single;
+begin
+  if Assigned(FFooterPanel) and FFooterPanel.Visible then
+    Result := FFooterPanel.Height
+  else
+    Result := 0;
+end;
+
 procedure TFilePanel.SetShowNetwork(AShow: Boolean);
 begin
   if Assigned(FDriveBar) then
@@ -7505,7 +7572,7 @@ begin
   for Src in ASources do
   begin
     ParentDir := ExcludeTrailingPathDelimiter(ExtractFilePath(ExcludeTrailingPathDelimiter(Src)));
-    if SameText(ParentDir, ExcludeTrailingPathDelimiter(ADest)) then
+    if AMove and SameText(ParentDir, ExcludeTrailingPathDelimiter(ADest)) then
       Continue;
     SetLength(Paths, Length(Paths) + 1);
     Paths[High(Paths)] := Src;

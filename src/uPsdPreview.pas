@@ -1137,10 +1137,6 @@ begin
     Exit;
   if (APath = '') or not FileExists(APath) then
     Exit;
-  if AMaxW < 8 then
-    AMaxW := 256;
-  if AMaxH < 8 then
-    AMaxH := 256;
   S := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
     try
@@ -1166,6 +1162,13 @@ begin
 
       if HaveComp then
       begin
+        if (AMaxW < 1) or (AMaxH < 1) then
+        begin
+          APixels := CompPix;
+          AWidth := H.Width;
+          AHeight := H.Height;
+          Exit(True);
+        end;
         if FinishScaled(CompPix, H.Width, H.Height, AMaxW, AMaxH, OutPix, Dw, Dh) then
         begin
           APixels := OutPix;
@@ -1176,6 +1179,13 @@ begin
       end;
       if HaveThumb then
       begin
+        if (AMaxW < 1) or (AMaxH < 1) then
+        begin
+          APixels := ThumbPix;
+          AWidth := Tw;
+          AHeight := Th;
+          Exit(True);
+        end;
         if FinishScaled(ThumbPix, Tw, Th, AMaxW, AMaxH, OutPix, Dw, Dh) then
         begin
           APixels := OutPix;
@@ -1218,6 +1228,7 @@ begin
   ASrcH := 0;
   if ABitmap = nil then
     Exit;
+  { 0 × 0 — родные пиксели файла, без ужатия под панель. }
   if not RenderPsdRaw(APath, AMaxW, AMaxH, True, Pix, W, H, ASrcW, ASrcH) then
     Exit;
   if (W < 1) or (H < 1) or (Length(Pix) < Int64(W) * H * 4) then

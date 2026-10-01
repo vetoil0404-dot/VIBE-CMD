@@ -36,6 +36,7 @@ procedure GetAppIconBitmap(var ABitmap: FMX.Graphics.TBitmap; ASize: Integer = 3
 function GetFileThumbnail(const AFilePath: string; AWidth, AHeight: Integer; ABitmap: FMX.Graphics.TBitmap): Boolean;
 function GetFileThumbnailRaw(const AFilePath: string; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+procedure ClearFolderThumbPlate(var APixels: TBytes; AWidth, AHeight: Integer);
 function GetShellItemThumbnailRaw(const AItem: IUnknown; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 function GetTypeIconRaw(const AIconKey: string; AIsDir: Boolean;
@@ -569,27 +570,154 @@ begin
 end;
 
 procedure KnockOutWhiteFolderBg(var APixels: TBytes; AWidth, AHeight: Integer);
-var
-  X, Y, I: Integer;
-  R, G, B, A: Byte;
-  HasAlpha: Boolean;
 begin
-  if Length(APixels) < AWidth * AHeight * 4 then
+  ClearFolderThumbPlate(APixels, AWidth, AHeight);
+end;
+
+procedure ClearFolderThumbPlate(var APixels: TBytes; AWidth, AHeight: Integer);
+var
+  N, I, P, X, Y, Head, Cleared: Integer;
+  BlackN, WhiteN: Integer;
+  WantBlack: Boolean;
+  Mark: TBytes;
+  Q: TList<Integer>;
+
+  function IsBlackAt(APix: Integer): Boolean;
+  begin
+    Result := (APixels[APix] <= 24) and (APixels[APix + 1] <= 24) and
+      (APixels[APix + 2] <= 24);
+  end;
+
+  function IsWhiteAt(APix: Integer): Boolean;
+  begin
+    Result := (APixels[APix] >= 242) and (APixels[APix + 1] >= 242) and
+      (APixels[APix + 2] >= 242);
+  end;
+
+  function MatchPlate(APix: Integer): Boolean;
+  begin
+    if WantBlack then
+      Result := IsBlackAt(APix)
+    else
+      Result := IsWhiteAt(APix);
+  end;
+
+  procedure Seed(AX, AY: Integer);
+  var
+    Idx, Pix: Integer;
+  begin
+    Idx := AY * AWidth + AX;
+    if Mark[Idx] <> 0 then
+      Exit;
+    Pix := Idx * 4;
+    if not MatchPlate(Pix) then
+      Exit;
+    Mark[Idx] := 1;
+    Q.Add(Idx);
+  end;
+
+begin
+  if (AWidth < 8) or (AHeight < 8) then
     Exit;
-  HasAlpha := BgraHasAlpha(APixels);
-  if HasAlpha then
+  N := AWidth * AHeight;
+  if Length(APixels) < N * 4 then
     Exit;
-  for Y := 0 to AHeight - 1 do
+  BlackN := 0;
+  WhiteN := 0;
+  if IsBlackAt(0) then
+    Inc(BlackN);
+  if IsWhiteAt(0) then
+    Inc(WhiteN);
+  P := (AWidth - 1) * 4;
+  if IsBlackAt(P) then
+    Inc(BlackN);
+  if IsWhiteAt(P) then
+    Inc(WhiteN);
+  P := ((AHeight - 1) * AWidth) * 4;
+  if IsBlackAt(P) then
+    Inc(BlackN);
+  if IsWhiteAt(P) then
+    Inc(WhiteN);
+  P := ((AHeight - 1) * AWidth + (AWidth - 1)) * 4;
+  if IsBlackAt(P) then
+    Inc(BlackN);
+  if IsWhiteAt(P) then
+    Inc(WhiteN);
+  { Углы не плашка — это обычная картинка, не трогаем. }
+  if (BlackN < 2) and (WhiteN < 2) then
+    Exit;
+  WantBlack := BlackN >= WhiteN;
+  SetLength(Mark, N);
+  Q := TList<Integer>.Create;
+  try
+    Q.Capacity := N div 2;
     for X := 0 to AWidth - 1 do
     begin
-      I := (Y * AWidth + X) * 4;
-      B := APixels[I];
-      G := APixels[I + 1];
-      R := APixels[I + 2];
-      A := APixels[I + 3];
-      if (A > 0) and (R > 245) and (G > 245) and (B > 245) then
-        APixels[I + 3] := 0;
+      Seed(X, 0);
+      Seed(X, AHeight - 1);
     end;
+    for Y := 1 to AHeight - 2 do
+    begin
+      Seed(0, Y);
+      Seed(AWidth - 1, Y);
+    end;
+    Head := 0;
+    while Head < Q.Count do
+    begin
+      I := Q[Head];
+      Inc(Head);
+      X := I mod AWidth;
+      Y := I div AWidth;
+      if X > 0 then
+        Seed(X - 1, Y);
+      if X < AWidth - 1 then
+        Seed(X + 1, Y);
+      if Y > 0 then
+        Seed(X, Y - 1);
+      if Y < AHeight - 1 then
+        Seed(X, Y + 1);
+    end;
+    Cleared := 0;
+    for I := 0 to N - 1 do
+      if Mark[I] <> 0 then
+        Inc(Cleared);
+    { Почти весь кадр одного цвета — не превью папки, а чёрная картинка. }
+    if (Cleared = 0) or (Cleared > (N * 9) div 10) then
+      Exit;
+    for I := 0 to N - 1 do
+      if Mark[I] <> 0 then
+      begin
+        P := I * 4;
+        APixels[P] := 0;
+        APixels[P + 1] := 0;
+        APixels[P + 2] := 0;
+        APixels[P + 3] := 0;
+      end;
+    { Серая кромка у чёрной плашки, чтобы не остался ореол. }
+    for Y := 0 to AHeight - 1 do
+      for X := 0 to AWidth - 1 do
+      begin
+        I := Y * AWidth + X;
+        if Mark[I] <> 0 then
+          Continue;
+        if not (((X > 0) and (Mark[I - 1] <> 0)) or
+                ((X < AWidth - 1) and (Mark[I + 1] <> 0)) or
+                ((Y > 0) and (Mark[I - AWidth] <> 0)) or
+                ((Y < AHeight - 1) and (Mark[I + AWidth] <> 0))) then
+          Continue;
+        P := I * 4;
+        if WantBlack then
+        begin
+          if (APixels[P] < 72) and (APixels[P + 1] < 72) and (APixels[P + 2] < 72) then
+            APixels[P + 3] := APixels[P + 3] div 3;
+        end
+        else if (APixels[P] > 210) and (APixels[P + 1] > 210) and
+                (APixels[P + 2] > 210) then
+          APixels[P + 3] := APixels[P + 3] div 3;
+      end;
+  finally
+    Q.Free;
+  end;
 end;
 
 function HBitmapToBgra(hbm: HBITMAP; AMaxEdge: Integer; AOpaqueIfNoAlpha: Boolean;

@@ -121,6 +121,9 @@ type
     procedure SkipCurrent;
     procedure AnswerConflict(AChoice: TConflictChoice);
     function GetProgress: TFileOpProgress;
+    function SourceCount: Integer;
+    function SourcePath(AIndex: Integer): string;
+    procedure SetDest(const AValue: string);
     property Kind: TFileOpKind read FKind;
     property Dest: string read FDest;
     property SpecialCopy: TProc<string, string> read FSpecialCopy write FSpecialCopy;
@@ -135,12 +138,115 @@ function FormatOpBytes(ABytes: Int64): string;
 function FormatOpSpeed(ABps: Double): string;
 function FormatOpEta(ASec: Double): string;
 
+type
+  TFileOpJobState = (jsQueued, jsRunning, jsPaused, jsNeedAnswer, jsBackground,
+    jsDone, jsFailed, jsCancelled);
+
+  TFileOpJobView = record
+    Id: Integer;
+    Kind: TFileOpKind;
+    State: TFileOpJobState;
+    Title: string;
+    Detail: string;
+    Percent: Integer;
+    Indeterminate: Boolean;
+    PercentText: string;
+    IconText: string;
+    Danger: Boolean;
+  end;
+
+  THubCountFunc = reference to function: Integer;
+  THubViewFunc = reference to function(AIndex: Integer): TFileOpJobView;
+  THubIdProc = reference to procedure(AId: Integer);
+  THubKindFunc = reference to function(AKind: TFileOpKind): Boolean;
+  THubPumpProc = reference to procedure;
+  THubSpinFunc = reference to function: Single;
+
+procedure SetFileOpHubApi(ACount: THubCountFunc; AView: THubViewFunc;
+  ARestore, ADismiss: THubIdProc; AHasBackground: THubKindFunc;
+  APump: THubPumpProc; ASpin: THubSpinFunc);
+function FileOpHubCount: Integer;
+function FileOpHubView(AIndex: Integer): TFileOpJobView;
+procedure FileOpHubRestore(AId: Integer);
+procedure FileOpHubDismiss(AId: Integer);
+function FileOpHubHasBackground(AKind: TFileOpKind): Boolean;
+procedure FileOpHubPumpViews;
+function FileOpHubSpin: Single;
+
 implementation
 
 uses
   System.IOUtils, System.Math, System.StrUtils, System.DateUtils, uFileModel,
   uArchiveEngine
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
+
+var
+  GHubCount: THubCountFunc;
+  GHubView: THubViewFunc;
+  GHubRestore, GHubDismiss: THubIdProc;
+  GHubHasBg: THubKindFunc;
+  GHubPump: THubPumpProc;
+  GHubSpin: THubSpinFunc;
+
+procedure SetFileOpHubApi(ACount: THubCountFunc; AView: THubViewFunc;
+  ARestore, ADismiss: THubIdProc; AHasBackground: THubKindFunc;
+  APump: THubPumpProc; ASpin: THubSpinFunc);
+begin
+  GHubCount := ACount;
+  GHubView := AView;
+  GHubRestore := ARestore;
+  GHubDismiss := ADismiss;
+  GHubHasBg := AHasBackground;
+  GHubPump := APump;
+  GHubSpin := ASpin;
+end;
+
+function FileOpHubCount: Integer;
+begin
+  if Assigned(GHubCount) then
+    Result := GHubCount()
+  else
+    Result := 0;
+end;
+
+function FileOpHubView(AIndex: Integer): TFileOpJobView;
+begin
+  if Assigned(GHubView) then
+    Result := GHubView(AIndex)
+  else
+    Result := Default(TFileOpJobView);
+end;
+
+procedure FileOpHubRestore(AId: Integer);
+begin
+  if Assigned(GHubRestore) then
+    GHubRestore(AId);
+end;
+
+procedure FileOpHubDismiss(AId: Integer);
+begin
+  if Assigned(GHubDismiss) then
+    GHubDismiss(AId);
+end;
+
+function FileOpHubHasBackground(AKind: TFileOpKind): Boolean;
+begin
+  Result := Assigned(GHubHasBg) and GHubHasBg(AKind);
+end;
+
+procedure FileOpHubPumpViews;
+begin
+  if Assigned(GHubPump) then
+    GHubPump();
+end;
+
+function FileOpHubSpin: Single;
+begin
+  if Assigned(GHubSpin) then
+    Result := GHubSpin()
+  else
+    Result := 0;
+end;
 
 const
   CHUNK = 1024 * 1024;
@@ -297,6 +403,32 @@ begin
   FLock.Enter;
   try
     Result := FSnap;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TFileOpEngine.SourceCount: Integer;
+begin
+  Result := Length(FSources);
+end;
+
+function TFileOpEngine.SourcePath(AIndex: Integer): string;
+begin
+  if (AIndex < 0) or (AIndex > High(FSources)) then
+    Result := ''
+  else
+    Result := FSources[AIndex];
+end;
+
+procedure TFileOpEngine.SetDest(const AValue: string);
+begin
+  FLock.Enter;
+  try
+    FDest := AValue;
+    FSnap.DestPath := AValue;
+    if FSnap.FileName = '' then
+      FSnap.FileName := ExtractFileName(AValue);
   finally
     FLock.Leave;
   end;
@@ -752,6 +884,12 @@ begin
 {$ENDIF}
 end;
 
+function SameOpPath(const A, B: string): Boolean;
+begin
+  Result := SameText(ExcludeTrailingPathDelimiter(A),
+    ExcludeTrailingPathDelimiter(B));
+end;
+
 function TFileOpEngine.CopyOneFile(const ASrc, ADst: string): Boolean;
 var
   InS, OutS: TStream;
@@ -768,6 +906,15 @@ begin
   Result := False;
   CheckWait;
   Dest := ADst;
+  { Тот же файл: перезапись обрежет его в ноль или удалит. Делаем копию рядом. }
+  if SameOpPath(ASrc, Dest) then
+    Dest := UniqueName(ASrc);
+  if SameOpPath(ASrc, Dest) then
+  begin
+    IncSkipped;
+    NotifyItem(ASrc, oisSkipped);
+    Exit(False);
+  end;
   if TFile.Exists(Dest) or TDirectory.Exists(Dest) then
   begin
     Choice := DecideConflict(ASrc, Dest);
@@ -887,7 +1034,7 @@ begin
           FLock.Leave;
         end;
       end;
-      if TFile.Exists(Dest) then
+      if (Done > 0) and TFile.Exists(Dest) and not SameOpPath(Dest, ASrc) then
       try
         TFile.Delete(Dest);
       except
@@ -921,10 +1068,9 @@ begin
           FLock.Leave;
         end;
       end;
-      if TFile.Exists(Dest) then
+      if (Done = 0) and TFile.Exists(Dest) and not SameOpPath(Dest, ASrc) then
       try
-        if Done = 0 then
-          TFile.Delete(Dest);
+        TFile.Delete(Dest);
       except
       end;
       NoteError(ASrc, E.Message);
@@ -1104,6 +1250,14 @@ begin
     Abort;
   Name := TPath.GetFileName(ExcludeTrailingPathDelimiter(ASrc));
   Dst := TPath.Combine(ADestDir, Name);
+  if (FKind = okCopy) and SameOpPath(ASrc, Dst) then
+    Dst := UniqueName(Dst)
+  else if (FKind = okMove) and SameOpPath(ASrc, Dst) then
+  begin
+    IncSkipped;
+    NotifyItem(ASrc, oisSkipped);
+    Exit;
+  end;
   FLock.Enter;
   try
     FSnap.SourcePath := ASrc;

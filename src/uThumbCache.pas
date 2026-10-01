@@ -3,6 +3,9 @@
 interface
 
 uses
+
+  System.ZLib ,
+ Winapi.Windows, Winapi.ShlObj, Winapi.ActiveX,
   System.SysUtils, System.Classes, System.IOUtils, System.Generics.Collections,
   System.SyncObjs, System.Diagnostics, System.DateUtils, System.StrUtils,
   System.Math, System.UITypes, System.Types,
@@ -66,7 +69,7 @@ type
     constructor Create;
     destructor Destroy; override;
 
-    function TryGet(const APath: string; out ABitmap: TBitmap): Boolean;
+    function TryGet(const APath: string; out ABitmap: FMX.Graphics.TBitmap): Boolean;
     procedure RequestAsync(const APath: string; ASize: Integer; AOnReady: TThumbReadyProc;
       const ANameHint: string = '');
     function HasWork: Boolean;
@@ -90,9 +93,7 @@ var
 
 implementation
 
-uses
-  System.ZLib
-  {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.ActiveX{$ENDIF};
+
 
 function IsSvgThumbExt(const APath: string): Boolean;
 var
@@ -125,6 +126,116 @@ begin
     (AExt = '.heic') or (AExt = '.heif') or (AExt = '.avif') or
     (AExt = '.jxl') or (AExt = '.tga');
 end;
+
+{$IFDEF MSWINDOWS}
+const
+  ShellThumbHandler = '{E357FCCD-A995-4576-B01F-234630154E96}';
+  ShellExtractImage = '{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}';
+
+var
+  GShellThumbCS: TCriticalSection;
+  GShellThumbMap: TDictionary<string, Boolean>;
+
+function ShellClassOpen(const APath: string; out AKey: HKEY): Boolean;
+begin
+  Result := RegOpenKeyEx(HKEY_CLASSES_ROOT, PChar(APath), 0, KEY_READ, AKey) = 0;
+  if not Result then
+    Result := RegOpenKeyEx(HKEY_CLASSES_ROOT, PChar(APath), 0,
+      KEY_READ or KEY_WOW64_64KEY, AKey) = 0;
+end;
+
+function ShellClassExists(const APath: string): Boolean;
+var
+  K: HKEY;
+begin
+  Result := ShellClassOpen(APath, K);
+  if Result then
+    RegCloseKey(K);
+end;
+
+function ShellClassValue(const APath, AName: string): string;
+var
+  K: HKEY;
+  Typ, N: DWORD;
+  Buf: array[0..511] of Char;
+begin
+  Result := '';
+  if not ShellClassOpen(APath, K) then
+    Exit;
+  try
+    N := SizeOf(Buf);
+    Typ := 0;
+    if AName = '' then
+    begin
+      if RegQueryValueEx(K, nil, nil, @Typ, @Buf[0], @N) <> 0 then
+        Exit;
+    end
+    else if RegQueryValueEx(K, PChar(AName), nil, @Typ, @Buf[0], @N) <> 0 then
+      Exit;
+    if (Typ = REG_SZ) or (Typ = REG_EXPAND_SZ) then
+      Result := PChar(@Buf[0]);
+  finally
+    RegCloseKey(K);
+  end;
+end;
+
+function ShellThumbOnClass(const AClass: string): Boolean;
+begin
+  Result := (AClass <> '') and
+    (ShellClassExists(AClass + '\ShellEx\' + ShellThumbHandler) or
+     ShellClassExists(AClass + '\ShellEx\' + ShellExtractImage));
+end;
+
+function ExtHasShellThumbnail(const AExt: string): Boolean;
+var
+  Prog, Cur, Perceived: string;
+begin
+  Result := False;
+  if (AExt = '') or (AExt[1] <> '.') then
+    Exit;
+  if not Assigned(GShellThumbCS) then
+    Exit;
+  GShellThumbCS.Enter;
+  try
+    if Assigned(GShellThumbMap) and GShellThumbMap.TryGetValue(AExt, Result) then
+      Exit;
+  finally
+    GShellThumbCS.Leave;
+  end;
+  Result := ShellThumbOnClass(AExt) or
+    ShellThumbOnClass('SystemFileAssociations\' + AExt);
+  if not Result then
+  begin
+    Prog := ShellClassValue(AExt, '');
+    if (Prog <> '') and (Prog[1] <> '.') then
+    begin
+      Cur := ShellClassValue(Prog + '\CurVer', '');
+      if Cur <> '' then
+        Prog := Cur;
+      Result := ShellThumbOnClass(Prog);
+      if not Result then
+        Perceived := ShellClassValue(Prog, 'PerceivedType');
+    end;
+  end;
+  if not Result then
+  begin
+    if Perceived = '' then
+      Perceived := ShellClassValue(AExt, 'PerceivedType');
+    if Perceived = '' then
+      Perceived := ShellClassValue('SystemFileAssociations\' + AExt, 'PerceivedType');
+    Perceived := LowerCase(Perceived);
+    if (Perceived = 'image') or (Perceived = 'video') or (Perceived = 'audio') then
+      Result := ShellThumbOnClass('SystemFileAssociations\' + Perceived);
+  end;
+  GShellThumbCS.Enter;
+  try
+    if Assigned(GShellThumbMap) then
+      GShellThumbMap.AddOrSetValue(AExt, Result);
+  finally
+    GShellThumbCS.Leave;
+  end;
+end;
+{$ENDIF}
 
 function IsThumbCandidate(const APath: string; AIsDir: Boolean;
   const ANameHint: string): Boolean;
@@ -165,6 +276,16 @@ begin
     (Ext = '.mp4') or (Ext = '.mkv') or (Ext = '.avi') or (Ext = '.mov') or
     (Ext = '.wmv') or (Ext = '.webm') or
     (IsListedTextExt(Ext) and not IsRemotePath(APath));
+  if Result then
+    Exit;
+  { exe/lnk/ico остаются jumbo-иконками, не системным превью. }
+  if (Ext = '.exe') or (Ext = '.dll') or (Ext = '.ocx') or (Ext = '.scr') or
+     (Ext = '.lnk') or (Ext = '.ico') or (Ext = '.cur') or (Ext = '.sys') or
+     (Ext = '.url') then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  Result := ExtHasShellThumbnail(Ext);
+  {$ENDIF}
 end;
 
 function CopyHeadAscii(const ABytes: TBytes; AMax: Integer): string;
@@ -1284,7 +1405,7 @@ begin
   end;
 end;
 
-function TThumbCache.TryGet(const APath: string; out ABitmap: TBitmap): Boolean;
+function TThumbCache.TryGet(const APath: string; out ABitmap: FMX.Graphics.TBitmap): Boolean;
 var
   Item: TCachedThumb;
 begin
@@ -1498,6 +1619,9 @@ begin
 {$ENDIF}
             if not Success then
               Success := GetFileThumbnailRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
+            if Success and (Length(Raw) > 0) and (RawW > 0) and (RawH > 0) and
+               TDirectory.Exists(Path) then
+              ClearFolderThumbPlate(Raw, RawW, RawH);
 {$IFDEF MSWINDOWS}
             if not Success and IsRasterThumbExt(Ext) and
                (IsPortableDevicePath(Path) or IsDeviceNamespacePath(Path) or
@@ -1679,11 +1803,19 @@ end;
 
 initialization
   GlobalThumbCache := TThumbCache.Create;
+  {$IFDEF MSWINDOWS}
+  GShellThumbCS := TCriticalSection.Create;
+  GShellThumbMap := TDictionary<string, Boolean>.Create;
+  {$ENDIF}
 
 finalization
   if Assigned(GlobalThumbCache) then
     GlobalThumbCache.Shutdown;
   FreeAndNil(GlobalThumbCache);
+  {$IFDEF MSWINDOWS}
+  FreeAndNil(GShellThumbMap);
+  FreeAndNil(GShellThumbCS);
+  {$ENDIF}
 
 end.
 

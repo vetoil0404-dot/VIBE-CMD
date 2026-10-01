@@ -16,7 +16,7 @@ uses
 
 const
   DOCK_HEIGHT = 64;
-  DOCK_ICON = 54;
+  DOCK_ICON = 48;     //54
   DOCK_GAP = 9;
   DOCK_PAD_X = 6;
   DOCK_SIDE_MARGIN = 10;

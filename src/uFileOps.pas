@@ -23,6 +23,13 @@ type
   TFileOpItemDoneProc = reference to procedure(const APath: string;
     AStatus: TOpItemStatus);
 
+  { Без uses формы прогресса: иначе цикл uFileOps ↔ uFileOpProgressForm
+    и uMain не видит FileOpHub*. }
+  TVibeLaunchProc = reference to procedure(AKind: Integer;
+    const ASources: TArray<string>; const ADest: string;
+    AOnDone: TFileOpDoneProc; APermanent: Boolean;
+    AOnItemDone: TFileOpItemDoneProc);
+
   TConflictAction = (caSkip, caAutoName, caOverwrite);
 
   TConflictItem = record
@@ -35,6 +42,10 @@ type
     SourceIsDir: Boolean;
     DestIsDir: Boolean;
   end;
+
+procedure SetVibeHooks(ALaunch: TVibeLaunchProc; ARestore: TFunc<Integer, Boolean>);
+procedure SetFileOpHubChanged(AHandler: TNotifyEvent);
+procedure NotifyFileOpHubChanged;
 
 procedure CopyPathSync(const ASource, ADestDir: string);
 procedure CopyPathAsync(const ASource, ADestDir: string; AOnDone: TFileOpDoneProc);
@@ -67,7 +78,7 @@ implementation
 
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
-  uFileOpEngine, uFileOpProgressForm, uArchiveEngine, uConflictDialog;
+  uFileOpEngine, uArchiveEngine, uConflictDialog;
 
 procedure CopyDirRecursive(const ASrc, ADst: string); forward;
 procedure DeletePathCore(const APath: string; APermanent: Boolean); forward;
@@ -79,6 +90,41 @@ var
   GFileOpWnd: NativeUInt = 0;
   GListOpBusy: Boolean = False;
   GListOpCancel: Boolean = False;
+  GFileOpHubChanged: TNotifyEvent;
+  GVibeLaunch: TVibeLaunchProc;
+  GVibeRestore: TFunc<Integer, Boolean>;
+
+procedure SetVibeHooks(ALaunch: TVibeLaunchProc; ARestore: TFunc<Integer, Boolean>);
+begin
+  GVibeLaunch := ALaunch;
+  GVibeRestore := ARestore;
+end;
+
+procedure SetFileOpHubChanged(AHandler: TNotifyEvent);
+begin
+  GFileOpHubChanged := AHandler;
+end;
+
+procedure NotifyFileOpHubChanged;
+begin
+  if Assigned(GFileOpHubChanged) then
+    GFileOpHubChanged(nil);
+end;
+
+procedure LaunchVibe(AKind: TFileOpKind; const ASources: TArray<string>;
+  const ADest: string; AOnDone: TFileOpDoneProc; APermanent: Boolean = False;
+  AOnItemDone: TFileOpItemDoneProc = nil);
+begin
+  if Assigned(GVibeLaunch) then
+    GVibeLaunch(Ord(AKind), ASources, ADest, AOnDone, APermanent, AOnItemDone)
+  else if Assigned(AOnDone) then
+    AOnDone(False, 'Окно операции не готово');
+end;
+
+function RestoreVibeKind(AKind: TFileOpKind): Boolean;
+begin
+  Result := Assigned(GVibeRestore) and GVibeRestore(Ord(AKind));
+end;
 
 procedure SetFileOpMode(AMode: TFileOpMode);
 begin
@@ -102,12 +148,12 @@ end;
 
 function RestoreVibeCopyFromBackground: Boolean;
 begin
-  Result := RestoreVibeBackground(okCopy);
+  Result := RestoreVibeKind(okCopy);
 end;
 
 function RestoreVibeDeleteFromBackground: Boolean;
 begin
-  Result := RestoreVibeBackground(okDelete);
+  Result := RestoreVibeKind(okDelete);
 end;
 
 procedure CancelListFileOps;
@@ -528,7 +574,7 @@ begin
   ZipPath := AZipFile;
   if GFileOpMode = fomVibe then
   begin
-    RunVibeOperation(okArchive, Snapshot, ZipPath, AOnDone);
+    LaunchVibe(okArchive, Snapshot, ZipPath, AOnDone);
     Exit;
   end;
   TThread.CreateAnonymousThread(
@@ -777,6 +823,11 @@ type
     function AskConflicts(out AActs: TArray<TConflictAction>): Boolean;
     procedure Run;
   end;
+
+var
+  GQuietWait: TList<TListOpJob>;
+
+procedure PumpQuietQueue; forward;
 
 function TListOpJob.Cancelled: Boolean;
 begin
@@ -1172,8 +1223,37 @@ begin
         GListOpBusy := False;
         if Assigned(DoneCb) then
           DoneCb(Fine, Err);
+        PumpQuietQueue;
       end);
   end;
+end;
+
+procedure StartQuietJob(Job: TListOpJob); forward;
+
+procedure StartQuietJob(Job: TListOpJob);
+begin
+  GListOpBusy := True;
+  GListOpCancel := False;
+  TThread.CreateAnonymousThread(
+    procedure
+    begin
+      try
+        Job.Run;
+      finally
+        Job.Free;
+      end;
+    end).Start;
+end;
+
+procedure PumpQuietQueue;
+var
+  Job: TListOpJob;
+begin
+  if GListOpBusy or (GQuietWait = nil) or (GQuietWait.Count = 0) then
+    Exit;
+  Job := GQuietWait[0];
+  GQuietWait.Delete(0);
+  StartQuietJob(Job);
 end;
 
 procedure RunQuietCopyMove(const ASources: TArray<string>; const ADestDir: string;
@@ -1187,25 +1267,20 @@ begin
       AOnDone(True, '');
     Exit;
   end;
-  if GListOpBusy then
-    Exit;
-  GListOpBusy := True;
-  GListOpCancel := False;
   Job := TListOpJob.Create;
   Job.Sources := Copy(ASources);
   Job.DestDir := ADestDir;
   Job.Move := AMove;
   Job.OnDone := AOnDone;
   Job.OnItem := AOnItemDone;
-  TThread.CreateAnonymousThread(
-    procedure
-    begin
-      try
-        Job.Run;
-      finally
-        Job.Free;
-      end;
-    end).Start;
+  if GListOpBusy then
+  begin
+    if GQuietWait = nil then
+      GQuietWait := TList<TListOpJob>.Create;
+    GQuietWait.Add(Job);
+    Exit;
+  end;
+  StartQuietJob(Job);
 end;
 
 procedure CopyPathsAsync(const ASources: TArray<string>; const ADestDir: string;
@@ -1221,7 +1296,7 @@ begin
   { V!be — свой движок и прогресс (конфликты в progress-форме). }
   if GFileOpMode = fomVibe then
   begin
-    RunVibeOperation(okCopy, Snapshot, Dest, AOnDone, False, AOnItemDone);
+    LaunchVibe(okCopy, Snapshot, Dest, AOnDone, False, AOnItemDone);
     Exit;
   end;
   { Тихий — без progress и без Shell UI; конфликты имён через uConflictDialog. }
@@ -1314,7 +1389,7 @@ begin
   Dest := ADestDir;
   if GFileOpMode = fomVibe then
   begin
-    RunVibeOperation(okMove, Snapshot, Dest, AOnDone, False, AOnItemDone);
+    LaunchVibe(okMove, Snapshot, Dest, AOnDone, False, AOnItemDone);
     Exit;
   end;
   if GFileOpMode = fomQuiet then
@@ -1436,7 +1511,7 @@ begin
   Snapshot := Copy(APaths);
   if GFileOpMode = fomVibe then
   begin
-    RunVibeOperation(okDelete, Snapshot, '', AOnDone, APermanent);
+    LaunchVibe(okDelete, Snapshot, '', AOnDone, APermanent);
     Exit;
   end;
   SplitDiskSources(Snapshot, Disk, Other);
@@ -1522,5 +1597,21 @@ begin
         end);
     end).Start;
 end;
+
+initialization
+
+finalization
+  GVibeLaunch := nil;
+  GVibeRestore := nil;
+  GFileOpHubChanged := nil;
+  if GQuietWait <> nil then
+  begin
+    while GQuietWait.Count > 0 do
+    begin
+      GQuietWait[0].Free;
+      GQuietWait.Delete(0);
+    end;
+    FreeAndNil(GQuietWait);
+  end;
 
 end.

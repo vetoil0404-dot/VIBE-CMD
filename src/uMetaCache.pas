@@ -203,6 +203,20 @@ begin
         H := Integer(ReadU32LE(FS));
         Result := (W > 0) and (H > 0);
       end
+      else if (Sig[0] = Ord('8')) and (Sig[1] = Ord('B')) and
+              (Sig[2] = Ord('P')) and (Sig[3] = Ord('S')) then
+      begin
+        if FS.Size < 26 then
+          Exit;
+        FS.Position := 4;
+        Marker := ReadU16BE(FS);
+        if (Marker <> 1) and (Marker <> 2) then
+          Exit;
+        FS.Position := 14;
+        H := Integer(ReadU32BE(FS));
+        W := Integer(ReadU32BE(FS));
+        Result := (W > 0) and (H > 0);
+      end
       else if (Sig[0] = Ord('R')) and (Sig[8] = Ord('W')) then
       begin
         FS.Position := 12;
