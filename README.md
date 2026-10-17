@@ -4,7 +4,7 @@
 
 Two-panel file manager for Windows 10 and 11. Dual panes, tabs, real previews, and Fluent design — without a pile of plugins.
 
-!\[Main window](docs/Foto.png)
+![Main window](docs/Foto.png)
 
 Also: [Українською](README.ua.md) ·
 \---
