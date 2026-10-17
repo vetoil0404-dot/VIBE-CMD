@@ -39,13 +39,15 @@ Total Commander досі найшвидший спосіб рухати файл
 
 ## Знімки екрана
 
-![Панелі](docs/Foto_1.jpg)
-![Панелі](docs/Foto_2.jpg)
-![Панелі](docs/Foto_3.jpg)
-![Панелі](docs/Foto_4.jpg)
-![Панелі](docs/Foto_5.jpg)
-![Панелі](docs/Foto_6.jpg)
-![Панелі](docs/Foto_7.jpg)
+![Panels](docs/Foto_01.png)
+![Panels](docs/Foto_02.png)
+![Panels](docs/Foto_03.png)
+![Panels](docs/Foto_04.png)
+![Panels](docs/Foto_05.png)
+![Panels](docs/Foto_06.png)
+![Panels](docs/Foto_07.png)
+![Panels](docs/Foto_08.png)
+![Panels](docs/Foto_09.png)
 
 ---
 
