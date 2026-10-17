@@ -29,7 +29,7 @@ Explorer is fine for one folder. V!BE CMD is for work that moves between two pla
 * **Fluent.** Own chrome, tabs, cards and title. Light, dark, or match the system. Window material: Normal, Mica, Acrylic. Follows the Windows accent color.
 * **See it now.** Image, document, spreadsheet, audio, video, font, EXE, folder stats and archive contents open in preview — no extra program.
 
-!\[Tiles and Home](docs/Foto\_06.png)
+![Tiles and Home](docs/Foto\_06.png)
 
 \---
 
@@ -46,7 +46,7 @@ Explorer is fine for one folder. V!BE CMD is for work that moves between two pla
 * Network paths without freezing the window. MTP / WPD devices as folders.
 * Archives open as folders: ZIP, TAR, GZ natively; 7Z, RAR, CAB, ISO via 7-Zip.
 
-!\[Name conflict](docs/Foto\_04.jpg)
+![Name conflict](docs/Foto\_04.jpg)
 
 ### Quick View
 
@@ -66,11 +66,11 @@ Open in the other panel (`Ctrl+Q`) or a separate window (`F3`).
 
 Image tools inside the viewer: crop, rotate, flip, resize, save as. Edits stay in memory until you save.
 
-!\[Quick View — video](docs/Foto\_05.png)
+![Quick View — video](docs/Foto\_05.png)
 
-!\[Quick View — audio](docs/Foto\_09.png)
+![Quick View — audio](docs/Foto\_09.png)
 
-!\[Image viewer](docs/Foto\_07.jpg)
+![Image viewer](docs/Foto\_07.jpg)
 
 ### Tools
 
@@ -80,11 +80,11 @@ Image tools inside the viewer: crop, rotate, flip, resize, save as. Edits stay i
 * **Dock.** Pin apps, folders and files. Own icons, drag to reorder.
 * **Themes.** Match system / Dark / Light, Normal / Mica / Acrylic, optional color tint, list font size.
 
-!\[Find files](docs/Foto\_02.png)
+![Find files](docs/Foto\_02.png)
 
-!\[Batch rename](docs/Foto\_03.png)
+![Batch rename](docs/Foto\_03.png)
 
-!\[Appearance](docs/Foto\_01.png)
+![Appearance](docs/Foto\_01.png)
 
 \---
 
@@ -112,7 +112,7 @@ Image tools inside the viewer: crop, rotate, flip, resize, save as. Edits stay i
 
 The bottom key bar mirrors the main actions.
 
-!\[Selection](docs/Foto\_08.png)
+![Selection](docs/Foto\_08.png)
 
 \---
 
