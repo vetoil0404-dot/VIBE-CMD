@@ -2,7 +2,7 @@
 
 A dual-pane file manager for Windows. Fluent chrome, Total Commander–style selection, and a Quick View that shows the file — not just an icon.
 
-![Panels](docs/Foto.jpg)
+![Panels](docs/Foto.png)
 
 Windows · Delphi / FireMonkey · a daily driver, not a skin on top of `TListView`.
 
@@ -39,13 +39,15 @@ Panes paint themselves (`TPaintBox` + a virtual list). Icons and metadata are no
 
 ## Screenshots
 
-![Panels](docs/Foto_1.jpg)
-![Panels](docs/Foto_2.jpg)
-![Panels](docs/Foto_3.jpg)
-![Panels](docs/Foto_4.jpg)
-![Panels](docs/Foto_5.jpg)
-![Panels](docs/Foto_6.jpg)
-![Panels](docs/Foto_7.jpg)
+![Panels](docs/Foto_01.png)
+![Panels](docs/Foto_02.png)
+![Panels](docs/Foto_03.png)
+![Panels](docs/Foto_04.png)
+![Panels](docs/Foto_05.png)
+![Panels](docs/Foto_06.png)
+![Panels](docs/Foto_07.png)
+![Panels](docs/Foto_08.png)
+![Panels](docs/Foto_09.png)
 
 ---
 
