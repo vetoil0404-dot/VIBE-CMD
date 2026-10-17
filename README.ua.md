@@ -2,7 +2,7 @@
 
 Двопанельний файловий менеджер для Windows. Fluent-вікно, виділення як у Total Commander, Quick View, який показує файл, а не іконку.
 
-![Панелі](docs/Foto.jpg)
+![Панелі](docs/Foto.png)
 
 Windows · Delphi / FireMonkey · щоденний інструмент, не скін поверх `TListView`.
 
