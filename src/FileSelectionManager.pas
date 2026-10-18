@@ -12,6 +12,7 @@ type
     function GetItemCount: Integer;
     function IsItemSelected(AIndex: Integer): Boolean;
     procedure SetItemSelected(AIndex: Integer; ASelected: Boolean);
+    function SetSelectedIndices(const AIndices: TArray<Integer>): Boolean;
     function GetItemExtension(AIndex: Integer): string;
     function GetItemName(AIndex: Integer): string;
     function IsItemDirectory(AIndex: Integer): Boolean;
@@ -25,6 +26,7 @@ type
     FCurrentIndex: Integer;
     FIsDragging: Boolean;
     FInitialState: Boolean;
+    FExplorerClick: Boolean;
   public
     constructor Create(AAdapter: ISelectionAdapter);
 
@@ -36,6 +38,8 @@ type
     procedure BeginRightPaint(AIndex: Integer);
     procedure MouseMove(AIndex: Integer; AShift: TShiftState);
     procedure MouseUp(AButton: TMouseButton);
+    function ApplyRubberBand(const AHits: TArray<Integer>; AReplace: Boolean;
+      const ABase: TArray<Integer>): Boolean;
     procedure CancelDrag;
 
     function KeyDown(var AKey: Word; AShift: TShiftState): Boolean;
@@ -51,6 +55,8 @@ type
     property CurrentIndex: Integer read FCurrentIndex write FCurrentIndex;
     property AnchorIndex: Integer read FAnchorIndex write FAnchorIndex;
     property IsDragging: Boolean read FIsDragging;
+    { Обычный ЛКМ без Ctrl: в режиме проводника оставляет выделенным только этот элемент. }
+    property ExplorerClick: Boolean read FExplorerClick write FExplorerClick;
   end;
 
 implementation
@@ -63,6 +69,7 @@ begin
   FCurrentIndex := 0;
   FIsDragging := False;
   FInitialState := False;
+  FExplorerClick := False;
 end;
 
 procedure TFileSelectionManager.ResetState(AIndex: Integer);
@@ -118,16 +125,16 @@ begin
     end
     else
     begin
-
-
       FCurrentIndex := AIndex;
       FAnchorIndex := AIndex;
+      if FExplorerClick then
+        FAdapter.SetSelectedIndices([AIndex]);
       FAdapter.InvalidateView;
     end;
   end
   else if AButton = TMouseButton.mbRight then
   begin
-    { Короткий клик ПКМ — переключить пункт. Протяжка идёт через BeginRightPaint. }
+    { Короткий клик ПКМ — переключить пункт. Правая кнопка не начинает перетаскивание. }
     FCurrentIndex := AIndex;
     FAnchorIndex := AIndex;
     FIsDragging := False;
@@ -181,6 +188,33 @@ end;
 procedure TFileSelectionManager.MouseUp(AButton: TMouseButton);
 begin
   FIsDragging := False;
+end;
+
+function TFileSelectionManager.ApplyRubberBand(const AHits: TArray<Integer>;
+  AReplace: Boolean; const ABase: TArray<Integer>): Boolean;
+var
+  Want: TArray<Integer>;
+  I, N: Integer;
+begin
+  if AReplace or (Length(ABase) = 0) then
+    Result := FAdapter.SetSelectedIndices(AHits)
+  else
+  begin
+    SetLength(Want, Length(ABase) + Length(AHits));
+    N := 0;
+    for I := 0 to High(ABase) do
+    begin
+      Want[N] := ABase[I];
+      Inc(N);
+    end;
+    for I := 0 to High(AHits) do
+    begin
+      Want[N] := AHits[I];
+      Inc(N);
+    end;
+    SetLength(Want, N);
+    Result := FAdapter.SetSelectedIndices(Want);
+  end;
 end;
 
 

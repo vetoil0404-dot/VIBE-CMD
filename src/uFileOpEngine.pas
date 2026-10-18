@@ -118,6 +118,8 @@ type
     procedure Pause;
     procedure Resume;
     procedure Cancel;
+    { True — поток ещё в работе, объект движка не освобождать. }
+    function DetachWorker: Boolean;
     procedure SkipCurrent;
     procedure AnswerConflict(AChoice: TConflictChoice);
     function GetProgress: TFileOpProgress;
@@ -173,11 +175,18 @@ function FileOpHubHasBackground(AKind: TFileOpKind): Boolean;
 procedure FileOpHubPumpViews;
 function FileOpHubSpin: Single;
 
+{ Тихий и Проводник: строка пилюли, без окна прогресса. Id < 0. }
+function FileOpTrackBegin(AKind: TFileOpKind; const ADetail: string;
+  AQueued: Boolean): Integer;
+procedure FileOpTrackRunning(AId: Integer);
+procedure FileOpTrackEnd(AId: Integer);
+function FileOpTrackCancelled(AId: Integer): Boolean;
+
 implementation
 
 uses
   System.IOUtils, System.Math, System.StrUtils, System.DateUtils, uFileModel,
-  uArchiveEngine
+  uArchiveEngine, uLang
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 var
@@ -187,6 +196,210 @@ var
   GHubHasBg: THubKindFunc;
   GHubPump: THubPumpProc;
   GHubSpin: THubSpinFunc;
+
+type
+  TOpTrack = class
+    Id: Integer;
+    Kind: TFileOpKind;
+    State: TFileOpJobState;
+    Detail: string;
+    Listed: Boolean;
+    Cancelled: Boolean;
+  end;
+
+var
+  GTracks: TObjectList<TOpTrack>;
+  GTrackLock: TCriticalSection;
+  GTrackNext: Integer;
+
+function FindTrack(AId: Integer): TOpTrack;
+var
+  I: Integer;
+begin
+  Result := nil;
+  if GTracks = nil then
+    Exit;
+  for I := 0 to GTracks.Count - 1 do
+    if GTracks[I].Id = AId then
+      Exit(GTracks[I]);
+end;
+
+function ListedTrackCount: Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  if GTracks = nil then
+    Exit;
+  for I := 0 to GTracks.Count - 1 do
+    if GTracks[I].Listed and not GTracks[I].Cancelled then
+      Inc(Result);
+end;
+
+function ListedTrackAt(AIndex: Integer): TOpTrack;
+var
+  I, N: Integer;
+begin
+  Result := nil;
+  if GTracks = nil then
+    Exit;
+  N := 0;
+  for I := 0 to GTracks.Count - 1 do
+    if GTracks[I].Listed and not GTracks[I].Cancelled then
+    begin
+      if N = AIndex then
+        Exit(GTracks[I]);
+      Inc(N);
+    end;
+end;
+
+function TrackIcon(AKind: TFileOpKind): string;
+begin
+  case AKind of
+    okCopy: Result := '';
+    okMove: Result := '';
+    okDelete: Result := '';
+    okArchive: Result := '';
+  else
+    Result := '';
+  end;
+end;
+
+function TrackToView(T: TOpTrack): TFileOpJobView;
+begin
+  Result := Default(TFileOpJobView);
+  if T = nil then
+    Exit;
+  Result.Id := T.Id;
+  Result.Kind := T.Kind;
+  Result.State := T.State;
+  Result.Title := FileOpKindCaption(T.Kind);
+  Result.Detail := T.Detail;
+  Result.IconText := TrackIcon(T.Kind);
+  Result.Percent := 0;
+  Result.Danger := False;
+  if T.State = jsQueued then
+  begin
+    Result.Indeterminate := False;
+    Result.PercentText := L('op.wait');
+  end
+  else
+  begin
+    Result.Indeterminate := True;
+    Result.PercentText := '…';
+  end;
+end;
+
+function FileOpTrackBegin(AKind: TFileOpKind; const ADetail: string;
+  AQueued: Boolean): Integer;
+var
+  T: TOpTrack;
+begin
+  Result := 0;
+  if (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    Dec(GTrackNext);
+    if GTrackNext >= 0 then
+      GTrackNext := -1;
+    T := TOpTrack.Create;
+    T.Id := GTrackNext;
+    T.Kind := AKind;
+    T.Detail := ADetail;
+    T.Listed := True;
+    T.Cancelled := False;
+    if AQueued then
+      T.State := jsQueued
+    else
+      T.State := jsRunning;
+    GTracks.Add(T);
+    Result := T.Id;
+  finally
+    GTrackLock.Leave;
+  end;
+  NotifyFileOpHubChanged;
+end;
+
+procedure FileOpTrackRunning(AId: Integer);
+var
+  T: TOpTrack;
+begin
+  if (AId >= 0) or (GTrackLock = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    T := FindTrack(AId);
+    if T = nil then
+      Exit;
+    T.State := jsRunning;
+    T.Listed := not T.Cancelled;
+  finally
+    GTrackLock.Leave;
+  end;
+  NotifyFileOpHubChanged;
+end;
+
+procedure FileOpTrackEnd(AId: Integer);
+var
+  I: Integer;
+  Removed: Boolean;
+begin
+  if (AId >= 0) or (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  Removed := False;
+  GTrackLock.Enter;
+  try
+    for I := GTracks.Count - 1 downto 0 do
+      if GTracks[I].Id = AId then
+      begin
+        GTracks.Delete(I);
+        Removed := True;
+        Break;
+      end;
+  finally
+    GTrackLock.Leave;
+  end;
+  if Removed then
+    NotifyFileOpHubChanged;
+end;
+
+function FileOpTrackCancelled(AId: Integer): Boolean;
+var
+  T: TOpTrack;
+begin
+  Result := False;
+  if (AId >= 0) or (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    T := FindTrack(AId);
+    Result := (T <> nil) and T.Cancelled;
+  finally
+    GTrackLock.Leave;
+  end;
+end;
+
+function FileOpTrackDismiss(AId: Integer): Boolean;
+var
+  T: TOpTrack;
+begin
+  Result := False;
+  if (AId >= 0) or (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    T := FindTrack(AId);
+    if T = nil then
+      Exit;
+    T.Cancelled := True;
+    T.Listed := False;
+    Result := True;
+  finally
+    GTrackLock.Leave;
+  end;
+  NotifyFileOpHubChanged;
+end;
 
 procedure SetFileOpHubApi(ACount: THubCountFunc; AView: THubViewFunc;
   ARestore, ADismiss: THubIdProc; AHasBackground: THubKindFunc;
@@ -203,28 +416,60 @@ end;
 
 function FileOpHubCount: Integer;
 begin
+  Result := 0;
   if Assigned(GHubCount) then
-    Result := GHubCount()
-  else
-    Result := 0;
+    Result := GHubCount();
+  if (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    Result := Result + ListedTrackCount;
+  finally
+    GTrackLock.Leave;
+  end;
 end;
 
 function FileOpHubView(AIndex: Integer): TFileOpJobView;
+var
+  VibeN: Integer;
+  T: TOpTrack;
 begin
-  if Assigned(GHubView) then
-    Result := GHubView(AIndex)
-  else
-    Result := Default(TFileOpJobView);
+  VibeN := 0;
+  if Assigned(GHubCount) then
+    VibeN := GHubCount();
+  if AIndex < VibeN then
+  begin
+    if Assigned(GHubView) then
+      Result := GHubView(AIndex)
+    else
+      Result := Default(TFileOpJobView);
+    Exit;
+  end;
+  Result := Default(TFileOpJobView);
+  if (GTrackLock = nil) or (GTracks = nil) then
+    Exit;
+  GTrackLock.Enter;
+  try
+    T := ListedTrackAt(AIndex - VibeN);
+    if T <> nil then
+      Result := TrackToView(T);
+  finally
+    GTrackLock.Leave;
+  end;
 end;
 
 procedure FileOpHubRestore(AId: Integer);
 begin
+  if AId < 0 then
+    Exit;
   if Assigned(GHubRestore) then
     GHubRestore(AId);
 end;
 
 procedure FileOpHubDismiss(AId: Integer);
 begin
+  if FileOpTrackDismiss(AId) then
+    Exit;
   if Assigned(GHubDismiss) then
     GHubDismiss(AId);
 end;
@@ -254,25 +499,25 @@ const
 function FileOpKindCaption(AKind: TFileOpKind): string;
 begin
   case AKind of
-    okCopy:    Result := 'Копирование';
-    okMove:    Result := 'Перемещение';
-    okDelete:  Result := 'Удаление';
-    okArchive: Result := 'Архивация';
+    okCopy:    Result := L('op.copy');
+    okMove:    Result := L('op.move');
+    okDelete:  Result := L('op.delete');
+    okArchive: Result := L('op.archive');
   else
-    Result := 'Операция';
+    Result := L('op.operation');
   end;
 end;
 
 function FormatOpBytes(ABytes: Int64): string;
 begin
   if ABytes >= 1024 * 1024 * 1024 then
-    Result := FormatFloat('0.00', ABytes / (1024 * 1024 * 1024)) + ' ГБ'
+    Result := Lf('op.bytes.gb', [FormatFloat('0.00', ABytes / (1024 * 1024 * 1024))])
   else if ABytes >= 1024 * 1024 then
-    Result := FormatFloat('0.0', ABytes / (1024 * 1024)) + ' МБ'
+    Result := Lf('op.bytes.mb', [FormatFloat('0.0', ABytes / (1024 * 1024))])
   else if ABytes >= 1024 then
-    Result := FormatFloat('0.0', ABytes / 1024) + ' КБ'
+    Result := Lf('op.bytes.kb', [FormatFloat('0.0', ABytes / 1024)])
   else
-    Result := IntToStr(ABytes) + ' Б';
+    Result := Lf('op.bytes.b', [IntToStr(ABytes)]);
 end;
 
 function FormatOpSpeed(ABps: Double): string;
@@ -280,7 +525,7 @@ begin
   if ABps <= 0 then
     Result := '—'
   else
-    Result := FormatOpBytes(Round(ABps)) + '/с';
+    Result := Lf('op.speed', [FormatOpBytes(Round(ABps))]);
 end;
 
 function FormatOpEta(ASec: Double): string;
@@ -291,11 +536,11 @@ begin
     Exit('—');
   S := Round(ASec);
   if S < 60 then
-    Result := IntToStr(S) + ' с'
+    Result := Lf('op.eta.s', [IntToStr(S)])
   else if S < 3600 then
-    Result := Format('%d мин %d с', [S div 60, S mod 60])
+    Result := Lf('op.eta.ms', [S div 60, S mod 60])
   else
-    Result := Format('%d ч %d мин', [S div 3600, (S mod 3600) div 60]);
+    Result := Lf('op.eta.hm', [S div 3600, (S mod 3600) div 60]);
 end;
 
 constructor TFileOpEngine.Create(AKind: TFileOpKind; const ASources: TArray<string>;
@@ -458,7 +703,7 @@ procedure TFileOpEngine.Pause;
 begin
   FPaused := True;
   FPauseEvent.ResetEvent;
-  SetPhase(opPaused, 'Пауза');
+  SetPhase(opPaused, L('op.pause'));
 end;
 
 procedure TFileOpEngine.Resume;
@@ -480,6 +725,16 @@ begin
     FConflictChoice := ccCancel;
     FConflictEvent.SetEvent;
   end;
+end;
+
+function TFileOpEngine.DetachWorker: Boolean;
+begin
+  Cancel;
+  Result := Assigned(FThread) and not FThread.Finished;
+  if not Result then
+    Exit;
+  FThread.FreeOnTerminate := True;
+  FThread := nil;
 end;
 
 procedure TFileOpEngine.SkipCurrent;
@@ -951,7 +1206,7 @@ begin
       Err := GetLastError;
       if IsFatalWinError(Err) then
         FFatal := True;
-      raise Exception.Create('Нет доступа: ' + ExtractFileName(ASrc));
+      raise Exception.Create(L('op.noaccess') + ': ' + ExtractFileName(ASrc));
     end;
     InS := THandleStream.Create(HIn);
     try
@@ -969,7 +1224,7 @@ begin
         Err := GetLastError;
         if IsFatalWinError(Err) then
           FFatal := True;
-        raise Exception.Create('Не удалось создать: ' + ExtractFileName(Dest));
+        raise Exception.Create(Lf('op.nocreate', [ExtractFileName(Dest)]));
       end;
       OutS := THandleStream.Create(HOut);
       try
@@ -1269,7 +1524,7 @@ begin
 
   if (FKind in [okCopy, okMove]) and TDirectory.Exists(ASrc) and
      IsIntoSelf(ASrc, ADestDir) then
-    raise Exception.Create('Нельзя копировать папку саму в себя: ' + Name);
+    raise Exception.Create(Lf('op.intoself', [Name]));
 
   if (FKind in [okCopy, okMove]) and ArchiveInvolved(ASrc, ADestDir) then
   begin
@@ -1469,7 +1724,7 @@ begin
       CheckWait;
     end);
   try
-    SetPhase(opScan, 'Подсчёт файлов…');
+    SetPhase(opScan, L('op.scan'));
     Files := 0;
     Bytes := 0;
     for Src in FSources do
@@ -1483,8 +1738,7 @@ begin
     finally
       FLock.Leave;
     end;
-    SetPhase(opReady, Format('К выполнению: %d, %s',
-      [Files, FormatOpBytes(Bytes)]));
+    SetPhase(opReady, Lf('op.ready', [Files, FormatOpBytes(Bytes)]));
 
     while not FStarted and not FCancel do
       Sleep(30);
@@ -1544,7 +1798,7 @@ begin
       if FSnap.Errors > 0 then
       begin
         Ok := False;
-        Err := Format('Ошибок: %d', [FSnap.Errors]);
+        Err := Lf('op.errors', [FSnap.Errors]);
         if FErrorList.Count > 0 then
           Err := Err + ' — ' + FErrorList[0];
         if FErrorList.Count > 1 then
@@ -1552,7 +1806,7 @@ begin
         SetPhase(opDone, Err);
       end
       else
-        SetPhase(opDone, 'Готово');
+        SetPhase(opDone, L('op.done'));
     finally
       FLock.Leave;
     end;
@@ -1560,8 +1814,8 @@ begin
     on E: EAbort do
     begin
       Ok := False;
-      Err := 'Отменено';
-      SetPhase(opCancel, 'Отменено');
+      Err := L('op.cancelled');
+      SetPhase(opCancel, L('op.cancelled'));
     end;
     on E: Exception do
     begin
@@ -1578,5 +1832,14 @@ begin
         OnDone(Ok, Err);
     end);
 end;
+
+initialization
+  GTrackLock := TCriticalSection.Create;
+  GTracks := TObjectList<TOpTrack>.Create(True);
+  GTrackNext := 0;
+
+finalization
+  FreeAndNil(GTracks);
+  FreeAndNil(GTrackLock);
 
 end.

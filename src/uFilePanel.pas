@@ -11,14 +11,16 @@ uses
   System.Rtti, System.SyncObjs,
   FMX.Types, FMX.Controls, FMX.Forms, FMX.Objects, FMX.Layouts,
   FMX.StdCtrls, FMX.Graphics, FMX.Ani, FMX.Surfaces, FMX.Platform,
-  FMX.TextLayout,
-  uFileModel, uThemeManager, uThumbCache, uIconCache, uMetaCache, uAppSettings, UCoreEngine,
+  FMX.TextLayout, FMX.Effects,
+  uFileModel, uThemeManager, uThumbCache, uIconCache, uMetaCache, uFolderSize,
+  uAppSettings, UCoreEngine,
   uCustomScrollbar, uCustomTabs, uFluentChrome, uFluentEdit, uFilePreview,
   FileSelectionManager, uFileOps,
-  uDirWatcher, uDriveBar
+  uDirWatcher, uDriveBar, uNetworkPanel, uLang, uLangBind
   {$IFDEF MSWINDOWS}, uWinFileDrag, uWinShellMenu, uClipboardImage, FMX.Platform.Win{$ENDIF};
 
 procedure OpenFileWithDefaultApp(const APath: string);
+procedure NotifyPreviewSaved(Sender: TObject);
 
 type
   TFileDragDropHook = reference to function(const AScreen: TPointF;
@@ -32,6 +34,8 @@ type
   TFilePanel = class;
 
   TQuickViewEvent = procedure(Sender: TObject; const APath: string) of object;
+  TStatusViewEvent = procedure(Sender: TObject; AMode: TPanelViewMode) of object;
+  TMouseModeEvent = procedure(Sender: TObject; AExplorer: Boolean) of object;
   TPathChangedEvent = procedure(Sender: TObject; const APath: string) of object;
   TPanelCopyMoveEvent = procedure(Sender: TObject; const ADest: string;
     const ASources: TArray<string>; AMove: Boolean; ASourcePanel: TFilePanel) of object;
@@ -87,10 +91,22 @@ type
     FPathAndHeader: TRectangle;
     FTabsBar: TCustomTabsBar;
     FDriveBar: TDriveBar;
+    FNet: TNetworkSession;
+    FNetBack: string;
+    FSettings: TAppSettings;
+    FNetBar: TRectangle;
+    FNetSubnet: TFluentEdit;
+    FNetAdd: TFluentEdit;
+    FNetScan: TFluentButton;
+    FNetStop: TFluentButton;
+    FNetHistMenu: TFluentPopupMenu;
+    FNetHistPath: string;
+    FPendingNetHistMenu: Boolean;
     FTopBar: TRectangle;
     FBtnBack: TFluentButton;
     FBtnForward: TFluentButton;
     FHistorySilent: Boolean;
+    FArcProbeGen: Integer;
     FCrumbsBox: THorzScrollBox;
     FCrumbsHost: TLayout;
     FPathEdit: TFluentEdit;
@@ -115,12 +131,42 @@ type
     FDragReady: Boolean;
     FDragStart: TPointF;
     FDragPaths: TArray<string>;
+    FBandArmed: Boolean;
+    FBandActive: Boolean;
+    FBandCtrl: Boolean;
+    FBandPressIdx: Integer;
+    FBandAnchor: TPointF;
+    FBandCurrent: TPointF;
+    FBandBase: TArray<Integer>;
+    FPendingClick: Boolean;
+    FPendingClickIdx: Integer;
+    FPendingClickShift: TShiftState;
+    FExplorerMouse: Boolean;
+    FMarkArmed: Boolean;
+    FMarkActive: Boolean;
+    FMarkRemove: Boolean;
+    FMarkAcc: TArray<Integer>;
+    FPendingExplorerMenu: Boolean;
+    FMouseModeMenu: TFluentPopupMenu;
     FDropHighlightIndex: Integer;
     FDropTargetHot: Boolean;
     FThumbTimer: TTimer;
     FThumbGen: Integer;
+    FThumbKey: string;
+    FThumbIconKey: string;
+    FThumbDirty: Boolean;
+    FThumbMoveTick: UInt64;
     FIconGen: Integer;
     FMetaGen: Integer;
+    FFolderSizeGen: Integer;
+    FShowFolderSizes: Boolean;
+    FManualSizePath: string;
+    FManualAwait: Boolean;
+    FManualPolled: TFolderSizeStatus;
+    FSizePaintDue: Boolean;
+    FSizeSortPending: Boolean;
+    FSizePaintTick: UInt64;
+    FSizeSortTick: UInt64;
     FDirChangeTimer: TTimer;
     FDirChangePath: string;
     FTabs: TList<TFileTab>;
@@ -143,6 +189,8 @@ type
     FOnPathChanged: TPathChangedEvent;
     FOnActivate: TNotifyEvent;
     FOnCursorChange: TNotifyEvent;
+    FOnStatusView: TStatusViewEvent;
+    FOnMouseModePick: TMouseModeEvent;
     FOnListReady: TNotifyEvent;
     FOnDropCopyMove: TPanelCopyMoveEvent;
     FPreview: TFilePreview;
@@ -154,6 +202,15 @@ type
     FListReadyFired: Boolean;
     FShowHiddenFiles: Boolean;
     FShowDriveBar: Boolean;
+    FShowDriveHome: Boolean;
+    FBtnHome: TFluentButton;
+    FHomePop: TPopup;
+    FHomeCard: TRectangle;
+    FHomeScroll: TVertScrollBox;
+    FHomeBar: TCustomFileScrollbar;
+    FHomeList: TLayout;
+    FHomeShadow: TShadowEffect;
+    FHomeClosedAt: UInt64;
     FNameFilter: string;
     FFilterReady: Boolean;
     FFilterMap: TList<Integer>;
@@ -169,11 +226,14 @@ type
     FColDateMedW: Single;
     FColDateShortW: Single;
     FColLayoutW: Single;
-    FLongestType: string;
     FColShowType: Boolean;
     FColShowSize: Boolean;
     FColTwoLine: Boolean;
     FColThisPC: Boolean;
+    FColNetMode: Integer;
+    FColIpW: Single;
+    FColNetKindW: Single;
+    FColShareW: Single;
     FColDateMode: TDateColMode;
     FColMeasure: TTextLayout;
     FNameLayout: TTextLayout;
@@ -193,6 +253,7 @@ type
     function GetItemCount: Integer;
     function IsItemSelected(AIndex: Integer): Boolean;
     procedure SetItemSelected(AIndex: Integer; ASelected: Boolean);
+    function SetSelectedIndices(const AIndices: TArray<Integer>): Boolean;
     function GetItemExtension(AIndex: Integer): string;
     function GetItemName(AIndex: Integer): string;
     function IsItemDirectory(AIndex: Integer): Boolean;
@@ -229,6 +290,15 @@ type
       out ATileH, ASlotW, APadX: Single);
     procedure KeepFocusVisible;
     function GetCurrentPathImpl: string;
+    function EntrySizeText(const AEntry: TFileEntry): string;
+    function IsManualSizeRow(const AEntry: TFileEntry): Boolean;
+    function ManualSizeCell(const AEntry: TFileEntry): string;
+    function ManualStatusPhrase: string;
+    procedure PollManualSize;
+    function EntryAccountedSize(const AEntry: TFileEntry): Int64;
+    procedure SyncFolderSizeRoot;
+    procedure QueueFolderSizes(AList: uFileModel.TFileEntryList);
+    procedure FolderSizeWake;
     function ShowsParentRow(const APath: string): Boolean;
     function HasParentDirectory: Boolean;
     procedure SetShowDriveBar(AShow: Boolean);
@@ -247,6 +317,26 @@ type
     procedure EndRightPaint;
     procedure ApplyRightPaintMouse(X, Y: Single);
     procedure SelectScrollTimerTick(Sender: TObject);
+    function LeftButtonHeld(const AShift: TShiftState): Boolean;
+    function PaintCaptureHeld: Boolean;
+    function PointerEndsGesture(const AScreen: TPointF): Boolean;
+    function ListStride: Single;
+    function OutsideScrollDelta(AViewY, AViewH: Single): Single;
+    procedure SyncSelectScrollTimer(const ALocal: TPointF);
+    procedure CollectBandHits(out AHits: TArray<Integer>);
+    procedure ApplyBandSelection(APaint: Boolean);
+    procedure ArmLeftBand(AIndex: Integer; const AShift: TShiftState; X, Y: Single);
+    procedure ClearLeftGesture;
+    procedure FinishLeftGesture(X, Y: Single);
+    procedure ApplyPendingLeftClick;
+    procedure ArmMarkGesture(X, Y: Single);
+    procedure ActivateMarkGesture;
+    procedure ApplyMarkSelection(APaint: Boolean);
+    procedure FinishMarkGesture(X, Y: Single; AKeepClick: Boolean);
+    procedure OpenExplorerItemMenu(AVisualIdx: Integer);
+    procedure ShowMouseModeMenu;
+    procedure MouseModeExplorerClick(Sender: TObject);
+    procedure MouseModeVibeClick(Sender: TObject);
     procedure PaintBoxDblClick(Sender: TObject);
     procedure PanelMouseWheel(Sender: TObject; Shift: TShiftState; WheelDelta: Integer; var Handled: Boolean);
 
@@ -288,13 +378,14 @@ type
     function MeasureColText(const AText: string; ASize: Single): Single;
     procedure InvalidateColLayout;
     procedure EnsureColTemplates;
-    procedure UpdateLongestType(AList: uFileModel.TFileEntryList);
+    function ColumnHeaderShift: Single;
     procedure RecalcColLayout(AContentWidth: Single);
     function FormatRowDate(const AEntry: TFileEntry): string;
     procedure DrawTrimmedText(Canvas: TCanvas; const ARect: TRectF;
       const AText: string; AColor: TAlphaColor; AOpacity: Single;
       AAlign: TTextAlign; ASize: Single);
     procedure ScrollBoxResize(Sender: TObject);
+    procedure ScrollBoxApplyStyle(Sender: TObject);
     procedure ScrollBoxViewportPositionChange(Sender: TObject; const OldViewportPosition, NewViewportPosition: TPointF; const ContentSizeChanged: Boolean);
     procedure EnsureIndexVisible(AIndex: Integer);
 
@@ -302,6 +393,7 @@ type
     procedure BtnTilesClick(Sender: TObject);
     procedure BtnQuickViewClick(Sender: TObject);
     procedure PreviewCloseClick(Sender: TObject);
+    procedure SyncPreviewList;
     procedure PreviewDiskChanged(Sender: TObject);
     procedure NotifyCursorChange;
     procedure BtnBackClick(Sender: TObject);
@@ -313,6 +405,7 @@ type
     procedure HeaderPaint(Sender: TObject; Canvas: TCanvas);
     procedure HeaderMouseDown(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
+    procedure ChromePointerDown(Sender: TObject);
     procedure PaintBoxMouseLeave(Sender: TObject);
     procedure IconBtnEnter(Sender: TObject);
     procedure IconBtnLeave(Sender: TObject);
@@ -321,15 +414,61 @@ type
     procedure UpdateChromeStackHeight;
     procedure LockChromeOrder;
     procedure DriveBarClick(Sender: TObject; const ARoot: string);
+    procedure EnsureNetSession;
+    procedure ShowNetBar(AOn: Boolean);
+    procedure PublishNetworkList;
+    procedure StoreNetPrefs;
+    procedure NetSessionChanged(Sender: TObject);
+    procedure NetPrefsChanged(Sender: TObject);
+    procedure NetScanClick(Sender: TObject);
+    procedure NetStopClick(Sender: TObject);
+    procedure NetAddSubmit(Sender: TObject);
+    procedure SyncNetButtons;
+    procedure NoteOpenedUnc(const APath: string);
+    function NetEntryAt(AVisual: Integer; out AEntry: TFileEntry): Boolean;
+    function NetHeadRow(AVisual: Integer): Boolean;
+    function NetRecentVisual(AVisual: Integer): Boolean;
+    procedure ShowNetRecentMenu(AVisual: Integer);
+    procedure NetHistForgetClick(Sender: TObject);
+    function NetSkipDrag(AVisual: Integer): Boolean;
+    function NetColKind: Integer;
+    procedure OpenHomeFolder(const APath: string);
     procedure DriveBarContext(Sender: TObject; const ARoot: string);
     function DriveClickKey(const ARoot: string): string;
     procedure RememberDrivePath(const APath: string);
     function ResolveDriveTarget(const ARoot: string): string;
     procedure HandlePlacesChanged(Sender: TObject);
+    procedure SetShowDriveHome(AShow: Boolean);
+    procedure ApplyDriveHomeLayout;
+    procedure EnsureDriveHomePop;
+    procedure SyncHomeScroll;
+    procedure HomeScrollResize(Sender: TObject);
+    procedure HomeScrollViewport(Sender: TObject; const OldViewportPosition,
+      NewViewportPosition: TPointF; const ContentSizeChanged: Boolean);
+    procedure RebuildDriveHomeList;
+    procedure AppendDriveHomeRow(AKind: Integer; const ACaption, APath: string;
+      var AY: Single; ARowW: Single);
+    function HomeFolderBitmap(const APath: string): FMX.Graphics.TBitmap;
+    procedure RefreshHomeFolderIcons;
+    function DriveHomeMaxBody: Single;
+    procedure OpenDriveHome;
+    procedure HomeClick(Sender: TObject);
+    procedure HomePopClosed(Sender: TObject);
+    procedure HomeRowMouseUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure HomeRowEnter(Sender: TObject);
+    procedure HomeRowLeave(Sender: TObject);
+    procedure ShowHomeUnpin(ARow: TRectangle; AOn: Boolean);
+    procedure HomeUnpinEnter(Sender: TObject);
+    procedure HomeUnpinLeave(Sender: TObject);
+    procedure HomeUnpinMouseUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure StyleHomeGlyph;
     function TabPathStillAvailable(const APath: string;
       const APlaces: TArray<TDriveInfo>): Boolean;
     procedure SyncDriveBar;
     procedure SetSort(AField: TSortField);
+    procedure ResortActiveEntries(AFollowFocus: Boolean = True);
     procedure PaintItemChrome(Canvas: TCanvas; const R: TRectF;
       ARadius: Single; IsSelected, IsCursor: Boolean; AIndex: Integer;
       out ATextColor: TAlphaColor);
@@ -353,6 +492,8 @@ type
     procedure PanelKeyDownHandler(Sender: TObject; var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
     procedure ThumbTimerTick(Sender: TObject);
     procedure RefreshThumbs;
+    procedure OrderVisibleThumbs;
+    function ThumbOrderRange(out AStart, AEnd: Integer): Boolean;
     procedure DirChangeTimerTick(Sender: TObject);
     function FileListsEquivalent(A, B: uFileModel.TFileEntryList): Boolean;
 
@@ -402,6 +543,12 @@ type
     procedure ApplyNetPulse(ATabIndex: Integer; const APath: string;
       AWasOff, AOk: Boolean);
     function WantRemoteThumbs: Boolean;
+    procedure ProbeArchiveEnter(const APath, ASelectPath: string);
+    procedure FinishArchiveEnter(AGen, ATab: Integer; const AFrom, APath, ASelect: string;
+      AList: uFileModel.TFileEntryList; ASilent: Boolean);
+    procedure FailArchiveEnter(AGen, ATab: Integer; const AFrom, AError: string;
+      ASilent: Boolean; AHistRestore: Integer);
+    procedure RevertUnopenedArchive(ATab: Integer; const APath, AError: string);
     procedure StartDirLoad(const APath, ASelectPath: string; AKeepSelection: Boolean);
     procedure StartDirLoadAt(ATabIndex: Integer; const APath, ASelectPath: string;
       AKeepSelection: Boolean);
@@ -426,6 +573,7 @@ type
     destructor Destroy; override;
 
     procedure UpdateStatusText;
+    procedure CountCursorFolder;
     procedure ApplyNameFilter(const AMask: string);
     procedure ClearFilter;
     function HasFilter: Boolean;
@@ -441,14 +589,18 @@ type
     function CanDropTo(const ADest: string; const ASources: TArray<string>): Boolean;
     procedure Navigate(const APath: string; const ASelectPath: string = '');
     procedure Refresh(const ASelectPath: string = ''; AKeepSelection: Boolean = False);
+    procedure InvalidateFolderSizes;
     function PreviewEditKey(var Key: Word; Shift: TShiftState): Boolean;
     procedure InvalidateView;
     procedure AddTab(const APath: string = '');
     procedure CloseCurrentTab;
     procedure SetViewMode(AMode: TPanelViewMode);
     procedure ApplyTheme(const AColors: TThemeColors);
+    procedure ApplyLanguage;
     procedure SetShowNetwork(AShow: Boolean);
     procedure SetShowHiddenFiles(AShow: Boolean);
+    procedure SetShowFolderSizes(AShow: Boolean);
+    procedure SetExplorerMouse(AExplorer: Boolean);
     procedure ApplyUiSettings(const ASettings: TAppSettings);
     procedure SetActive(AIsActive: Boolean);
     procedure MoveSelection(Delta: Integer; Shift: TShiftState = []);
@@ -465,6 +617,7 @@ type
     function CanHistoryForward: Boolean;
     procedure PanelonResize(Sender: TObject);
     procedure DeselectByPath(const APath: string);
+    function TryForgetNetworkRecent: Boolean;
 
     function SelectedEntry: TFileEntry;
     function HasSelection: Boolean;
@@ -488,9 +641,15 @@ type
     procedure HandlePaste;
     function IsPathEditing: Boolean;
     procedure CancelPathEdit;
+    function DriveHomeEnabled: Boolean;
+    function ToggleDriveHome: Boolean;
+    procedure CloseDriveHome;
+    function DriveHomeIsOpen: Boolean;
     function CollectDragPaths: TArray<string>;
     function FocusPathAfterRemove(const ARemoved: TArray<string>): string;
     procedure CaptureTabs(out AState: TSideState);
+    procedure ArmFolderSizes;
+    procedure CancelPendingIO;
     procedure RestoreTabs(const AState: TSideState);
     procedure LoadActiveTab;
     function LoadNextStaleTab: Boolean;
@@ -508,6 +667,8 @@ type
     property OnQuickView: TQuickViewEvent read FOnQuickView write FOnQuickView;
     property OnPathChanged: TPathChangedEvent read FOnPathChanged write FOnPathChanged;
     property OnCursorChange: TNotifyEvent read FOnCursorChange write FOnCursorChange;
+    property OnStatusView: TStatusViewEvent read FOnStatusView write FOnStatusView;
+    property OnMouseModePick: TMouseModeEvent read FOnMouseModePick write FOnMouseModePick;
     property OnListReady: TNotifyEvent read FOnListReady write FOnListReady;
     property OnDropCopyMove: TPanelCopyMoveEvent read FOnDropCopyMove write FOnDropCopyMove;
     function IsOffline: Boolean;
@@ -545,6 +706,10 @@ type
 var
   GFileDrag: TInAppFileDrag;
   GFileDragDropHook: TFileDragDropHook;
+  GFilePanels: TList<TFilePanel>;
+
+const
+  cThumbKeyIdle = #0;
 
 type
   TNetPulseJob = class
@@ -650,21 +815,45 @@ begin
   FDropHighlightIndex := -2;
   FDropTargetHot := False;
   FShowHiddenFiles := False;
+  FShowFolderSizes := True;
   FShowDriveBar := True;
+  FShowDriveHome := False;
+  FHomeClosedAt := 0;
   FNameFilter := '';
   FFilterReady := False;
   FFilterMap := TList<Integer>.Create;
   FListFontSize := 13;
-  FLongestType := 'Папка';
   FColLayoutW := -1;
   FColFs := 0;
   FDriveLast := TDictionary<string, string>.Create;
   FDragReady := False;
+  FBandArmed := False;
+  FBandActive := False;
+  FBandPressIdx := -1;
+  FPendingClick := False;
+  FExplorerMouse := False;
+  FMarkArmed := False;
+  FMarkActive := False;
+  FMarkRemove := False;
+  FPendingExplorerMenu := False;
+  FPendingNetHistMenu := False;
   FCrumbPaths := TStringList.Create;
   FThumbTimer := TTimer.Create(Self);
   FThumbTimer.Interval := 40;
   FThumbTimer.Enabled := False;
   FThumbTimer.OnTimer := ThumbTimerTick;
+  FThumbKey := '';
+  FThumbIconKey := '';
+  FThumbDirty := False;
+  FThumbMoveTick := 0;
+  if GFilePanels <> nil then
+    GFilePanels.Add(Self);
+  if Assigned(GlobalFolderSizes) then
+    GlobalFolderSizes.Advise(Self,
+      procedure
+      begin
+        FolderSizeWake;
+      end);
   FDirChangeTimer := TTimer.Create(Self);
   FDirChangeTimer.Interval := 800;
   FDirChangeTimer.Enabled := False;
@@ -689,12 +878,13 @@ begin
   FDragPollTimer.Enabled := False;
   FDragPollTimer.OnTimer := DragPollTimerTick;
   FSelectScrollTimer := TTimer.Create(Self);
-  FSelectScrollTimer.Interval := 30;
+  FSelectScrollTimer.Interval := 45;
   FSelectScrollTimer.Enabled := False;
   FSelectScrollTimer.OnTimer := SelectScrollTimerTick;
   BuildChrome;
   FRetryBtn := TFluentButton.Create(Self);
-  FRetryBtn.Setup(FCard, '', 'Повторить', fbkStandard, RetryLoadClick);
+  FRetryBtn.Setup(FCard, '', L('panel.retry'), fbkStandard, RetryLoadClick);
+  TrButton(FRetryBtn, 'panel.retry');
   FRetryBtn.Visible := False;
   FRetryBtn.HitTest := True;
   FRetryBtn.Width := 128;
@@ -707,6 +897,28 @@ end;
 destructor TFilePanel.Destroy;
 begin
   FDestroying := True;
+  if GFilePanels <> nil then
+    GFilePanels.Remove(Self);
+  if Assigned(GlobalThumbCache) then
+    GlobalThumbCache.ReleaseFocus(Self);
+  if FNet <> nil then
+  begin
+    FNet.OnChange := nil;
+    FNet.OnPrefs := nil;
+    FreeAndNil(FNet);
+  end;
+  if Assigned(GlobalFolderSizes) then
+  begin
+    GlobalFolderSizes.Unadvise(Self);
+    GlobalFolderSizes.NotePanelRoot(Self, '');
+  end;
+  if Assigned(FHomePop) then
+  begin
+    FHomePop.OnClosePopup := nil;
+    if FHomePop.IsOpen then
+      FHomePop.IsOpen := False;
+  end;
+  FreeAndNil(FHomeBar);
   FRefreshPending := False;
   if FShotJob <> nil then
   begin
@@ -746,7 +958,6 @@ begin
 
   for var J := 0 to FTabs.Count - 1 do
     AbandonTabLoad(J);
-  CheckSynchronize;
 
   FreeAndNil(FSelectionManager);
 
@@ -814,6 +1025,58 @@ if HasParentDirectory and (AIndex = 0) then Exit;
   else
   begin
     SelIndices.Remove(AIndex);
+  end;
+end;
+
+function TFilePanel.SetSelectedIndices(const AIndices: TArray<Integer>): Boolean;
+var
+  Sel: TList<Integer>;
+  Want: TDictionary<Integer, Byte>;
+  I, Idx, N: Integer;
+begin
+  Result := False;
+  Sel := GetCurrentSelectedIndices;
+  if not Assigned(Sel) then
+    Exit;
+  N := VisualCount;
+  Want := TDictionary<Integer, Byte>.Create;
+  try
+    for I := 0 to High(AIndices) do
+    begin
+      Idx := AIndices[I];
+      if (Idx < 0) or (Idx >= N) then
+        Continue;
+      if HasParentDirectory and (Idx = 0) then
+        Continue;
+      if not Want.ContainsKey(Idx) then
+        Want.Add(Idx, 1);
+    end;
+    if Sel.Count = Want.Count then
+    begin
+      for I := 0 to Sel.Count - 1 do
+        if not Want.ContainsKey(Sel[I]) then
+        begin
+          Result := True;
+          Break;
+        end;
+      if not Result then
+        Exit;
+    end
+    else
+      Result := True;
+    for I := Sel.Count - 1 downto 0 do
+      if not Want.ContainsKey(Sel[I]) then
+        Sel.Delete(I);
+    for I := 0 to Sel.Count - 1 do
+      Want.Remove(Sel[I]);
+    for I := 0 to High(AIndices) do
+      if Want.ContainsKey(AIndices[I]) then
+      begin
+        Sel.Add(AIndices[I]);
+        Want.Remove(AIndices[I]);
+      end;
+  finally
+    Want.Free;
   end;
 end;
 
@@ -1071,6 +1334,8 @@ begin
     CaptureFilterIdentity(Paths, Focus);
     RebuildFilterMap;
     RestoreFilterIdentity(Paths, Focus, AJump, True);
+    FThumbKey := '';
+    OrderVisibleThumbs;
   finally
     Paths.Free;
   end;
@@ -1173,6 +1438,8 @@ begin
     FTabs[FActiveTabIndex] := Tab;
     InvalidateColLayout;
     RebuildContent;
+    FThumbKey := '';
+    RefreshThumbs;
   end;
 end;
 
@@ -1201,6 +1468,11 @@ begin
     FTabs[FActiveTabIndex] := Tab;
     InvalidateColLayout;
     RebuildContent;
+    if Tab.ViewMode = vmTiles then
+    begin
+      FThumbKey := '';
+      RefreshThumbs;
+    end;
   end;
 end;
 
@@ -1241,22 +1513,33 @@ begin
   if ViewMode = vmDetails then
   begin
     RH := RowHeight;
-    if RH > 0 then
-      Result := Floor(Y / RH);
+    if RH <= 0 then
+      Exit;
+    Result := Floor(Y / RH);
+    if (Result < 0) or (Result >= TotalCount) then
+      Exit(-1);
+    { Строка короче клиента: поле справа от неё — пустое, рамка стартует оттуда. }
+    if (X < 6) or (X >= SB.Width - SCROLLBAR_RESERVE + 4) then
+      Result := -1;
   end
   else
   begin
     GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
-    if (SlotW <= 0) or (TileH <= 0) then
+    if (SlotW <= 0) or (TileH <= 0) or (TS <= 0) then
       Exit;
     var Col := Floor(X / SlotW);
     var RowIdx := Floor(Y / TileH);
-    if (Col >= 0) and (Col < Cols) then
-      Result := RowIdx * Cols + Col;
+    if (Col < 0) or (Col >= Cols) then
+      Exit;
+    Result := RowIdx * Cols + Col;
+    if (Result < 0) or (Result >= TotalCount) then
+      Exit(-1);
+    var ItemL := Col * SlotW + PadX;
+    var ItemT := RowIdx * TileH;
+    if (X < ItemL) or (X >= ItemL + TS) or (Y < ItemT) or
+       (Y >= ItemT + TS + TILE_TEXT_ZONE) then
+      Result := -1;
   end;
-
-  if (Result < 0) or (Result >= TotalCount) then
-    Result := -1;
 end;
 
 procedure TFilePanel.BuildChrome;
@@ -1362,6 +1645,7 @@ begin
   FTabsBar.OnTabAdd := HandleTabAdd;
   FTabsBar.OnTabReorder := HandleTabReorder;
   FTabsBar.OnTabDragQuery := HandleTabDragQuery;
+  FTabsBar.OnPointerDown := ChromePointerDown;
 
   { Адрес + заголовок колонок — один блок. Заголовок всегда виден (и в плитках). }
   FPathAndHeader := TRectangle.Create(Self);
@@ -1379,7 +1663,9 @@ begin
 
   FTopBar := TRectangle.Create(Self);
   FTopBar.Parent := FPathAndHeader;
-  FTopBar.Align := TAlignLayout.Top;
+  { MostTop всегда выше Align.Top. Иначе скрытая полоса сети с Y=0
+    при показе встаёт над строкой пути: FMX сортирует Top по координате. }
+  FTopBar.Align := TAlignLayout.MostTop;
   FTopBar.Height := 22;
   FTopBar.Stroke.Kind := TBrushKind.None;
   FTopBar.Fill.Kind := TBrushKind.Solid;
@@ -1390,8 +1676,7 @@ begin
   FBtnBack.Align := TAlignLayout.Left;
   FBtnBack.Width := 28;
   FBtnBack.Margins.Rect := TRectF.Create(0, 1, 0, 1);
-  FBtnBack.Hint := 'Назад (Alt+←)';
-  FBtnBack.ShowHint := True;
+  TrHint(FBtnBack, 'panel.hint.back');
   FBtnBack.ApplyTheme(FColors);
 
   FBtnForward := TFluentButton.Create(Self);
@@ -1399,9 +1684,26 @@ begin
   FBtnForward.Align := TAlignLayout.Left;
   FBtnForward.Width := 28;
   FBtnForward.Margins.Rect := TRectF.Create(0, 1, 2, 1);
-  FBtnForward.Hint := 'Вперёд (Alt+→)';
-  FBtnForward.ShowHint := True;
+  TrHint(FBtnForward, 'panel.hint.forward');
   FBtnForward.ApplyTheme(FColors);
+
+  FBtnHome := TFluentButton.Create(Self);
+  FBtnHome.Setup(FTopBar, #$E80F, '', fbkSubtle, HomeClick);
+  FBtnHome.Align := TAlignLayout.Left;
+  FBtnHome.Width := 28;
+  FBtnHome.Margins.Rect := TRectF.Create(0, 1, 2, 1);
+  TrHint(FBtnHome, 'panel.hint.drives');
+  FBtnHome.Visible := False;
+  FBtnHome.ApplyTheme(FColors);
+  StyleHomeGlyph;
+  for var Hi := 0 to FBtnHome.ChildrenCount - 1 do
+    for var Hj := 0 to FBtnHome.Children[Hi].ChildrenCount - 1 do
+      if FBtnHome.Children[Hi].Children[Hj] is TText then
+      begin
+        TText(FBtnHome.Children[Hi].Children[Hj]).Font.Family := 'Segoe MDL2 Assets';
+        TText(FBtnHome.Children[Hi].Children[Hj]).TextSettings.Font.Family :=
+          'Segoe MDL2 Assets';
+      end;
 
   FCrumbsBox := THorzScrollBox.Create(Self);
   FCrumbsBox.Parent := FTopBar;
@@ -1444,6 +1746,59 @@ begin
   FHeaderPaint.OnMouseDown := HeaderMouseDown;
   FHeaderPaint.Cursor := crHandPoint;
 
+  FNetBar := TRectangle.Create(Self);
+  FNetBar.Parent := FPathAndHeader;
+  FNetBar.Align := TAlignLayout.Top;
+  FNetBar.Height := 34;
+  FNetBar.Visible := False;
+  FNetBar.Stroke.Kind := TBrushKind.None;
+  FNetBar.Fill.Kind := TBrushKind.Solid;
+  FNetBar.Fill.Color := TAlphaColors.Null;
+  FNetBar.Position.Y := 28;
+  FNetSubnet := TFluentEdit.Create(Self);
+  FNetSubnet.Parent := FNetBar;
+  FNetSubnet.Align := TAlignLayout.Left;
+  FNetSubnet.Width := 168;
+  FNetSubnet.Margins.Rect := TRectF.Create(0, 4, 0, 4);
+  FNetSubnet.FillMode := fefSubtle;
+  FNetSubnet.Placeholder := '192.168.0.1-254';
+  FNetSubnet.OnSubmit := NetScanClick;
+  FNetSubnet.ApplyTheme(FColors);
+  FNetScan := CreateFluentButton(Self, FNetBar, #$E768, L('panel.net.scan'), fbkStandard, 168,
+    NetScanClick);
+  FNetScan.Align := TAlignLayout.Left;
+  FNetScan.Margins.Rect := TRectF.Create(6, 4, 0, 4);
+  FNetScan.Position.X := 200;
+  FNetScan.ApplyTheme(FColors);
+  FNetStop := CreateFluentButton(Self, FNetBar, #$E71A, L('panel.net.stop'), fbkSubtle, 96, NetStopClick);
+  TrButton(FNetStop, 'panel.net.stop');
+  FNetStop.Align := TAlignLayout.Left;
+  FNetStop.Margins.Rect := TRectF.Create(6, 4, 6, 4);
+  FNetStop.Position.X := 400;
+  FNetStop.Enabled := False;
+  FNetStop.ApplyTheme(FColors);
+  FNetAdd := TFluentEdit.Create(Self);
+  FNetAdd.Parent := FNetBar;
+  FNetAdd.Align := TAlignLayout.Client;
+  FNetAdd.Margins.Rect := TRectF.Create(0, 4, 0, 4);
+  FNetAdd.FillMode := fefSubtle;
+  TrPrompt(FNetAdd, 'panel.net.add');
+  FNetAdd.OnSubmit := NetAddSubmit;
+  FNetAdd.ApplyTheme(FColors);
+  FNetSubnet.Align := TAlignLayout.None;
+  FNetScan.Align := TAlignLayout.None;
+  FNetStop.Align := TAlignLayout.None;
+  FNetSubnet.Position.X := 0;
+  FNetScan.Position.X := 200;
+  FNetStop.Position.X := 400;
+  FNetSubnet.Index := 0;
+  FNetScan.Index := 1;
+  FNetStop.Index := 2;
+  FNetAdd.Index := 3;
+  FNetSubnet.Align := TAlignLayout.Left;
+  FNetScan.Align := TAlignLayout.Left;
+  FNetStop.Align := TAlignLayout.Left;
+
   FDriveBar := TDriveBar.Create(Self);
   FDriveBar.Parent := FChromeStack;
   FDriveBar.Align := TAlignLayout.Top;
@@ -1451,6 +1806,7 @@ begin
   FDriveBar.OnDriveClick := DriveBarClick;
   FDriveBar.OnDriveContext := DriveBarContext;
   FDriveBar.OnPlacesChanged := HandlePlacesChanged;
+  FDriveBar.OnPointerDown := ChromePointerDown;
   FDriveBar.ApplyTheme(FColors);
 
   UpdateChromeStackHeight;
@@ -1460,6 +1816,14 @@ begin
   BindDragEvents(Self);
   if Assigned(FCard) then
     BindDragEvents(FCard);
+  if Assigned(FHeaderBar) then
+    BindDragEvents(FHeaderBar);
+  if Assigned(FHeaderPaint) then
+    BindDragEvents(FHeaderPaint);
+  if Assigned(FCrumbsBox) then
+    BindDragEvents(FCrumbsBox);
+  if Assigned(FFooterPanel) then
+    BindDragEvents(FFooterPanel);
 
   FPreview := TFilePreview.Create(Self);
   FPreview.Parent := FCard;
@@ -1470,16 +1834,27 @@ begin
   FPreview.OnDiskChanged := PreviewDiskChanged;
   FPreview.ApplyTheme(FColors);
   UpdateHistoryButtons;
+  ApplyDriveHomeLayout;
 end;
 
 procedure TFilePanel.BtnDetailsClick(Sender: TObject);
 begin
-  SetViewMode(vmDetails);
+  if Assigned(FOnActivate) then
+    FOnActivate(Self);
+  if Assigned(FOnStatusView) then
+    FOnStatusView(Self, vmDetails)
+  else if ViewMode <> vmDetails then
+    SetViewMode(vmDetails);
 end;
 
 procedure TFilePanel.BtnTilesClick(Sender: TObject);
 begin
-  SetViewMode(vmTiles);
+  if Assigned(FOnActivate) then
+    FOnActivate(Self);
+  if Assigned(FOnStatusView) then
+    FOnStatusView(Self, vmTiles)
+  else if ViewMode <> vmTiles then
+    SetViewMode(vmTiles);
 end;
 
 procedure TFilePanel.BtnQuickViewClick(Sender: TObject);
@@ -1495,16 +1870,57 @@ begin
   end;
 end;
 
+procedure NotifyPreviewSaved(Sender: TObject);
+var
+  Path: string;
+  I: Integer;
+
+  procedure Walk(AObj: TFmxObject);
+  var
+    J: Integer;
+    Panel: TFilePanel;
+    Dir: string;
+  begin
+    if AObj = nil then
+      Exit;
+    if AObj is TFilePanel then
+    begin
+      Panel := TFilePanel(AObj);
+      Dir := ExtractFilePath(Path);
+      if SameText(IncludeTrailingPathDelimiter(Dir),
+                  IncludeTrailingPathDelimiter(Panel.CurrentPath)) then
+      begin
+        Panel.InvalidateView;
+        if Assigned(Panel.FThumbTimer) then
+          Panel.FThumbTimer.Enabled := True;
+        Panel.Refresh(Path);
+      end;
+    end;
+    for J := 0 to AObj.ChildrenCount - 1 do
+      Walk(AObj.Children[J]);
+  end;
+
+begin
+  if not (Sender is TFilePreview) then
+    Exit;
+  Path := TFilePreview(Sender).LastSavedPath;
+  if Path = '' then
+    Path := TFilePreview(Sender).FilePath;
+  if Path = '' then
+    Exit;
+  for I := 0 to Screen.FormCount - 1 do
+    Walk(Screen.Forms[I]);
+end;
+
 procedure TFilePanel.PreviewDiskChanged(Sender: TObject);
 begin
-  if Sender is TFilePreview then
-    Refresh(TFilePreview(Sender).FilePath);
+  NotifyPreviewSaved(Sender);
 end;
 
 function TFilePanel.PreviewEditKey(var Key: Word; Shift: TShiftState): Boolean;
 begin
   Result := Assigned(FPreview) and FPreview.Visible and
-    FPreview.HandleImageKey(Key, Shift);
+    (FPreview.HandleFontKey(Key, Shift) or FPreview.HandleImageKey(Key, Shift));
 end;
 
 procedure TFilePanel.PreviewCloseClick(Sender: TObject);
@@ -1528,12 +1944,25 @@ begin
   Result := Assigned(FPreview) and FPreview.Visible and FPreview.HasKeyboardFocus;
 end;
 
+procedure TFilePanel.SyncPreviewList;
+var
+  I: Integer;
+begin
+  { Полупрозрачный фон просмотра не должен смешиваться со списком.
+    Список прячем: сквозь стекло виден только материал окна. }
+  for I := 0 to FTabs.Count - 1 do
+    if Assigned(FTabs[I].ContainerLayout) then
+      FTabs[I].ContainerLayout.Visible :=
+        (not IsPreviewActive) and (I = FActiveTabIndex);
+end;
+
 procedure TFilePanel.ShowPreview(const APath: string);
 begin
   if FPreview = nil then
     Exit;
   FPreview.Visible := True;
   FPreview.BringToFront;
+  SyncPreviewList;
   FPreview.LoadFile(APath);
 end;
 
@@ -1543,6 +1972,7 @@ begin
     Exit;
   FPreview.ClearPreview;
   FPreview.Visible := False;
+  SyncPreviewList;
 end;
 
 procedure TFilePanel.PreviewFile(const APath: string);
@@ -1636,7 +2066,7 @@ var
 begin
   if not Assigned(FDriveLast) then
     Exit;
-  if (APath = '') or IsThisPCPath(APath) then
+  if (APath = '') or IsThisPCPath(APath) or IsVibeNetworkPath(APath) then
     Exit;
   Key := DriveMemoryKey(APath);
   if Key <> '' then
@@ -1684,6 +2114,277 @@ begin
     Result := ARoot;
 end;
 
+procedure TFilePanel.EnsureNetSession;
+begin
+  if FNet <> nil then
+    Exit;
+  FNet := TNetworkSession.Create;
+  FNet.OnChange := NetSessionChanged;
+  FNet.OnPrefs := NetPrefsChanged;
+  if FSettings <> nil then
+    FNet.LoadPrefs(FSettings.NetworkLastSubnet, FSettings.NetworkHistory);
+  if Assigned(FNetSubnet) and (FNetSubnet.Text = '') then
+    FNetSubnet.Text := FNet.ResolvedSubnet;
+end;
+
+procedure TFilePanel.ShowNetBar(AOn: Boolean);
+begin
+  if not Assigned(FNetBar) or not Assigned(FPathAndHeader) then
+    Exit;
+  FNetBar.Visible := AOn;
+  if AOn then
+    FPathAndHeader.Height := 84
+  else
+    FPathAndHeader.Height := 50;
+  UpdateChromeStackHeight;
+  SyncNetButtons;
+end;
+
+procedure TFilePanel.SyncNetButtons;
+var
+  Busy: Boolean;
+begin
+  Busy := Assigned(FNet) and FNet.Scanning;
+  if Assigned(FNetStop) then
+    FNetStop.Enabled := Busy;
+  if Assigned(FNetScan) then
+  begin
+    if Busy then
+      FNetScan.SetCaption(L('panel.net.scanning'))
+    else
+      FNetScan.SetCaption(L('panel.net.scan'));
+  end;
+end;
+
+procedure TFilePanel.StoreNetPrefs;
+begin
+  if (FSettings = nil) or (FNet = nil) or FDestroying then
+    Exit;
+  FSettings.NetworkLastSubnet := FNet.Subnet;
+  FSettings.NetworkHistory := FNet.HistoryText;
+  FSettings.SaveNetwork;
+end;
+
+procedure TFilePanel.NetPrefsChanged(Sender: TObject);
+begin
+  StoreNetPrefs;
+end;
+
+procedure TFilePanel.NetSessionChanged(Sender: TObject);
+begin
+  if FDestroying or not IsVibeNetworkPath(GetCurrentPathImpl) then
+    Exit;
+  PublishNetworkList;
+end;
+
+procedure TFilePanel.NetScanClick(Sender: TObject);
+var
+  Range: string;
+begin
+  EnsureNetSession;
+  Range := '';
+  if Assigned(FNetSubnet) then
+    Range := Trim(FNetSubnet.Text);
+  if Range = '' then
+  begin
+    Range := FNet.ResolvedSubnet;
+    if Assigned(FNetSubnet) then
+      FNetSubnet.Text := Range;
+  end;
+  FNet.Scan(Range);
+end;
+
+procedure TFilePanel.NetStopClick(Sender: TObject);
+begin
+  if FNet <> nil then
+    FNet.Stop;
+end;
+
+procedure TFilePanel.NetAddSubmit(Sender: TObject);
+begin
+  if (FNetAdd = nil) or (Trim(FNetAdd.Text) = '') then
+    Exit;
+  EnsureNetSession;
+  FNet.AddAddress(Trim(FNetAdd.Text));
+  FNetAdd.Text := '';
+end;
+
+procedure TFilePanel.NoteOpenedUnc(const APath: string);
+begin
+  if FDestroying or not IsUncPath(APath) or IsVibeNetworkPath(APath) then
+    Exit;
+  EnsureNetSession;
+  if FNet <> nil then
+    FNet.NoteOpened(APath);
+end;
+
+function TFilePanel.NetEntryAt(AVisual: Integer; out AEntry: TFileEntry): Boolean;
+var
+  Actual: Integer;
+  Entries: uFileModel.TFileEntryList;
+begin
+  Result := False;
+  AEntry := Default(TFileEntry);
+  Entries := GetCurrentEntries;
+  if not Assigned(Entries) then
+    Exit;
+  if not VisualToActual(AVisual, Actual) then
+    Exit;
+  if (Actual < 0) or (Actual >= Entries.Count) then
+    Exit;
+  AEntry := Entries[Actual];
+  Result := True;
+end;
+
+function TFilePanel.NetHeadRow(AVisual: Integer): Boolean;
+var
+  E: TFileEntry;
+begin
+  Result := NetEntryAt(AVisual, E) and SameText(E.IconKey, '#nethead');
+end;
+
+function TFilePanel.NetRecentVisual(AVisual: Integer): Boolean;
+var
+  E: TFileEntry;
+begin
+  Result := IsVibeNetworkRoot(GetCurrentPathImpl) and (FNet <> nil) and
+    NetEntryAt(AVisual, E) and FNet.IsRecentRow(E.FullPath);
+end;
+
+procedure TFilePanel.ShowNetRecentMenu(AVisual: Integer);
+var
+  E: TFileEntry;
+begin
+  if not NetRecentVisual(AVisual) or not NetEntryAt(AVisual, E) then
+    Exit;
+  if Assigned(FSelectionManager) and (FSelectionManager.CurrentIndex <> AVisual) then
+  begin
+    FSelectionManager.CurrentIndex := AVisual;
+    NotifyCursorChange;
+  end;
+  FNetHistPath := E.FullPath;
+  if FNetHistMenu = nil then
+  begin
+    FNetHistMenu := TFluentPopupMenu.Create(Self);
+    FNetHistMenu.Parent := Self;
+  end;
+  FNetHistMenu.ClearItems;
+  FNetHistMenu.AddItem(L('panel.net.forget'), '', NetHistForgetClick);
+  FNetHistMenu.ApplyTheme(FColors);
+  FNetHistMenu.PopupAtCursor;
+end;
+
+procedure TFilePanel.NetHistForgetClick(Sender: TObject);
+begin
+  if (FNet <> nil) and (FNetHistPath <> '') then
+    FNet.Forget(FNetHistPath);
+end;
+
+function TFilePanel.TryForgetNetworkRecent: Boolean;
+var
+  Sel: TArray<TFileEntry>;
+  I: Integer;
+begin
+  Result := False;
+  if (FNet = nil) or not IsVibeNetworkRoot(GetCurrentPathImpl) then
+    Exit;
+  Result := True;
+  Sel := SelectedEntries;
+  for I := 0 to High(Sel) do
+    if FNet.IsRecentRow(Sel[I].FullPath) then
+      FNet.Forget(Sel[I].FullPath);
+end;
+
+function TFilePanel.NetSkipDrag(AVisual: Integer): Boolean;
+var
+  E: TFileEntry;
+begin
+  Result := False;
+  if not IsVibeNetworkPath(GetCurrentPathImpl) then
+    Exit;
+  if not NetEntryAt(AVisual, E) then
+    Exit;
+  Result := SameText(E.IconKey, '#nethead') or SameText(E.IconKey, '#computer') or
+    SameText(E.IconKey, '#router') or SameText(E.IconKey, '#ftp') or
+    StartsText('network://', E.FullPath) or StartsText('ftp://', E.FullPath) or
+    StartsText('ftps://', E.FullPath) or StartsText('sftp://', E.FullPath) or
+    StartsText('http://', E.FullPath) or StartsText('https://', E.FullPath);
+end;
+
+function TFilePanel.NetColKind: Integer;
+var
+  P: string;
+begin
+  Result := 0;
+  P := GetCurrentPathImpl;
+  if not IsVibeNetworkPath(P) then
+    Exit;
+  if IsVibeNetworkRoot(P) then
+    Exit(1);
+  if StartsText('ftp://', P) or StartsText('ftps://', P) or
+     StartsText('sftp://', P) or StartsText('http://', P) or
+     StartsText('https://', P) then
+    Exit;
+  Result := 2;
+end;
+
+procedure TFilePanel.PublishNetworkList;
+var
+  Entries: uFileModel.TFileEntryList;
+  Tab: TFileTab;
+  Saved, Path: string;
+  Hit: TFileEntry;
+  Sel: TList<Integer>;
+begin
+  if FDestroying or (FNet = nil) then
+    Exit;
+  if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+    Exit;
+  Path := FTabs[FActiveTabIndex].Path;
+  if not IsVibeNetworkPath(Path) then
+    Exit;
+  Tab := FTabs[FActiveTabIndex];
+  Entries := Tab.Entries;
+  if Entries = nil then
+  begin
+    Entries := uFileModel.TFileEntryList.Create;
+    Tab.Entries := Entries;
+  end;
+  Saved := '';
+  if Assigned(FSelectionManager) and
+     NetEntryAt(FSelectionManager.CurrentIndex, Hit) then
+    Saved := Hit.FullPath;
+  Entries.Clear;
+  if IsVibeNetworkRoot(Path) then
+    FNet.FillRoot(Entries)
+  else
+    FNet.FillBrowse(Entries);
+  Tab.Loaded := True;
+  Tab.Loading := False;
+  Tab.Stale := False;
+  Tab.Offline := False;
+  Tab.LoadError := '';
+  Tab.Partial := False;
+  FTabs[FActiveTabIndex] := Tab;
+  Sel := GetCurrentSelectedIndices;
+  if Assigned(Sel) then
+    Sel.Clear;
+  if FNameFilter <> '' then
+    RebuildFilterMap
+  else
+    FFilterReady := False;
+  if Assigned(FSelectionManager) then
+    FPendingCursorIndex := FSelectionManager.CurrentIndex;
+  ApplyCursorAfterLoad(Entries, Saved, Saved = '');
+  RebuildContent;
+  KeepFocusVisible;
+  UpdateStatusText;
+  ShowNetBar(IsVibeNetworkRoot(Path));
+  SyncNetButtons;
+  if FWatchEnabled then
+    WatchTab(FActiveTabIndex);
+end;
+
 procedure TFilePanel.DriveBarClick(Sender: TObject; const ARoot: string);
 var
   Target, Key: string;
@@ -1693,6 +2394,12 @@ begin
     FOnActivate(Self);
   if ARoot = '' then
     Exit;
+  if SameText(ARoot, '\\') or SameText(ARoot, 'Network') or SameText(ARoot, 'Сеть') or
+     (StartsText('::{', ARoot) and SameText(ARoot, NetworkFolderPath)) then
+  begin
+    Navigate('network://');
+    Exit;
+  end;
   Target := ResolveDriveTarget(ARoot);
   if not IsListablePath(Target) then
     Target := ARoot;
@@ -1704,6 +2411,19 @@ begin
     FDriveLast.AddOrSetValue(Key, Target);
 end;
 
+procedure TFilePanel.OpenHomeFolder(const APath: string);
+begin
+  CancelPathEdit;
+  if Assigned(FOnActivate) then
+    FOnActivate(Self);
+  if APath = '' then
+    Exit;
+  if IsListablePath(APath) then
+    Navigate(APath)
+  else
+    ShowNotice(L('panel.folder.missing'));
+end;
+
 procedure TFilePanel.DriveBarContext(Sender: TObject; const ARoot: string);
 {$IFDEF MSWINDOWS}
 var
@@ -1712,6 +2432,8 @@ var
   Verb: string;
   Files: TArray<string>;
 begin
+  if Assigned(FOnActivate) then
+    FOnActivate(Self);
   if ARoot = '' then
     Exit;
   GetCursorPos(Pt);
@@ -1731,6 +2453,750 @@ procedure TFilePanel.SyncDriveBar;
 begin
   if Assigned(FDriveBar) then
     FDriveBar.SetActivePath(GetCurrentPathImpl);
+end;
+
+type
+  TDriveHomePopup = class(TPopup)
+  protected
+    procedure ApplyStyle; override;
+  end;
+
+procedure TDriveHomePopup.ApplyStyle;
+begin
+  inherited;
+  Padding.Rect := TRectF.Create(0, 0, 0, 0);
+end;
+
+function DriveHomeTitle(const AInfo: TDriveInfo): string;
+var
+  Name: string;
+begin
+  if AInfo.Kind = dkNetHood then
+    Exit(L('drive.network'));
+  Name := Trim(AInfo.VolumeName);
+  if Name = '' then
+    Name := DriveKindCaption(AInfo.Kind);
+  if AInfo.Letter <> '' then
+    Result := AInfo.Letter + ' ' + Name
+  else
+    Result := Name;
+end;
+
+function DriveHomeFree(const AInfo: TDriveInfo): string;
+begin
+  if AInfo.Kind in [dkNetHood, dkDevice, dkNetwork] then
+    Exit('');
+  if not AInfo.Ready then
+    Exit(L('drive.nodisk'));
+  if AInfo.TotalBytes <= 0 then
+    Exit('');
+  Result := Lf('drive.free', [FormatFileSize(AInfo.FreeBytes)]);
+end;
+
+procedure TFilePanel.SetShowDriveHome(AShow: Boolean);
+begin
+  if not AShow then
+    CloseDriveHome;
+  if (FShowDriveHome = AShow) and Assigned(FBtnHome) and
+     (FBtnHome.Visible = AShow) then
+    Exit;
+  FShowDriveHome := AShow;
+  ApplyDriveHomeLayout;
+end;
+
+procedure TFilePanel.ApplyDriveHomeLayout;
+const
+  BarOn = 30;
+  HeadOn = 58;
+  BarOff = 22;
+  HeadOff = 50;
+var
+  Show: Boolean;
+  BarH, HeadH: Single;
+  Changed: Boolean;
+begin
+  Show := FShowDriveHome;
+  if Assigned(FBtnHome) then
+    FBtnHome.Visible := Show;
+  if Show then
+  begin
+    BarH := BarOn;
+    HeadH := HeadOn;
+  end
+  else
+  begin
+    BarH := BarOff;
+    HeadH := HeadOff;
+    if Assigned(FBtnHome) then
+      FBtnHome.SetSelected(False);
+  end;
+  Changed := False;
+  if Assigned(FTopBar) and (Abs(FTopBar.Height - BarH) > 0.5) then
+  begin
+    FTopBar.Height := BarH;
+    Changed := True;
+  end;
+  if Assigned(FPathAndHeader) and (Abs(FPathAndHeader.Height - HeadH) > 0.5) then
+  begin
+    FPathAndHeader.Height := HeadH;
+    Changed := True;
+  end;
+  if not Changed then
+    Exit;
+  Realign;
+  if Assigned(FCrumbsHost) then
+    FCrumbsHost.Height := BarH;
+  UpdateChromeStackHeight;
+  RebuildBreadcrumbs;
+  if Assigned(FCrumbsHost) and (FCrumbsHost.Height < BarH) then
+    FCrumbsHost.Height := BarH;
+end;
+
+procedure TFilePanel.EnsureDriveHomePop;
+begin
+  if Assigned(FHomePop) then
+    Exit;
+  FHomePop := TDriveHomePopup.Create(Self);
+  FHomePop.Parent := Self;
+  FHomePop.ClipChildren := False;
+  FHomePop.Padding.Rect := TRectF.Create(0, 0, 0, 0);
+  FHomePop.Placement := TPlacement.Bottom;
+  FHomePop.OnClosePopup := HomePopClosed;
+
+  FHomeCard := TRectangle.Create(Self);
+  FHomeCard.Parent := FHomePop;
+  FHomeCard.Align := TAlignLayout.Client;
+  FHomeCard.Margins.Rect := TRectF.Create(18, 14, 18, 22);
+  FHomeCard.XRadius := 8;
+  FHomeCard.YRadius := 8;
+  FHomeCard.Stroke.Kind := TBrushKind.Solid;
+  FHomeCard.Stroke.Thickness := 1;
+  FHomeCard.Fill.Kind := TBrushKind.Solid;
+  FHomeCard.Fill.Color := FColors.CardBackground;
+  FHomeCard.Stroke.Color := FColors.CardStroke;
+  FHomeCard.Padding.Rect := TRectF.Create(8, 8, 8, 8);
+  FHomeCard.ClipChildren := False;
+
+  FHomeShadow := TShadowEffect.Create(FHomeCard);
+  FHomeShadow.Parent := FHomeCard;
+  ApplyFluentShadow(FHomeShadow, FColors.IsDark);
+
+  FHomeScroll := TVertScrollBox.Create(Self);
+  FHomeScroll.Parent := FHomeCard;
+  FHomeScroll.Align := TAlignLayout.Client;
+  FHomeScroll.ShowScrollBars := False;
+  FHomeScroll.ShowSizeGrip := False;
+  FHomeScroll.AniCalculations.AutoShowing := False;
+  FHomeScroll.OnResize := HomeScrollResize;
+  FHomeScroll.OnViewportPositionChange := HomeScrollViewport;
+  FHomeBar := TCustomFileScrollbar.Create(FHomeCard, FHomeScroll);
+  FHomeBar.ApplyTheme(FColors);
+
+  FHomeList := TLayout.Create(Self);
+  FHomeList.Parent := FHomeScroll;
+  FHomeList.Align := TAlignLayout.None;
+  FHomeList.Anchors := [TAnchorKind.akLeft, TAnchorKind.akTop];
+  FHomeList.HitTest := False;
+  FHomeList.SetBounds(0, 0, 260, 0);
+end;
+
+function TFilePanel.DriveHomeMaxBody: Single;
+var
+  FormH, Bottom, Space: Single;
+begin
+  Result := 360;
+  if not (Root is TCommonCustomForm) or not Assigned(FBtnHome) then
+    Exit;
+  FormH := TCommonCustomForm(Root).ClientHeight;
+  Bottom := FBtnHome.AbsoluteRect.Bottom;
+  Space := FormH - Bottom - 8 - 14 - 22;
+  if Space < 48 then
+    Space := 48;
+  Result := Space;
+end;
+
+function TFilePanel.HomeFolderBitmap(const APath: string): FMX.Graphics.TBitmap;
+var
+  Entry: TFileEntry;
+  Name: string;
+begin
+  Result := nil;
+  if (APath = '') or not Assigned(GlobalIconCache) then
+    Exit;
+  Entry := Default(TFileEntry);
+  Name := ExtractFileName(ExcludeTrailingPathDelimiter(APath));
+  if Name = '' then
+    Name := APath;
+  Entry.FullPath := APath;
+  Entry.Name := Name;
+  Entry.IsDirectory := True;
+  PrepareFileEntry(Entry);
+  Result := GlobalIconCache.GetForPaint(Entry, SelectIconBucket(20), IconSceneScale);
+end;
+
+procedure TFilePanel.RefreshHomeFolderIcons;
+var
+  I, J: Integer;
+  Row: TFmxObject;
+  Img: TImage;
+  Bmp: FMX.Graphics.TBitmap;
+begin
+  if not Assigned(FHomeList) then
+    Exit;
+  for I := 0 to FHomeList.ControlsCount - 1 do
+  begin
+    Row := FHomeList.Controls[I];
+    if not (Row is TRectangle) or (TRectangle(Row).Tag <> 2) then
+      Continue;
+    Img := nil;
+    for J := 0 to Row.ChildrenCount - 1 do
+      if Row.Children[J] is TImage then
+      begin
+        Img := TImage(Row.Children[J]);
+        Break;
+      end;
+    if Img = nil then
+      Continue;
+    Bmp := HomeFolderBitmap(TRectangle(Row).TagString);
+    if Assigned(Bmp) and (Bmp.Width > 0) then
+    begin
+      Img.Bitmap.Assign(Bmp);
+      Img.Visible := True;
+    end;
+  end;
+end;
+
+procedure TFilePanel.AppendDriveHomeRow(AKind: Integer; const ACaption, APath: string;
+  var AY: Single; ARowW: Single);
+const
+  RowH = 40;
+  SepH = 13;
+var
+  Row, Line, XBtn: TRectangle;
+  Title, XCap: TText;
+  Icon: TImage;
+  Bmp: FMX.Graphics.TBitmap;
+begin
+  if not Assigned(FHomeList) then
+    Exit;
+  if AKind = 0 then
+  begin
+    Line := TRectangle.Create(FHomeList);
+    Line.Parent := FHomeList;
+    Line.Align := TAlignLayout.None;
+    Line.Anchors := [TAnchorKind.akLeft, TAnchorKind.akTop];
+    Line.SetBounds(8, AY + 6, Max(0, ARowW - 16), 1);
+    Line.HitTest := False;
+    Line.Stroke.Kind := TBrushKind.None;
+    Line.Fill.Kind := TBrushKind.Solid;
+    Line.Fill.Color := FColors.CardStroke;
+    AY := AY + SepH;
+    Exit;
+  end;
+
+  Row := TRectangle.Create(FHomeList);
+  Row.Parent := FHomeList;
+  Row.Align := TAlignLayout.None;
+  Row.Anchors := [TAnchorKind.akLeft, TAnchorKind.akTop];
+  Row.SetBounds(0, AY, ARowW, RowH);
+  Row.XRadius := 4;
+  Row.YRadius := 4;
+  Row.Stroke.Kind := TBrushKind.Solid;
+  Row.Stroke.Thickness := 1;
+  Row.Fill.Kind := TBrushKind.Solid;
+  Row.Fill.Color := TAlphaColors.Null;
+  Row.Stroke.Color := TAlphaColors.Null;
+  Row.HitTest := True;
+  Row.Cursor := crHandPoint;
+  Row.Tag := 2;
+  Row.TagString := APath;
+  Row.OnMouseUp := HomeRowMouseUp;
+  Row.OnMouseEnter := HomeRowEnter;
+  Row.OnMouseLeave := HomeRowLeave;
+
+  Title := TText.Create(Row);
+  Title.Parent := Row;
+  Title.Align := TAlignLayout.Client;
+  Title.HitTest := False;
+  Title.WordWrap := False;
+  Title.TextSettings.WordWrap := False;
+  Title.TextSettings.Trimming := TTextTrimming.Character;
+  Title.Margins.Rect := TRectF.Create(2, 0, 4, 0);
+  ApplyFluentText(Title, 13, False);
+  Title.TextSettings.FontColor := FColors.TextColor;
+  Title.TextSettings.HorzAlign := TTextAlign.Leading;
+  Title.TextSettings.VertAlign := TTextAlign.Center;
+  Title.Text := ACaption;
+
+  XBtn := TRectangle.Create(Row);
+  XBtn.Parent := Row;
+  XBtn.Align := TAlignLayout.Right;
+  XBtn.Width := 22;
+  XBtn.Margins.Rect := TRectF.Create(0, 9, 6, 9);
+  XBtn.XRadius := 4;
+  XBtn.YRadius := 4;
+  XBtn.Stroke.Kind := TBrushKind.None;
+  XBtn.Fill.Kind := TBrushKind.Solid;
+  XBtn.Fill.Color := TAlphaColors.Null;
+  XBtn.HitTest := True;
+  XBtn.Visible := False;
+  XBtn.Tag := 7;
+  XBtn.Cursor := crHandPoint;
+  TrHint(XBtn, 'panel.hint.unpin');
+  XBtn.OnMouseEnter := HomeUnpinEnter;
+  XBtn.OnMouseLeave := HomeUnpinLeave;
+  XBtn.OnMouseUp := HomeUnpinMouseUp;
+  XCap := TText.Create(XBtn);
+  XCap.Parent := XBtn;
+  XCap.Align := TAlignLayout.Client;
+  XCap.HitTest := False;
+  XCap.Text := #$E711;
+  XCap.TextSettings.Font.Family := FluentIconFamily;
+  XCap.TextSettings.Font.Size := 10;
+  XCap.TextSettings.FontColor := FColors.SubTextColor;
+  XCap.TextSettings.HorzAlign := TTextAlign.Center;
+  XCap.TextSettings.VertAlign := TTextAlign.Center;
+
+  Icon := TImage.Create(Row);
+  Icon.Parent := Row;
+  Icon.Align := TAlignLayout.Left;
+  Icon.Width := 20;
+  Icon.Margins.Rect := TRectF.Create(8, 8, 6, 8);
+  Icon.WrapMode := TImageWrapMode.Fit;
+  Icon.HitTest := False;
+  Bmp := HomeFolderBitmap(APath);
+  if Assigned(Bmp) and (Bmp.Width > 0) then
+    Icon.Bitmap.Assign(Bmp)
+  else
+    Icon.Visible := False;
+  AY := AY + RowH;
+end;
+
+procedure TFilePanel.RebuildDriveHomeList;
+const
+  BodyW = 280;
+  RowH = 40;
+  Pad = 8;
+  ShadowL = 18;
+  ShadowT = 14;
+  ShadowR = 18;
+  ShadowB = 22;
+var
+  I, N: Integer;
+  Tile: TDriveTile;
+  Info: TDriveInfo;
+  Row: TRectangle;
+  Icon: TImage;
+  Glyph, Title, FreeTx: TText;
+  FreeText: string;
+  RowsH, BodyH, RowW, MaxBody, Y: Single;
+  NeedScroll: Boolean;
+  Home: TExplorerHome;
+  P: Integer;
+begin
+  if not Assigned(FHomeList) or not Assigned(FDriveBar) or not Assigned(FHomePop) then
+    Exit;
+  while FHomeList.ControlsCount > 0 do
+    FHomeList.Controls[0].Free;
+
+  N := FDriveBar.PlaceCount;
+  Home := ReadExplorerHome;
+  RowsH := N * RowH;
+  if (Length(Home.Pinned) > 0) or (Length(Home.Frequent) > 0) then
+  begin
+    RowsH := RowsH + 13 + Length(Home.Pinned) * RowH;
+    if Length(Home.Frequent) > 0 then
+    begin
+      if Length(Home.Pinned) > 0 then
+        RowsH := RowsH + 13;
+      RowsH := RowsH + Length(Home.Frequent) * RowH;
+    end;
+  end;
+  MaxBody := DriveHomeMaxBody;
+  if RowsH + Pad * 2 > MaxBody then
+  begin
+    BodyH := MaxBody;
+    NeedScroll := True;
+  end
+  else
+  begin
+    BodyH := RowsH + Pad * 2;
+    if BodyH < RowH then
+      BodyH := RowH;
+    NeedScroll := False;
+  end;
+  RowW := BodyW - Pad * 2;
+  if NeedScroll then
+    RowW := RowW - 14;
+
+  FHomePop.Width := BodyW + ShadowL + ShadowR;
+  FHomePop.Height := BodyH + ShadowT + ShadowB;
+  FHomeList.SetBounds(0, 0, RowW, RowsH);
+
+  Y := 0;
+  for I := 0 to N - 1 do
+  begin
+    Tile := FDriveBar.PlaceTile(I);
+    if Tile = nil then
+    begin
+      Y := Y + RowH;
+      Continue;
+    end;
+    Info := Tile.Info;
+    Row := TRectangle.Create(FHomeList);
+    Row.Parent := FHomeList;
+    Row.Align := TAlignLayout.None;
+    Row.Anchors := [TAnchorKind.akLeft, TAnchorKind.akTop];
+    Row.SetBounds(0, Y, RowW, RowH);
+    Y := Y + RowH;
+    Row.XRadius := 4;
+    Row.YRadius := 4;
+    Row.Stroke.Kind := TBrushKind.Solid;
+    Row.Stroke.Thickness := 1;
+    Row.Fill.Kind := TBrushKind.Solid;
+    Row.HitTest := True;
+    Row.Cursor := crHandPoint;
+    Row.TagString := Info.Root;
+    Row.OnMouseUp := HomeRowMouseUp;
+    Row.OnMouseEnter := HomeRowEnter;
+    Row.OnMouseLeave := HomeRowLeave;
+    if Tile.IsActive then
+    begin
+      Row.Tag := 1;
+      Row.Fill.Color := FColors.AccentSubtle;
+      Row.Stroke.Color := FColors.SelectionColor;
+    end
+    else
+    begin
+      Row.Tag := 0;
+      Row.Fill.Color := TAlphaColors.Null;
+      Row.Stroke.Color := TAlphaColors.Null;
+    end;
+
+    Icon := TImage.Create(Row);
+    Icon.Parent := Row;
+    Icon.Align := TAlignLayout.Left;
+    Icon.Width := 20;
+    Icon.Margins.Rect := TRectF.Create(8, 8, 6, 8);
+    Icon.WrapMode := TImageWrapMode.Fit;
+    Icon.HitTest := False;
+    Tile.AssignShellIcon(Icon.Bitmap);
+    Icon.Visible := Icon.Bitmap.Width > 0;
+
+    Glyph := TText.Create(Row);
+    Glyph.Parent := Row;
+    Glyph.Align := TAlignLayout.Left;
+    Glyph.Width := 22;
+    Glyph.Margins.Rect := TRectF.Create(8, 0, 4, 0);
+    Glyph.Text := DriveKindIcon(Info.Kind);
+    Glyph.Font.Family := 'Segoe MDL2 Assets';
+    Glyph.Font.Size := 16;
+    Glyph.TextSettings.Font.Family := 'Segoe MDL2 Assets';
+    Glyph.TextSettings.Font.Size := 16;
+    Glyph.TextSettings.FontColor := FColors.TextColor;
+    Glyph.TextSettings.HorzAlign := TTextAlign.Center;
+    Glyph.TextSettings.VertAlign := TTextAlign.Center;
+    Glyph.HitTest := False;
+    Glyph.Visible := not Icon.Visible;
+
+    FreeText := DriveHomeFree(Info);
+    FreeTx := TText.Create(Row);
+    FreeTx.Parent := Row;
+    FreeTx.Align := TAlignLayout.Right;
+    FreeTx.HitTest := False;
+    FreeTx.WordWrap := False;
+    FreeTx.TextSettings.WordWrap := False;
+    FreeTx.TextSettings.Trimming := TTextTrimming.Character;
+    ApplyFluentText(FreeTx, 11, False);
+    FreeTx.TextSettings.FontColor := FColors.SubTextColor;
+    FreeTx.TextSettings.HorzAlign := TTextAlign.Trailing;
+    FreeTx.TextSettings.VertAlign := TTextAlign.Center;
+    FreeTx.Text := FreeText;
+    FreeTx.Visible := FreeText <> '';
+    if FreeTx.Visible then
+    begin
+      FreeTx.Width := 122;
+      FreeTx.Margins.Rect := TRectF.Create(4, 0, 8, 0);
+    end
+    else
+      FreeTx.Width := 0;
+
+    Title := TText.Create(Row);
+    Title.Parent := Row;
+    Title.Align := TAlignLayout.Client;
+    Title.HitTest := False;
+    Title.WordWrap := False;
+    Title.TextSettings.WordWrap := False;
+    Title.TextSettings.Trimming := TTextTrimming.Character;
+    Title.Margins.Rect := TRectF.Create(2, 0, 4, 0);
+    ApplyFluentText(Title, 13, False);
+    Title.TextSettings.FontColor := FColors.TextColor;
+    Title.TextSettings.HorzAlign := TTextAlign.Leading;
+    Title.TextSettings.VertAlign := TTextAlign.Center;
+    Title.Text := DriveHomeTitle(Info);
+  end;
+  if (Length(Home.Pinned) > 0) or (Length(Home.Frequent) > 0) then
+  begin
+    AppendDriveHomeRow(0, '', '', Y, RowW);
+    for P := 0 to High(Home.Pinned) do
+      AppendDriveHomeRow(2, Home.Pinned[P].Caption, Home.Pinned[P].Path, Y, RowW);
+    if Length(Home.Frequent) > 0 then
+    begin
+      if Length(Home.Pinned) > 0 then
+        AppendDriveHomeRow(0, '', '', Y, RowW);
+      for P := 0 to High(Home.Frequent) do
+        AppendDriveHomeRow(2, Home.Frequent[P].Caption, Home.Frequent[P].Path, Y, RowW);
+    end;
+  end;
+  FHomeList.Height := Y;
+  RefreshHomeFolderIcons;
+  if Assigned(FThumbTimer) then
+    FThumbTimer.Enabled := True;
+  if Assigned(FHomeScroll) then
+  begin
+    FHomeScroll.ViewportPosition := TPointF.Create(0, 0);
+    FHomeScroll.InvalidateContentSize;
+    FHomeScroll.RealignContent;
+  end;
+  SyncHomeScroll;
+end;
+
+procedure TFilePanel.SyncHomeScroll;
+begin
+  if Assigned(FHomeBar) then
+    FHomeBar.UpdateThumb;
+end;
+
+procedure TFilePanel.HomeScrollResize(Sender: TObject);
+begin
+  SyncHomeScroll;
+end;
+
+procedure TFilePanel.HomeScrollViewport(Sender: TObject;
+  const OldViewportPosition, NewViewportPosition: TPointF;
+  const ContentSizeChanged: Boolean);
+begin
+  SyncHomeScroll;
+end;
+
+procedure TFilePanel.OpenDriveHome;
+begin
+  if not FShowDriveHome or not Assigned(FBtnHome) or not Assigned(FDriveBar) then
+    Exit;
+  EnsureDriveHomePop;
+  if FDriveBar.PlaceCount = 0 then
+    FDriveBar.PopulateLetters;
+  SyncDriveBar;
+  RebuildDriveHomeList;
+  FBtnHome.SetSelected(True);
+  FHomePop.PlacementTarget := FBtnHome;
+  FHomePop.Placement := TPlacement.Bottom;
+  FHomePop.HorizontalOffset := -18;
+  FHomePop.VerticalOffset := -10;
+  FHomePop.IsOpen := True;
+end;
+
+procedure TFilePanel.CloseDriveHome;
+begin
+  if Assigned(FBtnHome) then
+    FBtnHome.SetSelected(False);
+  if Assigned(FHomePop) and FHomePop.IsOpen then
+    FHomePop.IsOpen := False;
+end;
+
+function TFilePanel.DriveHomeIsOpen: Boolean;
+begin
+  Result := Assigned(FHomePop) and FHomePop.IsOpen;
+end;
+
+function TFilePanel.DriveHomeEnabled: Boolean;
+begin
+  Result := FShowDriveHome;
+end;
+
+function TFilePanel.ToggleDriveHome: Boolean;
+begin
+  Result := FShowDriveHome and Assigned(FBtnHome);
+  if not Result then
+    Exit;
+  if DriveHomeIsOpen then
+    CloseDriveHome
+  else
+  begin
+    if Assigned(FOnActivate) then
+      FOnActivate(Self);
+    if FShowDriveHome then
+      OpenDriveHome;
+  end;
+end;
+
+procedure TFilePanel.HomeClick(Sender: TObject);
+begin
+  {$IFDEF MSWINDOWS}
+  if (FHomeClosedAt <> 0) and (GetTickCount64 - FHomeClosedAt < 300) then
+    Exit;
+  {$ENDIF}
+  if IsPreviewActive then
+    HidePreview;
+  ToggleDriveHome;
+end;
+
+procedure TFilePanel.HomePopClosed(Sender: TObject);
+begin
+  {$IFDEF MSWINDOWS}
+  FHomeClosedAt := GetTickCount64;
+  {$ENDIF}
+  if Assigned(FBtnHome) then
+    FBtnHome.SetSelected(False);
+end;
+
+procedure TFilePanel.HomeRowMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+var
+  RootPath: string;
+  Kind: Integer;
+  Btn: TMouseButton;
+begin
+  if not (Sender is TRectangle) then
+    Exit;
+  RootPath := TRectangle(Sender).TagString;
+  Kind := TRectangle(Sender).Tag;
+  Btn := Button;
+  TThread.ForceQueue(nil,
+    procedure
+    begin
+      if FDestroying then
+        Exit;
+      CloseDriveHome;
+      if Btn = TMouseButton.mbRight then
+        DriveBarContext(Self, RootPath)
+      else if Btn = TMouseButton.mbLeft then
+      begin
+        if Kind = 2 then
+          OpenHomeFolder(RootPath)
+        else
+          DriveBarClick(Self, RootPath);
+      end;
+    end);
+end;
+
+procedure TFilePanel.ShowHomeUnpin(ARow: TRectangle; AOn: Boolean);
+var
+  I: Integer;
+  C: TFmxObject;
+begin
+  if ARow = nil then
+    Exit;
+  for I := 0 to ARow.ChildrenCount - 1 do
+  begin
+    C := ARow.Children[I];
+    if (C is TControl) and (TControl(C).Tag = 7) then
+      TControl(C).Visible := AOn;
+  end;
+end;
+
+function HomeRowStillHot(ARow: TControl): Boolean;
+var
+  P: TPointF;
+begin
+  Result := False;
+  if ARow = nil then
+    Exit;
+  P := ARow.ScreenToLocal(Screen.MousePos);
+  Result := ARow.LocalRect.Contains(P);
+end;
+
+procedure TFilePanel.HomeRowEnter(Sender: TObject);
+var
+  Row: TRectangle;
+begin
+  if not (Sender is TRectangle) then
+    Exit;
+  Row := TRectangle(Sender);
+  if Row.Tag = 7 then
+    Exit;
+  Row.Fill.Color := FColors.ControlFillHover;
+  Row.Stroke.Color := FColors.ControlStroke;
+  if Row.Tag = 2 then
+    ShowHomeUnpin(Row, True);
+end;
+
+procedure TFilePanel.HomeRowLeave(Sender: TObject);
+var
+  Row: TRectangle;
+begin
+  if not (Sender is TRectangle) then
+    Exit;
+  Row := TRectangle(Sender);
+  if Row.Tag = 7 then
+    Exit;
+  if HomeRowStillHot(Row) then
+    Exit;
+  ShowHomeUnpin(Row, False);
+  if Row.Tag = 1 then
+  begin
+    Row.Fill.Color := FColors.AccentSubtle;
+    Row.Stroke.Color := FColors.SelectionColor;
+  end
+  else
+  begin
+    Row.Fill.Color := TAlphaColors.Null;
+    Row.Stroke.Color := TAlphaColors.Null;
+  end;
+end;
+
+procedure TFilePanel.HomeUnpinEnter(Sender: TObject);
+var
+  Btn: TRectangle;
+  I: Integer;
+begin
+  if not (Sender is TRectangle) then
+    Exit;
+  Btn := TRectangle(Sender);
+  Btn.Fill.Color := FColors.ControlStroke;
+  for I := 0 to Btn.ChildrenCount - 1 do
+    if Btn.Children[I] is TText then
+      TText(Btn.Children[I]).TextSettings.FontColor := FColors.TextColor;
+  if Btn.Parent is TRectangle then
+    HomeRowEnter(Btn.Parent);
+end;
+
+procedure TFilePanel.HomeUnpinLeave(Sender: TObject);
+var
+  Btn: TRectangle;
+  I: Integer;
+begin
+  if not (Sender is TRectangle) then
+    Exit;
+  Btn := TRectangle(Sender);
+  Btn.Fill.Color := TAlphaColors.Null;
+  for I := 0 to Btn.ChildrenCount - 1 do
+    if Btn.Children[I] is TText then
+      TText(Btn.Children[I]).TextSettings.FontColor := FColors.SubTextColor;
+  if Btn.Parent is TRectangle then
+    HomeRowLeave(Btn.Parent);
+end;
+
+procedure TFilePanel.HomeUnpinMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+var
+  Path: string;
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  if not (Sender is TControl) or not (TControl(Sender).Parent is TRectangle) then
+    Exit;
+  Path := TRectangle(TControl(Sender).Parent).TagString;
+  if Path = '' then
+    Exit;
+  TThread.ForceQueue(nil,
+    procedure
+    begin
+      if FDestroying then
+        Exit;
+      if UnpinHomePlace(Path) and DriveHomeIsOpen then
+        RebuildDriveHomeList;
+    end);
 end;
 
 function TFilePanel.TabPathStillAvailable(const APath: string;
@@ -1840,6 +3306,8 @@ begin
     Refresh('', True);
 
   SyncDriveBar;
+  if DriveHomeIsOpen then
+    RebuildDriveHomeList;
 end;
 
 function ItemPathAtVisual(APanel: TFilePanel; AIndex: Integer): string;
@@ -1986,6 +3454,25 @@ var
   Target: Integer;
   Bucket: TIconBucket;
 begin
+  if SameText(AEntry.IconKey, '#nethead') then
+    Exit;
+  if SameText(AEntry.IconKey, '#computer') or SameText(AEntry.IconKey, '#router') or
+     SameText(AEntry.IconKey, '#ftp') then
+  begin
+    Canvas.Fill.Color := FColors.TextColor;
+    Canvas.Font.Family := 'Segoe MDL2 Assets';
+    Canvas.Font.Size := Max(10, ARect.Height * 0.72);
+    if SameText(AEntry.IconKey, '#router') then
+      Canvas.FillText(ARect, #$E968, False, AOpacity, [], TTextAlign.Center,
+        TTextAlign.Center)
+    else if SameText(AEntry.IconKey, '#ftp') then
+      Canvas.FillText(ARect, #$E774, False, AOpacity, [], TTextAlign.Center,
+        TTextAlign.Center)
+    else
+      Canvas.FillText(ARect, #$E7F8, False, AOpacity, [], TTextAlign.Center,
+        TTextAlign.Center);
+    Exit;
+  end;
   Bmp := nil;
   Target := Max(1, Round(Min(ARect.Width, ARect.Height)));
   Bucket := SelectIconBucket(Target);
@@ -2036,11 +3523,10 @@ end;
 procedure TFilePanel.SetSort(AField: TSortField);
 var
   Tab: TFileTab;
-  SelectedPaths: TStringList;
-  FocusedPath: string;
-  Entries: uFileModel.TFileEntryList;
 begin
   if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+    Exit;
+  if IsVibeNetworkPath(GetCurrentPathImpl) then
     Exit;
 
   Tab := FTabs[FActiveTabIndex];
@@ -2052,24 +3538,57 @@ begin
     Tab.SortAsc := True;
   end;
   FTabs[FActiveTabIndex] := Tab;
+  FSizeSortPending := False;
+  FSizeSortTick := 0;
 
+  ResortActiveEntries;
+end;
+
+procedure TFilePanel.ResortActiveEntries(AFollowFocus: Boolean);
+var
+  Tab: TFileTab;
+  SelectedPaths: TStringList;
+  FocusedPath: string;
+  Entries: uFileModel.TFileEntryList;
+  Snap: Boolean;
+begin
+  if FDestroying then
+    Exit;
+  if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+    Exit;
+  if IsVibeNetworkPath(GetCurrentPathImpl) then
+    Exit;
+  if Assigned(FRenameEdit) and FRenameEdit.Visible then
+    Exit;
+
+  Tab := FTabs[FActiveTabIndex];
   Entries := Tab.Entries;
   if not Assigned(Entries) then
     Exit;
 
   SelectedPaths := TStringList.Create;
   SelectedPaths.CaseSensitive := False;
+  Snap := (Tab.SortField = sfSize) and Assigned(GlobalFolderSizes) and FolderSizesShown;
+  if Snap then
+    GlobalFolderSizes.BeginSortSnapshot;
   try
     CaptureFilterIdentity(SelectedPaths, FocusedPath);
     SortEntries(Entries, Tab.SortField, Tab.SortAsc);
     RebuildFilterMap;
-    RestoreFilterIdentity(SelectedPaths, FocusedPath, False, True);
+    { Фоновый пересчёт не тянет курсор в видимую область — иначе список прыгает. }
+    RestoreFilterIdentity(SelectedPaths, FocusedPath, False, AFollowFocus);
+    if not AFollowFocus then
+      InvalidateView;
   finally
     SelectedPaths.Free;
+    if Snap then
+      GlobalFolderSizes.EndSortSnapshot;
   end;
 
-  if Assigned(FHeaderPaint) then
+  if AFollowFocus and Assigned(FHeaderPaint) then
     FHeaderPaint.Repaint;
+  FThumbKey := '';
+  OrderVisibleThumbs;
 end;
 
 procedure TFilePanel.HeaderPaint(Sender: TObject; Canvas: TCanvas);
@@ -2081,9 +3600,10 @@ var
   var
     LAlign: TTextAlign;
   begin
-    // Если ПЛИТКИ — текст всегда по центру. Если ПОДРОБНО — размер/дата справа, имя слева.
     if (ViewMode = vmTiles) or ((ViewMode = vmDetails) and FColTwoLine) then
       LAlign := TTextAlign.Center
+    else if (FColNetMode = 1) and (AField = sfSize) then
+      LAlign := TTextAlign.Leading
     else if (AField = sfSize) or (AField = sfDate) then
       LAlign := TTextAlign.Trailing
     else
@@ -2100,10 +3620,14 @@ var
       Canvas.Fill.Color := FColors.SubTextColor;
 
     var Caption := ACaption;
-    if SortField = AField then
+    if (SortField = AField) and not IsVibeNetworkPath(GetCurrentPathImpl) then
       Caption := Caption + IfThen(SortAscending, ' ↑', ' ↓');
 
-    Canvas.FillText(ARect, Caption, False, 1, [], LAlign, TTextAlign.Center);
+    { Center кладёт подпись оптически низко. Сдвиг rect на 3px поднимает
+      «Имя / Тип / Размер / Дата» и стрелку сортировки вместе. }
+    var TextR := ARect;
+    TextR.Offset(0, -3);
+    Canvas.FillText(TextR, Caption, False, 1, [], LAlign, TTextAlign.Center);
   end;
 
 
@@ -2111,8 +3635,13 @@ begin
   W := FHeaderBar.Width;
   Canvas.BeginScene;
   try
-    Canvas.Fill.Color := FColors.HeaderBackground;
-    Canvas.FillRect(TRectF.Create(0, 0, W, FHeaderBar.Height), 0, 0, [], 1);
+    { При альфе меньше $FF плашка уже есть у FPathAndHeader.
+      Второй слой той же краски делает заголовок колонок плотнее строки пути. }
+    if TAlphaColorRec(FColors.HeaderBackground).A >= 255 then
+    begin
+      Canvas.Fill.Color := FColors.HeaderBackground;
+      Canvas.FillRect(TRectF.Create(0, 0, W, FHeaderBar.Height), 0, 0, [], 1);
+    end;
 
     Canvas.Stroke.Kind := TBrushKind.Solid;
     Canvas.Stroke.Color := FColors.DividerColor;
@@ -2131,44 +3660,60 @@ begin
     if CurrentScrollBox <> nil then
     begin
       ListW := CurrentScrollBox.Width;
-      Off := FHeaderBar.AbsoluteRect.Left - CurrentScrollBox.AbsoluteRect.Left;
+      Off := ColumnHeaderShift;
     end;
     GetHeaderColumnBounds(ListW, NameL, NameR, TypeL, TypeR, SizeL, SizeR, DateL, DateR);
-    DrawCol(TRectF.Create(NameL - Off, 0, NameR - Off, FHeaderBar.Height), 'Имя', sfName);
+    DrawCol(TRectF.Create(NameL - Off, 0, NameR - Off, FHeaderBar.Height), L('panel.col.name'), sfName);
+    var TypeCap := L('panel.col.type');
+    var SizeCap := L('panel.col.size');
+    if FColNetMode = 1 then
+    begin
+      TypeCap := 'IP';
+      SizeCap := L('panel.col.type');
+    end;
     if (ViewMode = vmDetails) and FColTwoLine then
     begin
       if TypeR - TypeL > 4 then
-        DrawCol(TRectF.Create(TypeL - Off, 0, TypeR - Off, FHeaderBar.Height), 'Тип', sfExt);
+        DrawCol(TRectF.Create(TypeL - Off, 0, TypeR - Off, FHeaderBar.Height), TypeCap, sfExt);
       if SizeR - SizeL > 4 then
       begin
         if IsThisPCPath(GetCurrentPathImpl) then
           DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height),
-            'Свободно / занято', sfSize)
+            L('panel.col.freeused'), sfSize)
         else
-          DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height), 'Размер', sfSize);
+          DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height), SizeCap, sfSize);
       end;
-      if (not IsThisPCPath(GetCurrentPathImpl)) and (DateR - DateL > 4) then
-        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), 'Дата', sfDate);
+      if (not IsThisPCPath(GetCurrentPathImpl)) and (FColDateMode <> dcmHidden) and
+         (DateR - DateL > 4) then
+        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), L('panel.col.date'), sfDate);
     end
     else
     begin
       if FColShowType and (TypeR - TypeL > 4) then
-        DrawCol(TRectF.Create(TypeL - Off, 0, TypeR - Off, FHeaderBar.Height), 'Тип', sfExt);
+        DrawCol(TRectF.Create(TypeL - Off, 0, TypeR - Off, FHeaderBar.Height), TypeCap, sfExt);
       if FColShowSize and (SizeR - SizeL > 4) then
       begin
         if IsThisPCPath(GetCurrentPathImpl) then
           DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height),
-            'Свободно / занято', sfSize)
+            L('panel.col.freeused'), sfSize)
         else
-          DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height), 'Размер', sfSize);
+          DrawCol(TRectF.Create(SizeL - Off, 0, SizeR - Off, FHeaderBar.Height), SizeCap, sfSize);
       end;
       if (FColDateMode <> dcmHidden) and (DateR - DateL > 4) and
          (not IsThisPCPath(GetCurrentPathImpl)) then
-        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), 'Дата', sfDate);
+        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), L('panel.col.date'), sfDate);
     end;
   finally
     Canvas.EndScene;
   end;
+end;
+
+procedure TFilePanel.ChromePointerDown(Sender: TObject);
+begin
+  if IsPreviewActive then
+    HidePreview;
+  if Assigned(FOnActivate) then
+    FOnActivate(Self);
 end;
 
 procedure TFilePanel.HeaderMouseDown(Sender: TObject; Button: TMouseButton;
@@ -2177,6 +3722,11 @@ begin
   CancelPathEdit;
   if Assigned(FOnActivate) then
     FOnActivate(Self);
+  if Button = TMouseButton.mbRight then
+  begin
+    ShowMouseModeMenu;
+    Exit;
+  end;
   if Button <> TMouseButton.mbLeft then
     Exit;
   var NameL, NameR, TypeL, TypeR, SizeL, SizeR, DateL, DateR, Off, ListW, LX: Single;
@@ -2185,7 +3735,7 @@ begin
   if CurrentScrollBox <> nil then
   begin
     ListW := CurrentScrollBox.Width;
-    Off := FHeaderBar.AbsoluteRect.Left - CurrentScrollBox.AbsoluteRect.Left;
+    Off := ColumnHeaderShift;
   end;
   GetHeaderColumnBounds(ListW, NameL, NameR, TypeL, TypeR, SizeL, SizeR, DateL, DateR);
   LX := X + Off;
@@ -2234,13 +3784,9 @@ var
   SelectedIndicesRef: TList<Integer>;
   RealIdx: Integer;
 begin
-  if FFilterReady and Assigned(FStatusText) then
+  if IsVibeNetworkPath(GetCurrentPathImpl) and Assigned(FNet) and Assigned(FStatusText) then
   begin
-    Entries := GetCurrentEntries;
-    if Assigned(Entries) then
-      FStatusText.Text := Format('%d из %d', [FFilterMap.Count, Entries.Count])
-    else
-      FStatusText.Text := Format('%d из %d', [FFilterMap.Count, 0]);
+    FStatusText.Text := FNet.StatusText(GetCurrentPathImpl);
     Exit;
   end;
   if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) then
@@ -2253,10 +3799,28 @@ begin
         var N := FTabs[FActiveTabIndex].LoadSeen;
         if (N <= 0) and Assigned(FTabs[FActiveTabIndex].Entries) then
           N := FTabs[FActiveTabIndex].Entries.Count;
-        FStatusText.Text := Format('Чтение сети · %d', [N]);
+        FStatusText.Text := Lf('panel.status.netread', [N]);
       end;
       Exit;
     end;
+  end;
+  if Assigned(FStatusText) then
+  begin
+    var Phrase := ManualStatusPhrase;
+    if Phrase <> '' then
+    begin
+      FStatusText.Text := Phrase;
+      Exit;
+    end;
+  end;
+  if FFilterReady and Assigned(FStatusText) then
+  begin
+    Entries := GetCurrentEntries;
+    if Assigned(Entries) then
+      FStatusText.Text := Lf('panel.status.filter', [FFilterMap.Count, Entries.Count])
+    else
+      FStatusText.Text := Lf('panel.status.filter', [FFilterMap.Count, 0]);
+    Exit;
   end;
   Entries := GetCurrentEntries;
   if not Assigned(Entries) then Exit;
@@ -2271,10 +3835,8 @@ begin
     if Entry.IsDirectory then
       Inc(FolderCount)
     else
-    begin
       Inc(FileCount);
-      TotalSize := TotalSize + Entry.Size;
-    end;
+    TotalSize := TotalSize + EntryAccountedSize(Entry);
   end;
 
   // 2. Считаем выделенные элементы
@@ -2302,10 +3864,8 @@ begin
         if Entry.IsDirectory then
           Inc(SelFolderCount)
         else
-        begin
           Inc(SelFileCount);
-          SelTotalSize := SelTotalSize + Entry.Size;
-        end;
+        SelTotalSize := SelTotalSize + EntryAccountedSize(Entry);
       end;
     end;
   end;
@@ -2317,27 +3877,27 @@ begin
     if (SelFileCount + SelFolderCount) > 0 then
     begin
       if IsSearchView then
-        FStatusText.Text := Format('Поиск  |  %s / %s  |  %d / %d',
+        FStatusText.Text := Lf('panel.status.search.sel',
           [FormatFileSize(SelTotalSize), FormatFileSize(TotalSize),
            SelFileCount + SelFolderCount, FileCount + FolderCount])
       else if IsBranchView then
-        FStatusText.Text := Format('Ветвь  |  %s / %s  |  Файлов: %d / %d',
+        FStatusText.Text := Lf('panel.status.branch.sel',
           [FormatFileSize(SelTotalSize), FormatFileSize(TotalSize),
            SelFileCount, FileCount])
       else
-        FStatusText.Text := Format('%s / %s  |  Файлов: %d / %d  |  Папок: %d / %d',
+        FStatusText.Text := Lf('panel.status.sel',
           [FormatFileSize(SelTotalSize), FormatFileSize(TotalSize),
            SelFileCount, FileCount,
            SelFolderCount, FolderCount]);
     end
     else if IsSearchView then
-      FStatusText.Text := Format('Поиск  |  %s  |  %d',
+      FStatusText.Text := Lf('panel.status.search',
         [FormatFileSize(TotalSize), FileCount + FolderCount])
     else if IsBranchView then
-      FStatusText.Text := Format('Ветвь  |  %s  |  Файлов: %d',
+      FStatusText.Text := Lf('panel.status.branch',
         [FormatFileSize(TotalSize), FileCount])
     else
-      FStatusText.Text := Format('%s  |  Файлов: %d  |  Папок: %d',
+      FStatusText.Text := Lf('panel.status.plain',
         [FormatFileSize(TotalSize), FileCount, FolderCount]);
   end;
 end;
@@ -2345,11 +3905,31 @@ end;
 
 
 
+procedure TFilePanel.ScrollBoxApplyStyle(Sender: TObject);
+var
+  Obj: TFmxObject;
+  Box: TScrollBox;
+begin
+  if not (Sender is TScrollBox) then
+    Exit;
+  Box := TScrollBox(Sender);
+  Obj := Box.FindStyleResource('background');
+  if Obj is TRectangle then
+  begin
+    TRectangle(Obj).Fill.Kind := TBrushKind.None;
+    TRectangle(Obj).Stroke.Kind := TBrushKind.None;
+  end;
+end;
+
 procedure TFilePanel.ScrollBoxResize(Sender: TObject);
 begin
   FColLayoutW := -1;
   RebuildContent;
   KeepFocusVisible;
+  FThumbDirty := True;
+  FThumbMoveTick := TThread.GetTickCount64;
+  if Assigned(FThumbTimer) and not FDestroying then
+    FThumbTimer.Enabled := True;
   for var Tab in FTabs do
   begin
     if Tab.ScrollBox = Sender then
@@ -2364,6 +3944,18 @@ procedure TFilePanel.ScrollBoxViewportPositionChange(Sender: TObject;
   const OldViewportPosition, NewViewportPosition: TPointF; const ContentSizeChanged: Boolean);
 begin
   FScrollTick := GetTickCount;
+  FThumbDirty := True;
+  FThumbMoveTick := TThread.GetTickCount64;
+  if IsRemotePath(GetCurrentPathImpl) and
+     (FThumbKey <> '') and (FThumbKey <> cThumbKeyIdle) and
+     Assigned(GlobalThumbCache) and GlobalThumbCache.WorkersEnabled and
+     not GlobalThumbCache.ShuttingDown then
+  begin
+    FThumbKey := cThumbKeyIdle;
+    GlobalThumbCache.Focus(Self, nil, nil, 0);
+  end;
+  if Assigned(FThumbTimer) and not FDestroying then
+    FThumbTimer.Enabled := True;
   if Assigned(FRenameEdit) and FRenameEdit.Visible then
     EndInlineRename(False);
   var PB := CurrentPaintBox;
@@ -2387,8 +3979,299 @@ begin
     Result := '';
 end;
 
+function TFilePanel.EntrySizeText(const AEntry: TFileEntry): string;
+var
+  Arc, Inner, Parent: string;
+begin
+  if not AEntry.IsDirectory then
+    Exit(AEntry.DisplaySize);
+  if AEntry.FreeBytes > 0 then
+    Exit(AEntry.DisplaySize);
+  if IsManualSizeRow(AEntry) then
+  begin
+    Result := ManualSizeCell(AEntry);
+    if (Result = FolderSizePendingMark) and Assigned(FThumbTimer) and not FDestroying then
+      FThumbTimer.Enabled := True;
+    Exit;
+  end;
+  if not FShowFolderSizes then
+    Exit(FolderSizeDeniedMark);
+  if (AEntry.FullPath = '') or ((AEntry.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+     IsVirtualShellPath(AEntry.FullPath) or IsThisPCPath(AEntry.FullPath) or
+     IsDeviceNamespacePath(AEntry.FullPath) or IsPortableDevicePath(AEntry.FullPath) or
+     SplitArchivePath(AEntry.FullPath, Arc, Inner) or not Assigned(GlobalFolderSizes) then
+    Exit(FolderSizeDeniedMark);
+  { Старый список ещё на экране, путь уже другой: не ставить обход и не писать <DIR>. }
+  if not IsSearchView then
+  begin
+    Parent := ExcludeTrailingPathDelimiter(
+      ExtractFilePath(ExcludeTrailingPathDelimiter(AEntry.FullPath)));
+    if not SameDirHistoryPath(Parent, GetCurrentPathImpl) then
+      Exit(AEntry.DisplaySize);
+  end;
+  if IsRemotePath(AEntry.FullPath) then
+    Exit(FolderSizeDeniedMark);
+  Result := GlobalFolderSizes.CellText(Self, AEntry.FullPath, AEntry.Modified, False);
+  if (Result = FolderSizePendingMark) and Assigned(FThumbTimer) and not FDestroying then
+    FThumbTimer.Enabled := True;
+end;
+
+function TFilePanel.IsManualSizeRow(const AEntry: TFileEntry): Boolean;
+begin
+  { Пока идёт ручной запрос — «…» у этой строки. Дальше локальный размер
+    при включённом показе живёт как обычный. Сеть и выключенный показ
+    оставляют число только у строки, по которой жали Alt+Enter. }
+  Result := (FManualSizePath <> '') and AEntry.IsDirectory and
+    SameText(ExcludeTrailingPathDelimiter(AEntry.FullPath),
+      ExcludeTrailingPathDelimiter(FManualSizePath)) and
+    (FManualAwait or (not FShowFolderSizes) or IsRemotePath(AEntry.FullPath));
+end;
+
+function TFilePanel.ManualSizeCell(const AEntry: TFileEntry): string;
+var
+  Status: TFolderSizeStatus;
+  Bytes: Int64;
+  HasSum: Boolean;
+begin
+  Result := FolderSizeDeniedMark;
+  if not Assigned(GlobalFolderSizes) then
+    Exit;
+  GlobalFolderSizes.Peek(AEntry.FullPath, FManualAwait, Status, Bytes, HasSum);
+  case Status of
+    fssPending:
+      Result := FolderSizePendingMark;
+    fssReady:
+      Result := FormatFileSize(Bytes);
+    fssPartial:
+      if HasSum then
+        Result := FormatFileSize(Bytes)
+      else
+        Result := FolderSizePartialMark;
+  else
+    Result := FolderSizeDeniedMark;
+  end;
+end;
+
+function TFilePanel.ManualStatusPhrase: string;
+var
+  Entry: TFileEntry;
+  Status: TFolderSizeStatus;
+  Bytes: Int64;
+  HasSum: Boolean;
+begin
+  Result := '';
+  if (FManualSizePath = '') or not Assigned(GlobalFolderSizes) then
+    Exit;
+  if FManualAwait then
+    Exit(L('panel.size.counting') + FolderSizePendingMark);
+  GlobalFolderSizes.Peek(FManualSizePath, False, Status, Bytes, HasSum);
+  if Status = fssNone then
+    Exit;
+  if not GetFocusedEntry(Entry) or
+     not SameText(ExcludeTrailingPathDelimiter(Entry.FullPath),
+       ExcludeTrailingPathDelimiter(FManualSizePath)) then
+    Exit;
+  case Status of
+    fssReady:
+      Result := Lf('panel.size.value', [FormatFileSize(Bytes)]);
+    fssPartial:
+      if HasSum then
+        Result := Lf('panel.size.partial', [FormatFileSize(Bytes)])
+      else
+        Result := L('panel.size.partialonly');
+    fssError:
+      Result := L('panel.size.denied');
+  end;
+end;
+
+procedure TFilePanel.PollManualSize;
+var
+  Status: TFolderSizeStatus;
+  Bytes: Int64;
+  HasSum: Boolean;
+begin
+  if (FManualSizePath = '') or not Assigned(GlobalFolderSizes) then
+    Exit;
+  GlobalFolderSizes.Peek(FManualSizePath, True, Status, Bytes, HasSum);
+  if Status = FManualPolled then
+    Exit;
+  if Status = fssNone then
+  begin
+    FManualSizePath := '';
+    FManualAwait := False;
+    FManualPolled := fssNone;
+  end
+  else
+  begin
+    FManualPolled := Status;
+    FManualAwait := Status = fssPending;
+  end;
+  InvalidateView;
+  UpdateStatusText;
+end;
+
+procedure TFilePanel.CountCursorFolder;
+var
+  Entry: TFileEntry;
+  Arc, Inner: string;
+  Status: TFolderSizeStatus;
+
+  function BareUncRoot(const APath: string): Boolean;
+  var
+    S: string;
+  begin
+    S := ExcludeTrailingPathDelimiter(Trim(APath));
+    if (Length(S) < 2) or (S[1] <> '\') or (S[2] <> '\') then
+      Exit(False);
+    Delete(S, 1, 2);
+    Result := Pos('\', S) = 0;
+  end;
+
+begin
+  if FDestroying or not Assigned(GlobalFolderSizes) then
+    Exit;
+  if not GetFocusedEntry(Entry) or not Entry.IsDirectory then
+    Exit;
+  if (Entry.FullPath = '') or (Entry.FreeBytes > 0) or BareUncRoot(Entry.FullPath) then
+    Exit;
+  if (Entry.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+    Exit;
+  if IsVirtualShellPath(Entry.FullPath) or IsThisPCPath(Entry.FullPath) or
+     IsDeviceNamespacePath(Entry.FullPath) or IsPortableDevicePath(Entry.FullPath) or
+     IsVibeNetworkPath(Entry.FullPath) or
+     SplitArchivePath(Entry.FullPath, Arc, Inner) then
+    Exit;
+  FManualSizePath := Entry.FullPath;
+  Status := GlobalFolderSizes.RequestOne(Self, Entry.FullPath, Entry.Modified);
+  FManualPolled := Status;
+  FManualAwait := Status = fssPending;
+  if Assigned(FThumbTimer) then
+    FThumbTimer.Enabled := True;
+  InvalidateView;
+  UpdateStatusText;
+end;
+
+function TFilePanel.EntryAccountedSize(const AEntry: TFileEntry): Int64;
+var
+  Bytes: Int64;
+  Arc, Inner: string;
+begin
+  if not AEntry.IsDirectory then
+    Exit(AEntry.Size);
+  { В сумму — только готовый обход. Том, ссылка, виртуальная папка и архив дают 0. }
+  if not FShowFolderSizes or (AEntry.FreeBytes > 0) or (AEntry.FullPath = '') or
+     IsDriveRoot(AEntry.FullPath) or
+     ((AEntry.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+     IsVirtualShellPath(AEntry.FullPath) or IsThisPCPath(AEntry.FullPath) or
+     IsDeviceNamespacePath(AEntry.FullPath) or IsPortableDevicePath(AEntry.FullPath) or
+     SplitArchivePath(AEntry.FullPath, Arc, Inner) or
+     IsRemotePath(AEntry.FullPath) then
+    Exit(0);
+  if FolderSizeReadyBytes(AEntry.FullPath, AEntry.Modified, Bytes) then
+    Exit(Bytes);
+  Result := 0;
+end;
+
+procedure TFilePanel.SyncFolderSizeRoot;
+var
+  P, Arc, Inner: string;
+begin
+  if FDestroying or not Assigned(GlobalFolderSizes) then
+    Exit;
+  if not FShowFolderSizes then
+  begin
+    GlobalFolderSizes.NotePanelRoot(Self, '');
+    Exit;
+  end;
+  if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+  begin
+    GlobalFolderSizes.NotePanelRoot(Self, '');
+    Exit;
+  end;
+  P := FTabs[FActiveTabIndex].Path;
+  if IsVibeNetworkPath(P) or IsVirtualShellPath(P) or IsThisPCPath(P) or
+     IsDeviceNamespacePath(P) or SplitArchivePath(P, Arc, Inner) then
+    GlobalFolderSizes.NotePanelRoot(Self, '')
+  else
+    GlobalFolderSizes.NotePanelRoot(Self, P);
+end;
+
+procedure TFilePanel.QueueFolderSizes(AList: uFileModel.TFileEntryList);
+var
+  Paths: TArray<string>;
+  Modified: TArray<TDateTime>;
+  I, N: Integer;
+  E: TFileEntry;
+  Arc, Inner: string;
+begin
+  if FDestroying or not FShowFolderSizes or not Assigned(GlobalFolderSizes) or
+     not Assigned(AList) or (AList.Count = 0) then
+    Exit;
+  N := 0;
+  SetLength(Paths, AList.Count);
+  SetLength(Modified, AList.Count);
+  for I := 0 to AList.Count - 1 do
+  begin
+    E := AList[I];
+    if not E.IsDirectory or (E.FreeBytes > 0) or (E.FullPath = '') then
+      Continue;
+    if (E.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+      Continue;
+    if IsVirtualShellPath(E.FullPath) or IsThisPCPath(E.FullPath) or
+       IsDeviceNamespacePath(E.FullPath) or IsPortableDevicePath(E.FullPath) or
+       IsRemotePath(E.FullPath) or
+       SplitArchivePath(E.FullPath, Arc, Inner) then
+      Continue;
+    Paths[N] := E.FullPath;
+    Modified[N] := E.Modified;
+    Inc(N);
+  end;
+  if N = 0 then
+    Exit;
+  SetLength(Paths, N);
+  SetLength(Modified, N);
+  GlobalFolderSizes.RequestFolders(Self, Paths, Modified);
+  if Assigned(FThumbTimer) then
+    FThumbTimer.Enabled := True;
+end;
+
+procedure TFilePanel.ArmFolderSizes;
+begin
+  if FDestroying or not FShowFolderSizes then
+    Exit;
+  SyncFolderSizeRoot;
+  QueueFolderSizes(GetCurrentEntries);
+end;
+
+procedure TFilePanel.CancelPendingIO;
+var
+  J: Integer;
+begin
+  if FNet <> nil then
+    FNet.CancelJobs;
+  for J := 0 to FTabs.Count - 1 do
+    AbandonTabLoad(J);
+end;
+
+procedure TFilePanel.FolderSizeWake;
+begin
+  if FDestroying then
+    Exit;
+  if Assigned(FThumbTimer) then
+    FThumbTimer.Enabled := True;
+end;
+
+procedure TFilePanel.InvalidateFolderSizes;
+begin
+  if FDestroying or not Assigned(GlobalFolderSizes) then
+    Exit;
+  GlobalFolderSizes.InvalidateUnder(GetCurrentPathImpl);
+end;
+
 function TFilePanel.ShowsParentRow(const APath: string): Boolean;
 begin
+  if IsVibeNetworkPath(APath) then
+    Exit(True);
   Result := ParentOfBrowsablePath(APath) <> '';
   if Result and IsDriveRoot(APath) and FShowDriveBar then
     Result := False;
@@ -2457,6 +4340,21 @@ var
 begin
   if FTabs.Count = 0 then Exit;
   CurrentPath := FTabs[FActiveTabIndex].Path;
+  if IsVibeNetworkPath(CurrentPath) then
+  begin
+    ParentPath := VibeNetworkParent(CurrentPath);
+    if ParentPath = '' then
+    begin
+      if (FNetBack <> '') and not IsVibeNetworkPath(FNetBack) and
+         IsListablePath(FNetBack) then
+        ParentPath := FNetBack
+      else
+        ParentPath := ComputerFolderPath;
+    end;
+    if ParentPath <> '' then
+      Navigate(ParentPath, CurrentPath);
+    Exit;
+  end;
   ParentPath := ParentOfBrowsablePath(CurrentPath);
   if IsBrowsablePath(ParentPath) and (ParentPath <> CurrentPath) then
     Navigate(ParentPath, CurrentPath);
@@ -2501,8 +4399,17 @@ end;
 
 procedure TFilePanel.EnsureColTemplates;
 var
-  Fs, Cap: Single;
-  TypeSample: string;
+  Fs, TypeW: Single;
+
+  function Keep(APrev, ANew: Single): Single;
+  begin
+    { Повторный замер шрифта гуляет на пару пикселей и сдвигал колонки. }
+    if (APrev > 0) and (Abs(ANew - APrev) < 4) then
+      Result := APrev
+    else
+      Result := ANew;
+  end;
+
 begin
   Fs := DetailsFontSize;
   if (Abs(Fs - FColFs) < 0.05) and (FColSizeW > 0) then
@@ -2511,51 +4418,38 @@ begin
   FColPad := Max(8, Round(0.6 * Fs));
   FColGap := Max(8, Round(0.7 * Fs));
   FColMinName := Max(140, Round(18 * Fs));
-  TypeSample := FLongestType;
-  if TypeSample = '' then
-    TypeSample := 'Папка';
-  FColTypeW := MeasureColText(TypeSample, Fs) + FColPad;
-  Cap := MeasureColText('Файл конфигурации', Fs) + FColPad;
-  if FColTypeW < MeasureColText('Папка', Fs) + FColPad then
-    FColTypeW := MeasureColText('Папка', Fs) + FColPad;
-  if FColTypeW > Cap then
-    FColTypeW := Cap;
-  FColSizeW := MeasureColText('999.9 ГБ', Fs) + FColPad;
-  FColThisPCSizeW := Max(MeasureColText('Свободно / занято', Fs),
-    MeasureColText('999.9 ГБ / 999.9 ГБ', Fs)) + FColPad;
-  FColDateFullW := MeasureColText('31.12.2026 23:59', Fs) + FColPad;
-  FColDateMedW := MeasureColText('31.12.26 23:59', Fs) + FColPad;
-  FColDateShortW := MeasureColText('31.12.26', Fs) + FColPad;
+  { Ширина не зависит от текущего списка: иначе колонка прыгает, когда позже
+    находится более длинный тип. }
+  { net.share сюда не входит: «Спільний ресурс» шире «Папка» и «JPEG»
+    и отодвигает «Тип» к имени на обычном списке. Ширина шары — FColShareW. }
+  TypeW := MeasureColText(L('model.folder'), Fs);
+  TypeW := Max(TypeW, MeasureColText(L('panel.col.type'), Fs));
+  TypeW := Max(TypeW, MeasureColText('JPEG', Fs));
+  FColTypeW := Keep(FColTypeW, TypeW + FColPad);
+  FColShareW := Keep(FColShareW,
+    Max(MeasureColText(L('net.share'), Fs), MeasureColText(L('net.node'), Fs)) + FColPad);
+  FColIpW := Keep(FColIpW, MeasureColText('255.255.255.255', Fs) + FColPad);
+  FColNetKindW := Keep(FColNetKindW,
+    Max(Max(MeasureColText('SMB · FTP · Web', Fs), MeasureColText(L('panel.col.type'), Fs)),
+      MeasureColText(L('net.share'), Fs)) + FColPad);
+  FColSizeW := Keep(FColSizeW,
+    Max(MeasureColText(L('panel.col.size'), Fs), MeasureColText('999.99 Gb', Fs)) + FColPad);
+  FColThisPCSizeW := Keep(FColThisPCSizeW,
+    Max(MeasureColText(L('panel.col.freeused'), Fs),
+      MeasureColText('999.99 Gb / 999.99 Gb', Fs)) + FColPad);
+  FColDateFullW := Keep(FColDateFullW, MeasureColText('31.12.2026 23:59', Fs) + FColPad);
+  FColDateMedW := Keep(FColDateMedW, MeasureColText('31.12.26 23:59', Fs) + FColPad);
+  FColDateShortW := Keep(FColDateShortW, MeasureColText('31.12.26', Fs) + FColPad);
   FColLayoutW := -1;
 end;
 
-procedure TFilePanel.UpdateLongestType(AList: uFileModel.TFileEntryList);
-var
-  E: TFileEntry;
-  Best: string;
-  BestW, Tw: Single;
-  Fs: Single;
+function TFilePanel.ColumnHeaderShift: Single;
 begin
-  Best := 'Папка';
-  Fs := DetailsFontSize;
-  BestW := MeasureColText(Best, Fs);
-  if Assigned(AList) then
-    for E in AList do
-    begin
-      if E.DisplayType = '' then
-        Continue;
-      Tw := MeasureColText(E.DisplayType, Fs);
-      if Tw > BestW then
-      begin
-        BestW := Tw;
-        Best := E.DisplayType;
-      end;
-    end;
-  if Best <> FLongestType then
-  begin
-    FLongestType := Best;
-    InvalidateColLayout;
-  end;
+  { Заголовок внутри отступа адреса. AbsoluteRect на старте ещё 0 и потом
+    сдвигал подписи влево. }
+  Result := 0;
+  if Assigned(FPathAndHeader) then
+    Result := FPathAndHeader.Padding.Left;
 end;
 
 procedure TFilePanel.RecalcColLayout(AContentWidth: Single);
@@ -2586,19 +4480,37 @@ var
 begin
   EnsureColTemplates;
   ThisPC := IsThisPCPath(GetCurrentPathImpl);
+  var NetMode := NetColKind;
   WasTwo := FColTwoLine;
-  if (Abs(AContentWidth - FColLayoutW) < 0.5) and (ThisPC = FColThisPC) then
+  if (Abs(AContentWidth - FColLayoutW) < 0.5) and (ThisPC = FColThisPC) and
+     (NetMode = FColNetMode) then
     Exit;
   FColLayoutW := AContentWidth;
   FColThisPC := ThisPC;
+  FColNetMode := NetMode;
   W := AContentWidth - SCROLLBAR_RESERVE;
   if ThisPC then
     SizeW := FColThisPCSizeW
+  else if NetMode = 1 then
+    SizeW := FColNetKindW
   else
     SizeW := FColSizeW;
   NameLeft := 6 + 14 + Round(22 * ZoomPercent / 100) + 16;
   FColShowType := True;
   FColShowSize := True;
+  if NetMode = 1 then
+  begin
+    FColDateMode := dcmHidden;
+    FColTwoLine := False;
+    Exit;
+  end;
+  if NetMode = 2 then
+  begin
+    FColShowSize := False;
+    FColDateMode := dcmHidden;
+    FColTwoLine := False;
+    Exit;
+  end;
   { Вторая строка только когда имя уже заметно уже минимума одной строки. }
   Need := Max(80, Round(FColMinName * 0.42));
   if WasTwo then
@@ -2683,10 +4595,25 @@ var
   ThisPC: Boolean;
   FirstMeta: Single;
 begin
+  RecalcColLayout(AContentWidth);
   if ViewMode <> vmDetails then
   begin
     ThisPC := IsThisPCPath(GetCurrentPathImpl);
-    if ThisPC then
+    if FColNetMode = 1 then
+    begin
+      NameW := 120;
+      TypeW := 120;
+      SizeW := 130;
+      DateW := 0;
+    end
+    else if FColNetMode = 2 then
+    begin
+      NameW := 160;
+      TypeW := 80;
+      SizeW := 0;
+      DateW := 0;
+    end
+    else if ThisPC then
     begin
       NameW := 80;
       TypeW := 80;
@@ -2708,7 +4635,6 @@ begin
     Exit;
   end;
 
-  RecalcColLayout(AContentWidth);
   ER := AContentWidth - SCROLLBAR_RESERVE;
   Gap := FColGap;
   DateR := ER - 6;
@@ -2728,7 +4654,9 @@ begin
 
   if FColShowSize then
   begin
-    if IsThisPCPath(GetCurrentPathImpl) then
+    if FColNetMode = 1 then
+      SizeW := FColNetKindW
+    else if IsThisPCPath(GetCurrentPathImpl) then
       SizeW := FColThisPCSizeW
     else
       SizeW := FColSizeW;
@@ -2747,7 +4675,12 @@ begin
   if FColShowType then
   begin
     TypeR := SizeL - Gap;
-    TypeL := TypeR - FColTypeW;
+    if FColNetMode = 1 then
+      TypeL := TypeR - FColIpW
+    else if FColNetMode = 2 then
+      TypeL := TypeR - Max(FColTypeW, FColShareW)
+    else
+      TypeL := TypeR - FColTypeW;
   end
   else
   begin
@@ -2904,6 +4837,8 @@ begin
   Full := ExcludeTrailingPathDelimiter(GetCurrentPathImpl);
   if Full = '' then
     Exit;
+  if IsVibeNetworkPath(GetCurrentPathImpl) then
+    Full := NormalizeVibeNetwork(GetCurrentPathImpl);
 
   Names := TStringList.Create;
   Layout := TTextLayoutManager.DefaultTextLayout.Create;
@@ -2912,7 +4847,20 @@ begin
   Layout.Font.Style := [TFontStyle.fsBold];
   try
     Drive := ExtractFileDrive(Full);
-    if IsVirtualShellPath(Full) then
+    if IsVibeNetworkPath(Full) then
+    begin
+      FCrumbPaths.Add('network://');
+      Names.Add(L('drive.network'));
+      if not IsVibeNetworkRoot(Full) then
+      begin
+        FCrumbPaths.Add(Full);
+        Name := VibeNetworkHost(Full);
+        if Name = '' then
+          Name := Full;
+        Names.Add(Name);
+      end;
+    end
+    else if IsVirtualShellPath(Full) then
     begin
       Acc := Full;
       while Acc <> '' do
@@ -2920,7 +4868,7 @@ begin
         FCrumbPaths.Insert(0, Acc);
         Name := DisplayNameForPath(Acc);
         if Name = '' then
-          Name := 'Устройство';
+          Name := L('drive.device');
         Names.Insert(0, Name);
         if IsThisPCPath(Acc) then
           Break;
@@ -3014,6 +4962,8 @@ var
   Target: string;
   ContentX: Single;
 begin
+  if IsPreviewActive then
+    HidePreview;
   if Assigned(FOnActivate) then
     FOnActivate(Self);
   if Button <> TMouseButton.mbLeft then
@@ -3237,7 +5187,7 @@ begin
       Exit;
     if not Ok then
     begin
-      P.ShowNotice('Не удалось записать снимок');
+      P.ShowNotice(L('panel.shot.fail'));
       Exit;
     end;
     Folder := ExcludeTrailingPathDelimiter(ExtractFilePath(Dest));
@@ -3287,7 +5237,7 @@ var
        IsPortableDevicePath(Dir) or IsDeviceNamespacePath(Dir) or
        SplitArchivePath(Dir, Arc, Inner) or (not TDirectory.Exists(Dir)) then
     begin
-      ShowNotice('Некуда вставить');
+      ShowNotice(L('panel.paste.nowhere'));
       Exit;
     end;
     Result := True;
@@ -3339,7 +5289,7 @@ begin
             TFile.Delete(Dest);
         except
         end;
-      ShowNotice('Не удалось записать снимок');
+      ShowNotice(L('panel.shot.fail'));
     end;
     Exit;
   end;
@@ -3473,7 +5423,9 @@ begin
   SB.AniCalculations.AutoShowing := False;
   SB.OnMouseWheel := PanelMouseWheel;
   SB.OnResize := ScrollBoxResize;
+  SB.OnApplyStyleLookup := ScrollBoxApplyStyle;
   SB.OnViewportPositionChange := ScrollBoxViewportPositionChange;
+  ScrollBoxApplyStyle(SB);
   SB.OnMouseDown := EmptyAreaMouseDown;
   ContainerLayout.OnMouseDown := EmptyAreaMouseDown;
 
@@ -3481,7 +5433,11 @@ begin
   BgRect.Parent := SB.Content;
   BgRect.Align := TAlignLayout.Client;
   BgRect.Fill.Kind := TBrushKind.Solid;
-  BgRect.Fill.Color := FColors.PanelBackground;
+  { Список рисует фон сам. Вторая плашка той же альфы складывается и густеет. }
+  if TAlphaColorRec(FColors.PanelBackground).A < 255 then
+    BgRect.Fill.Color := TAlphaColors.Null
+  else
+    BgRect.Fill.Color := FColors.PanelBackground;
   BgRect.Stroke.Kind := TBrushKind.None;
   BgRect.HitTest := True;
   BgRect.OnMouseDown := EmptyAreaMouseDown;
@@ -3589,6 +5545,8 @@ var
   NeedLoad: Boolean;
   Tab: TFileTab;
 begin
+  if IsPreviewActive then
+    HidePreview;
   if (AIndex < 0) or (AIndex >= FTabs.Count) then Exit;
 
   Prev := FActiveTabIndex;
@@ -3599,10 +5557,7 @@ begin
   end;
 
   FActiveTabIndex := AIndex;
-
-  for var I := 0 to FTabs.Count - 1 do
-    if Assigned(FTabs[I].ContainerLayout) then
-      FTabs[I].ContainerLayout.Visible := (I = FActiveTabIndex);
+  SyncPreviewList;
 
   RestoreTabCursor(AIndex);
 
@@ -3610,6 +5565,13 @@ begin
   SyncDriveBar;
 
   Tab := FTabs[AIndex];
+  if (Prev >= 0) and (Prev < FTabs.Count) and (Prev <> AIndex) and Assigned(FNet) then
+  begin
+    if IsVibeNetworkPath(FTabs[Prev].Path) and not IsVibeNetworkPath(Tab.Path) then
+      FNet.CancelJobs
+    else if IsVibeNetworkRoot(Tab.Path) and not IsVibeNetworkRoot(FTabs[Prev].Path) then
+      FNet.CancelJobs;
+  end;
   if FDeferDirLoad then
   begin
     Tab.Stale := True;
@@ -3628,7 +5590,16 @@ begin
   end
   else
   begin
-    if FNameFilter <> '' then
+    if IsVibeNetworkPath(Tab.Path) then
+    begin
+      EnsureNetSession;
+      ShowNetBar(IsVibeNetworkRoot(Tab.Path));
+      if IsVibeNetworkRoot(Tab.Path) or SameText(FNet.BrowsePath, Tab.Path) then
+        PublishNetworkList
+      else
+        FNet.Browse(Tab.Path);
+    end
+    else if FNameFilter <> '' then
       CommitNameFilter(False)
     else
     begin
@@ -3636,12 +5607,23 @@ begin
       UpdateStatusText;
       KeepFocusVisible;
     end;
+    QueueFolderSizes(Tab.Entries);
   end;
   if FWatchEnabled and (not Tab.Loading) and Tab.Loaded then
     WatchTab(AIndex);
+  SyncFolderSizeRoot;
   UpdateLoadChrome;
   UpdateHistoryButtons;
   NotifyCursorChange;
+  FThumbKey := '';
+  if not NeedLoad then
+    OrderVisibleThumbs
+  else if Assigned(GlobalThumbCache) and GlobalThumbCache.WorkersEnabled and
+          not GlobalThumbCache.ShuttingDown then
+  begin
+    FThumbKey := cThumbKeyIdle;
+    GlobalThumbCache.Focus(Self, nil, nil, 0);
+  end;
 end;
 
 procedure TFilePanel.HandleTabClose(Sender: TObject; AIndex: Integer; var ACanClose: Boolean);
@@ -3691,7 +5673,6 @@ end;
 procedure TFilePanel.HandleTabReorder(Sender: TObject; AFromIndex, AToIndex: Integer);
 var
   Tab: TFileTab;
-  I: Integer;
 begin
   if (AFromIndex < 0) or (AFromIndex >= FTabs.Count) then
     Exit;
@@ -3708,9 +5689,7 @@ begin
   else
     FActiveTabIndex := AToIndex;
 
-  for I := 0 to FTabs.Count - 1 do
-    if Assigned(FTabs[I].ContainerLayout) then
-      FTabs[I].ContainerLayout.Visible := (I = FActiveTabIndex);
+  SyncPreviewList;
 end;
 
 procedure TFilePanel.HandleTabDragQuery(Sender: TObject; AIndex: Integer; var APath: string);
@@ -3836,19 +5815,333 @@ begin
     end);
 end;
 
+function ShownArchiveError(const ARaw: string): string;
+var
+  Low: string;
+begin
+  Low := LowerCase(ARaw);
+  { Слова архиватора, не подписи: password, парол, encrypted, шифр. }
+  if (Pos('password', Low) > 0) or (Pos(#$043F#$0430#$0440#$043E#$043B, Low) > 0) or
+     (Pos('encrypted', Low) > 0) or (Pos(#$0448#$0438#$0444#$0440, Low) > 0) then
+    Exit(ARaw);
+  if (ARaw = '') or (ARaw = L('arch.notarchive')) or
+     (Pos('invalid zip', Low) > 0) or
+     (Pos('error reading zip', Low) > 0) or
+     (Pos('local header', Low) > 0) or
+     (Pos('central header', Low) > 0) or
+     (Pos('not an archive', Low) > 0) or
+     (Pos('not archive', Low) > 0) or
+     (Pos('cannot open the file as archive', Low) > 0) or
+     (Pos('can not open the file as archive', Low) > 0) then
+    Exit(L('arch.notarchive'));
+  Result := ARaw;
+end;
+
+function ShouldProbeArchive(const ACurrent, ATarget: string): Boolean;
+var
+  Arc, Inner, Cur: string;
+begin
+  Result := False;
+  if not SplitArchivePath(ATarget, Arc, Inner) or (Inner <> '') then
+    Exit;
+  Arc := ExcludeTrailingPathDelimiter(Arc);
+  if not SameText(Arc, ExcludeTrailingPathDelimiter(ATarget)) then
+    Exit;
+  if SameDirHistoryPath(ACurrent, ATarget) then
+    Exit;
+  Cur := ExcludeTrailingPathDelimiter(ACurrent);
+  if SameText(Cur, Arc) or StartsText(IncludeTrailingPathDelimiter(Arc), Cur) then
+    Exit;
+  Result := True;
+end;
+
+function HistorySlot(const AHistory: TArray<string>; APrefer: Integer;
+  const APath: string): Integer;
+var
+  I, Best, Dist: Integer;
+begin
+  Result := -1;
+  Best := MaxInt;
+  for I := 0 to High(AHistory) do
+    if SameDirHistoryPath(AHistory[I], APath) then
+    begin
+      Dist := Abs(I - APrefer);
+      if Dist < Best then
+      begin
+        Best := Dist;
+        Result := I;
+      end;
+    end;
+end;
+
+function ListInsideArchive(AList: uFileModel.TFileEntryList;
+  const AArchive: string): Boolean;
+var
+  I: Integer;
+  Prefix: string;
+begin
+  Result := False;
+  if not Assigned(AList) or (AArchive = '') then
+    Exit;
+  Prefix := IncludeTrailingPathDelimiter(ExcludeTrailingPathDelimiter(AArchive));
+  for I := 0 to AList.Count - 1 do
+    if StartsText(Prefix, AList[I].FullPath) then
+      Exit(True);
+end;
+
+function UnopenedArchiveRoot(const ATab: TFileTab; const APath: string): Boolean;
+var
+  Arc, Inner: string;
+begin
+  Result := False;
+  if ATab.Loaded or not SameDirHistoryPath(ATab.Path, APath) then
+    Exit;
+  if not SplitArchivePath(APath, Arc, Inner) or (Inner <> '') then
+    Exit;
+  if not SameText(ExcludeTrailingPathDelimiter(Arc),
+                  ExcludeTrailingPathDelimiter(APath)) then
+    Exit;
+  if ListInsideArchive(ATab.Entries, Arc) then
+    Exit;
+  Result := True;
+end;
+
+procedure TFilePanel.ProbeArchiveEnter(const APath, ASelectPath: string);
+var
+  Gen, TabIdx, HistRestore, Prefer: Integer;
+  FromPath: string;
+  Silent: Boolean;
+  Tab: TFileTab;
+begin
+  if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+    Exit;
+  TabIdx := FActiveTabIndex;
+  Tab := FTabs[TabIdx];
+  FromPath := Tab.Path;
+  Silent := FHistorySilent;
+  Prefer := Tab.HistoryIndex;
+  if Silent then
+    HistRestore := HistorySlot(Tab.History, Prefer, FromPath)
+  else
+    HistRestore := -1;
+  Inc(FArcProbeGen);
+  Gen := FArcProbeGen;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      List: uFileModel.TFileEntryList;
+      Err: string;
+      Ok: Boolean;
+    begin
+      List := uFileModel.TFileEntryList.Create;
+      Ok := False;
+      Err := '';
+      try
+        Ok := TryReadArchiveRoot(APath, List, Err);
+      except
+        on E: Exception do
+        begin
+          Ok := False;
+          if Err = '' then
+            Err := E.Message;
+        end;
+      end;
+      TThread.Queue(nil,
+        procedure
+        begin
+          if FDestroying then
+          begin
+            List.Free;
+            Exit;
+          end;
+          if Ok then
+            FinishArchiveEnter(Gen, TabIdx, FromPath, APath, ASelectPath, List,
+              Silent)
+          else
+          begin
+            List.Free;
+            FailArchiveEnter(Gen, TabIdx, FromPath, ShownArchiveError(Err),
+              Silent, HistRestore);
+          end;
+        end);
+    end).Start;
+end;
+
+procedure TFilePanel.FinishArchiveEnter(AGen, ATab: Integer;
+  const AFrom, APath, ASelect: string; AList: uFileModel.TFileEntryList;
+  ASilent: Boolean);
+var
+  Tab: TFileTab;
+begin
+  if FDestroying or (AList = nil) or (AGen <> FArcProbeGen) or
+     (ATab < 0) or (ATab >= FTabs.Count) or (FActiveTabIndex <> ATab) or
+     not SameDirHistoryPath(FTabs[ATab].Path, AFrom) then
+  begin
+    AList.Free;
+    Exit;
+  end;
+  EndInlineRename(False);
+  if IsPreviewActive then
+    HidePreview;
+  if not SameDirHistoryPath(FTabs[ATab].Path, AFrom) then
+  begin
+    AList.Free;
+    Exit;
+  end;
+
+  Tab := FTabs[ATab];
+  Tab.Path := APath;
+  Tab.Loaded := False;
+  Tab.Stale := False;
+  Tab.BranchView := False;
+  Tab.SearchView := False;
+  Tab.LoadError := '';
+  Tab.Offline := False;
+  Tab.Partial := False;
+  Tab.AutoRetryUsed := False;
+  Tab.CursorIndex := 0;
+  if ASelect <> '' then
+    Tab.CursorPath := ASelect
+  else
+    Tab.CursorPath := '';
+  FTabs[ATab] := Tab;
+  FTabsBar.SetTabInfo(ATab, DisplayNameForPath(APath), APath);
+
+  if Assigned(FSelectionManager) then
+  begin
+    var SelIndices := GetCurrentSelectedIndices;
+    if Assigned(SelIndices) then
+      SelIndices.Clear;
+    FSelectionManager.ResetState(0);
+  end;
+
+  UpdatePathLabel;
+  SyncDriveBar;
+  RememberDrivePath(APath);
+  if Assigned(FOnPathChanged) then
+    FOnPathChanged(Self, APath);
+  if not ASilent then
+    RecordHistory(APath)
+  else
+    UpdateHistoryButtons;
+
+  FPendingCursorIndex := 0;
+  ApplyLoadedList(APath, AList, ASelect, False, nil, '', False);
+  if FWatchEnabled then
+    WatchTab(ATab);
+end;
+
+procedure TFilePanel.FailArchiveEnter(AGen, ATab: Integer;
+  const AFrom, AError: string; ASilent: Boolean; AHistRestore: Integer);
+var
+  Tab: TFileTab;
+begin
+  if FDestroying or (AGen <> FArcProbeGen) then
+    Exit;
+  if (ATab < 0) or (ATab >= FTabs.Count) then
+    Exit;
+  if not SameDirHistoryPath(FTabs[ATab].Path, AFrom) then
+    Exit;
+  if ASilent and (AHistRestore >= 0) then
+  begin
+    Tab := FTabs[ATab];
+    if AHistRestore <= High(Tab.History) then
+    begin
+      Tab.HistoryIndex := AHistRestore;
+      FTabs[ATab] := Tab;
+      if ATab = FActiveTabIndex then
+        UpdateHistoryButtons;
+    end;
+  end;
+  if (ATab = FActiveTabIndex) and (AError <> '') then
+    ShowNotice(AError);
+end;
+
+procedure TFilePanel.RevertUnopenedArchive(ATab: Integer;
+  const APath, AError: string);
+var
+  Parent, Notice: string;
+  Tab: TFileTab;
+  Slot: Integer;
+begin
+  if FDestroying or (ATab < 0) or (ATab >= FTabs.Count) then
+    Exit;
+  Notice := ShownArchiveError(AError);
+  Parent := ParentOfBrowsablePath(APath);
+  if (Parent = '') or SameDirHistoryPath(Parent, APath) then
+  begin
+    if (ATab = FActiveTabIndex) and (Notice <> '') then
+      ShowNotice(Notice);
+    Exit;
+  end;
+  Tab := FTabs[ATab];
+  Tab.Path := Parent;
+  Tab.LoadError := '';
+  Tab.Offline := False;
+  Tab.Partial := False;
+  if (Tab.HistoryIndex >= 0) and (Tab.HistoryIndex <= High(Tab.History)) and
+     SameDirHistoryPath(Tab.History[Tab.HistoryIndex], APath) then
+  begin
+    Slot := HistorySlot(Tab.History, Tab.HistoryIndex, Parent);
+    if Slot >= 0 then
+      Tab.HistoryIndex := Slot;
+  end;
+  Tab.CursorPath := APath;
+  FTabs[ATab] := Tab;
+  if ATab <> FActiveTabIndex then
+    Exit;
+  FTabsBar.SetTabInfo(ATab, DisplayNameForPath(Parent), Parent);
+  UpdatePathLabel;
+  SyncDriveBar;
+  RememberDrivePath(Parent);
+  UpdateHistoryButtons;
+  if Assigned(FOnPathChanged) then
+    FOnPathChanged(Self, Parent);
+  Tab := FTabs[ATab];
+  if Assigned(Tab.Entries) and (Tab.Entries.Count > 0) then
+  begin
+    ApplyCursorAfterLoad(Tab.Entries, APath, False);
+    RebuildContent;
+    KeepFocusVisible;
+    InvalidateView;
+  end;
+  if Notice <> '' then
+    ShowNotice(Notice);
+end;
+
 procedure TFilePanel.Navigate(const APath: string; const ASelectPath: string = '');
 var
   TargetPath: string;
   SameDir: Boolean;
   CurEntries: uFileModel.TFileEntryList;
+  OldPath: string;
 begin
-  EndInlineRename(False);
-  TargetPath := APath;
-  if not IsListablePath(TargetPath) then
-    TargetPath := 'C:\';
-
-  if not IsListablePath(TargetPath) then
+  OldPath := GetCurrentPathImpl;
+  if IsVibeNetworkPath(APath) then
+    TargetPath := NormalizeVibeNetwork(APath)
+  else
+  begin
+    TargetPath := APath;
+    if not IsListablePath(TargetPath) then
+      TargetPath := 'C:\';
+    if not IsListablePath(TargetPath) then
+      Exit;
+  end;
+  if IsVibeNetworkRoot(TargetPath) and (OldPath <> '') and
+     not IsVibeNetworkPath(OldPath) then
+    FNetBack := OldPath;
+  if Assigned(FNet) and not SameText(ExcludeTrailingPathDelimiter(OldPath),
+     ExcludeTrailingPathDelimiter(TargetPath)) then
+    FNet.CancelJobs;
+  { Корень архива снаружи: путь и крошки только после чтения каталога. }
+  if ShouldProbeArchive(GetCurrentPathImpl, TargetPath) then
+  begin
+    ProbeArchiveEnter(TargetPath, ASelectPath);
     Exit;
+  end;
+  EndInlineRename(False);
+  if IsPreviewActive then
+    HidePreview;
 
   SameDir := SameDirHistoryPath(GetCurrentPathImpl, TargetPath);
   CurEntries := GetCurrentEntries;
@@ -3913,6 +6206,7 @@ begin
   end;
   if IsRemotePath(TargetPath) then
     UpdateLoadChrome;
+  SyncFolderSizeRoot;
 end;
 
 
@@ -3926,6 +6220,27 @@ begin
     Exit;
 
   Path := GetCurrentPathImpl;
+  if IsVibeNetworkPath(Path) then
+  begin
+    AbandonTabLoad(FActiveTabIndex);
+    EnsureNetSession;
+    if IsVibeNetworkRoot(Path) then
+    begin
+      ShowNetBar(True);
+      if Assigned(FNetSubnet) and (FNetSubnet.Text = '') then
+        FNetSubnet.Text := FNet.ResolvedSubnet;
+      PublishNetworkList;
+    end
+    else
+    begin
+      ShowNetBar(False);
+      FNet.Browse(Path);
+    end;
+    Exit;
+  end;
+  ShowNetBar(False);
+  if Assigned(FNet) then
+    FNet.CancelJobs;
   if (Path = '') or (not IsListablePath(Path)) then Exit;
 
   if AKeepSelection then
@@ -3973,16 +6288,19 @@ begin
   begin
     Found := -1;
     if Assigned(AList) then
+    begin
+      var ByName := (Pos('://', ASelectPath) = 0) and not IsUncPath(ASelectPath);
       for I := 0 to AList.Count - 1 do
         if SameText(AList[I].FullPath, ASelectPath) or
            SameText(ExcludeTrailingPathDelimiter(AList[I].FullPath),
                     ExcludeTrailingPathDelimiter(ASelectPath)) or
-           SameText(AList[I].Name,
-             ExtractFileName(ExcludeTrailingPathDelimiter(ASelectPath))) then
+           (ByName and SameText(AList[I].Name,
+             ExtractFileName(ExcludeTrailingPathDelimiter(ASelectPath)))) then
         begin
           Found := I;
           Break;
         end;
+    end;
     if Found >= 0 then
     begin
       ScreenIndex := Found;
@@ -4327,7 +6645,6 @@ begin
     FTabs[AIndex] := Tab;
     if AIndex = FActiveTabIndex then
     begin
-      UpdateLongestType(Tab.Entries);
       if FNameFilter <> '' then
         CommitNameFilter(False)
       else
@@ -4336,8 +6653,11 @@ begin
         RebuildContent;
       end;
       InvalidateView;
+      if Assigned(FThumbTimer) and not FDestroying then
+        FThumbTimer.Enabled := True;
       if ADone then
       begin
+        NoteOpenedUnc(Tab.Path);
         if FWatchEnabled then
           WatchTab(AIndex);
         UpdateLoadChrome;
@@ -4375,7 +6695,7 @@ var
   N: Integer;
 begin
   AStatus := '';
-  ARetry := 'Дочитать';
+  ARetry := L('panel.readmore');
   AShowRetry := False;
   if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
     Exit;
@@ -4391,9 +6711,9 @@ begin
   begin
     AShowRetry := True;
     if (not Assigned(Tab.Entries) or (Tab.Entries.Count = 0)) then
-      AStatus := 'нет связи · '
+      AStatus := L('panel.link.none')
     else
-      AStatus := 'оборвалось · ';
+      AStatus := L('panel.link.broke');
   end;
 end;
 
@@ -4409,7 +6729,7 @@ begin
   if AMsg <> '' then
     Tab.LoadError := AMsg
   else
-    Tab.LoadError := 'Нет связи';
+    Tab.LoadError := L('panel.link.lost');
   FTabs[AIndex] := Tab;
   Inc(FThumbGen);
   Inc(FIconGen);
@@ -4423,8 +6743,6 @@ begin
   if FDestroying or IsOffline then
     Exit;
   if (GetTickCount - FScrollTick) < 250 then
-    Exit;
-  if Assigned(GlobalThumbCache) and (GlobalThumbCache.PendingCount >= 24) then
     Exit;
   Result := True;
 end;
@@ -4503,7 +6821,7 @@ begin
     end;
   end
   else if not FTabs[ATabIndex].Offline then
-    SetTabOffline(ATabIndex, 'Нет связи');
+    SetTabOffline(ATabIndex, L('panel.link.lost'));
 end;
 
 procedure TFilePanel.StartDirLoad(const APath, ASelectPath: string; AKeepSelection: Boolean);
@@ -4728,7 +7046,7 @@ begin
           N := Cur.Entries.Count;
         Cur.Loading := False;
         Cur.LoadError := '';
-        if AError = 'Нет доступа' then
+        if AError = L('op.noaccess') then
         begin
           Cur.LoadError := AError;
           Cur.Partial := True;
@@ -4762,6 +7080,8 @@ begin
       begin
         Cur.LoadError := '';
         FTabs[TabIdx] := Cur;
+        if UnopenedArchiveRoot(Cur, Path) then
+          RevertUnopenedArchive(TabIdx, Path, AError);
       end
       else
         FTabs[TabIdx] := Cur;
@@ -5004,7 +7324,7 @@ begin
               Entry.DisplayType, FColors.SubTextColor, RowOp, TTextAlign.Leading, MetaFs);
           if SizeR - SizeL > 4 then
             DrawTrimmedText(Canvas, TRectF.Create(SizeL, MetaTop, SizeR, R.Bottom),
-              Entry.DisplaySize, FColors.SubTextColor, RowOp, TTextAlign.Trailing, MetaFs);
+              EntrySizeText(Entry), FColors.SubTextColor, RowOp, TTextAlign.Trailing, MetaFs);
           if (FColDateMode <> dcmHidden) and (DateR - DateL > 4) then
             DrawTrimmedText(Canvas, TRectF.Create(DateL, MetaTop, DateR, R.Bottom),
               FormatRowDate(Entry), FColors.SubTextColor, RowOp, TTextAlign.Trailing, MetaFs);
@@ -5021,8 +7341,13 @@ begin
             DrawTrimmedText(Canvas, TRectF.Create(TypeL, R.Top, TypeR, R.Bottom),
               Entry.DisplayType, Canvas.Fill.Color, RowOp, TTextAlign.Leading, MetaFs);
           if FColShowSize then
+          begin
+            var SizeAlign := TTextAlign.Trailing;
+            if FColNetMode = 1 then
+              SizeAlign := TTextAlign.Leading;
             DrawTrimmedText(Canvas, TRectF.Create(SizeL, R.Top, SizeR, R.Bottom),
-              Entry.DisplaySize, Canvas.Fill.Color, RowOp, TTextAlign.Trailing, MetaFs);
+              EntrySizeText(Entry), Canvas.Fill.Color, RowOp, SizeAlign, MetaFs);
+          end;
           if FColDateMode <> dcmHidden then
             DrawTrimmedText(Canvas, TRectF.Create(DateL, R.Top, DateR, R.Bottom),
               FormatRowDate(Entry), Canvas.Fill.Color, RowOp, TTextAlign.Trailing, MetaFs);
@@ -5037,6 +7362,7 @@ begin
       if Cols <= 0 then Cols := 1;
       Canvas.Font.Size := 12;
 
+      RecalcColLayout(W);
       StartIdx := Max(0, Floor(VPos / TileH) * Cols);
       EndIdx := Min(TotalCount - 1, Ceil((VPos + ViewH) / TileH) * Cols + Cols);
 
@@ -5113,15 +7439,6 @@ begin
 
           HasDrawn := True;
         end;
-        if (TS >= 64) and Assigned(GlobalThumbCache) and
-           GlobalThumbCache.WorkersEnabled and
-           IsThumbCandidate(Entry.FullPath, Entry.IsDirectory, Entry.Name) and
-           (not IsRemotePath(Entry.FullPath) or WantRemoteThumbs) then
-        begin
-          GlobalThumbCache.RequestAsync(Entry.FullPath, Round(TS), nil, Entry.Name);
-          if Assigned(FThumbTimer) and not FDestroying then
-            FThumbTimer.Enabled := True;
-        end;
 
         if not HasDrawn then
         begin
@@ -5154,13 +7471,13 @@ begin
           Canvas.Fill.Color := FColors.OnAccentTextColor
         else
           Canvas.Fill.Color := FColors.SubTextColor;
-        var SizeStr: string;
-        if Entry.DisplaySize <> '' then
-          SizeStr := Entry.DisplaySize
-        else if Entry.IsDirectory then
-          SizeStr := 'Папка'
-        else
-          SizeStr := '';
+        var SizeStr := EntrySizeText(Entry);
+        if FColNetMode = 1 then
+          SizeStr := Trim(Entry.DisplayType + '  ' + Entry.DisplaySize)
+        else if (FColNetMode = 2) and (Entry.DisplayType <> '') then
+          SizeStr := Entry.DisplayType
+        else if (SizeStr = '') and Entry.IsDirectory then
+          SizeStr := L('model.folder');
 
         var ExtraStr := '';
         if (not Entry.IsDirectory) and Assigned(GlobalMetaCache) and
@@ -5185,8 +7502,38 @@ begin
         end;
       end;
     end;
-    if Assigned(FThumbTimer) and not FDestroying and Assigned(GlobalIconCache) and
-       GlobalIconCache.HasWork then
+    if FBandActive then
+    begin
+      var Band := TRectF.Create(
+        Min(FBandAnchor.X, FBandCurrent.X), Min(FBandAnchor.Y, FBandCurrent.Y),
+        Max(FBandAnchor.X, FBandCurrent.X), Max(FBandAnchor.Y, FBandCurrent.Y));
+      var Clip := TRectF.Create(0, VPos, EffectiveRight, VPos + ViewH);
+      var DrawR: TRectF;
+      DrawR.Left := Max(Band.Left, Clip.Left);
+      DrawR.Top := Max(Band.Top, Clip.Top);
+      DrawR.Right := Min(Band.Right, Clip.Right);
+      DrawR.Bottom := Min(Band.Bottom, Clip.Bottom);
+      if DrawR.Width < 1 then
+        DrawR.Right := DrawR.Left + 1;
+      if DrawR.Height < 1 then
+        DrawR.Bottom := DrawR.Top + 1;
+      DrawR.Right := Min(DrawR.Right, Clip.Right);
+      DrawR.Bottom := Min(DrawR.Bottom, Clip.Bottom);
+      if (DrawR.Left < DrawR.Right) and (DrawR.Top < DrawR.Bottom) then
+      begin
+        Canvas.Fill.Kind := TBrushKind.Solid;
+        Canvas.Fill.Color := ThemeAdjustAlpha(FColors.SelectionColor, $28);
+        Canvas.FillRect(DrawR, 0, 0, [], 1);
+        Canvas.Stroke.Kind := TBrushKind.Solid;
+        Canvas.Stroke.Color := ThemeAdjustAlpha(FColors.SelectionColor, $A0);
+        Canvas.Stroke.Thickness := 1;
+        Canvas.Stroke.Dash := TStrokeDash.Solid;
+        Canvas.DrawRect(DrawR, 0, 0, [], 1);
+      end;
+    end;
+    if Assigned(FThumbTimer) and not FDestroying and
+       ((Assigned(GlobalIconCache) and GlobalIconCache.HasWork) or
+        (Assigned(GlobalFolderSizes) and GlobalFolderSizes.HasWork)) then
       FThumbTimer.Enabled := True;
   finally
     Canvas.EndScene;
@@ -5200,6 +7547,7 @@ var
   ClickedIdx: Integer;
   Entries: uFileModel.TFileEntryList;
   TotalCount: Integer;
+  OnParent: Boolean;
 begin
   var SB := CurrentScrollBox;
   if SB = nil then Exit;
@@ -5214,6 +7562,8 @@ begin
     SetFocus;
 
   ClickedIdx := GetIndexAt(X, Y);
+  if NetHeadRow(ClickedIdx) then
+    Exit;
   TotalCount := VisualCount;
 
   if (Button = TMouseButton.mbLeft) and HasParentDirectory and (ClickedIdx = 0) and
@@ -5227,43 +7577,135 @@ begin
   begin
     FSuppressSelectUntilUp := False;
     FPendingRightSelect := False;
-    FSelectionManager.CurrentIndex := ClickedIdx;
-    NotifyCursorChange;
+    FPendingExplorerMenu := False;
+    FPendingNetHistMenu := False;
+    OnParent := HasParentDirectory and (ClickedIdx = 0);
+    if FSelectionManager.CurrentIndex <> ClickedIdx then
+    begin
+      FSelectionManager.CurrentIndex := ClickedIdx;
+      NotifyCursorChange;
+    end;
 
     if Button = TMouseButton.mbLeft then
     begin
-      FSelectionManager.MouseDown(ClickedIdx, Button, Shift);
-      if not (ssCtrl in Shift) and not (ssShift in Shift) then
+      if ssShift in Shift then
       begin
+        { Shift остаётся диапазоном от якоря и рамку не открывает. }
+        FDragReady := False;
+        ClearLeftGesture;
+        FSelectionManager.ExplorerClick := False;
+        FSelectionManager.MouseDown(ClickedIdx, Button, Shift);
+      end
+      else if FExplorerMouse then
+      begin
+        { Невыделенный — рамка. Уже выделенный — перетаскивание без паузы.
+          Клик без сдвига по выделенному оставляет только его. }
+        FDragReady := False;
+        ClearLeftGesture;
+        if (not OnParent) and not NetSkipDrag(ClickedIdx) and
+           IsItemSelected(ClickedIdx) then
+        begin
+          FPendingClick := True;
+          FPendingClickIdx := ClickedIdx;
+          FPendingClickShift := Shift;
+          FDragStart := TPointF.Create(X, Y);
+          FDragReady := True;
+          FDragPaths := CollectDragPaths;
+        end
+        else
+          ArmLeftBand(ClickedIdx, Shift, X, Y);
+      end
+      else if (not OnParent) and not NetSkipDrag(ClickedIdx) and
+              (IsItemSelected(ClickedIdx) or not HasMultiSelection) then
+      begin
+        { Отмеченный файл тянет всю отметку. Без отметок тянется файл под курсором. }
+        FDragReady := False;
+        ClearLeftGesture;
         FDragReady := True;
         FDragStart := TPointF.Create(X, Y);
         FDragPaths := CollectDragPaths;
+        FPendingClick := True;
+        FPendingClickIdx := ClickedIdx;
+        FPendingClickShift := Shift;
       end
       else
+      begin
+        { Сдвиг с неотмеченного при живой отметке ничего не меняет. }
         FDragReady := False;
+        ClearLeftGesture;
+        FPendingClick := True;
+        FPendingClickIdx := ClickedIdx;
+        FPendingClickShift := Shift;
+      end;
     end
     else if Button = TMouseButton.mbRight then
     begin
-      { Длинный ПКМ не трогает выделение. Короткий клик — в MouseUp,
-        протяжка кистью — после сдвига > 8 px. }
       FDragReady := False;
-      FPendingRightSelect := True;
+      ClearLeftGesture;
       FSelectionManager.CancelDrag;
-      CapturePaintBoxMouse;
+      if NetRecentVisual(ClickedIdx) then
+      begin
+        FPendingRightSelect := False;
+        FPendingExplorerMenu := False;
+        FPendingNetHistMenu := True;
+      end
+      else if FExplorerMouse then
+      begin
+        { Меню на отпускании. Протяжку ПКМ в этом режиме не включаем. }
+        FPendingRightSelect := False;
+        FPendingExplorerMenu := True;
+      end
+      else
+      begin
+        FPendingExplorerMenu := False;
+        FPendingNetHistMenu := False;
+        FPendingRightSelect := True;
+        FDragReady := False;
+        if (not OnParent) and not (ssShift in Shift) then
+          ArmMarkGesture(X, Y)
+        else
+          CapturePaintBoxMouse;
+      end;
       InvalidateView;
     end
     else
       FDragReady := False;
 
-    FLongClickArmed := True;
-    FLongClickBtn := Button;
     FLongClickIdx := ClickedIdx;
     FLongClickPt := TPointF.Create(X, Y);
-    FLongClickTimer.Enabled := False;
-    FLongClickTimer.Enabled := True;
+    FLongClickBtn := Button;
+    if IsVibeNetworkPath(GetCurrentPathImpl) then
+    begin
+      FLongClickArmed := False;
+      if Assigned(FLongClickTimer) then
+        FLongClickTimer.Enabled := False;
+    end
+    else if FExplorerMouse and (Button = TMouseButton.mbRight) then
+    begin
+      FLongClickArmed := False;
+      if Assigned(FLongClickTimer) then
+        FLongClickTimer.Enabled := False;
+    end
+    else
+    begin
+      FLongClickArmed := True;
+      FLongClickTimer.Enabled := False;
+      FLongClickTimer.Enabled := True;
+    end;
   end
   else
+  begin
     CancelLongClick;
+    FPendingRightSelect := False;
+    FPendingExplorerMenu := False;
+    FPendingNetHistMenu := False;
+    if (Button = TMouseButton.mbLeft) and not (ssShift in Shift) then
+    begin
+      FDragReady := False;
+      if FExplorerMouse then
+        ArmLeftBand(-1, Shift, X, Y);
+    end;
+  end;
 end;
 
 procedure TFilePanel.PaintBoxMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
@@ -5279,38 +7721,113 @@ begin
   Entries := GetCurrentEntries;
   if not Assigned(Entries) then Exit;
 
-  if FPendingRightSelect or FSelectionManager.IsDragging then
+  if FMarkArmed or FMarkActive then
   begin
     if not RightButtonHeld(Shift) then
     begin
-      EndRightPaint;
+      if FMarkActive then
+        FinishMarkGesture(X, Y, False);
+    end
+    else if (not PaintCaptureHeld) or PointerEndsGesture(Screen.MousePos) then
+    begin
+      FinishMarkGesture(X, Y, False);
+      UpdateStatusText;
     end
     else
     begin
-      if FLongClickArmed and
-         ((Abs(X - FLongClickPt.X) > 8) or (Abs(Y - FLongClickPt.Y) > 8)) then
+      if (not FMarkActive) and
+         (Sqr(X - FBandAnchor.X) + Sqr(Y - FBandAnchor.Y) > 16) then
+        ActivateMarkGesture;
+      if FMarkActive then
       begin
-        FPendingRightSelect := False;
-        FSelectionManager.BeginRightPaint(FLongClickIdx);
-        CancelLongClick;
-        if Assigned(FSelectScrollTimer) then
-          FSelectScrollTimer.Enabled := True;
+        FBandCurrent := TPointF.Create(X, Y);
+        ApplyMarkSelection(True);
+        ClickedIdx := GetIndexAt(X, Y);
+        if (ClickedIdx >= 0) and (FSelectionManager.CurrentIndex <> ClickedIdx) then
+        begin
+          FSelectionManager.CurrentIndex := ClickedIdx;
+          NotifyCursorChange;
+        end;
+        SyncSelectScrollTimer(FBandCurrent);
       end;
-      if FSelectionManager.IsDragging then
-        ApplyRightPaintMouse(X, Y);
     end;
   end
-  else if FLongClickArmed and
+  else if FPendingRightSelect and RightButtonHeld(Shift) and
+          PointerEndsGesture(Screen.MousePos) then
+  begin
+    FDragReady := False;
+    EndRightPaint;
+    UpdateStatusText;
+  end
+  else if FSelectionManager.IsDragging then
+  begin
+    if not RightButtonHeld(Shift) or PointerEndsGesture(Screen.MousePos) then
+    begin
+      EndRightPaint;
+      UpdateStatusText;
+    end
+    else
+    begin
+      ApplyRightPaintMouse(X, Y);
+      SyncSelectScrollTimer(TPointF.Create(X, Y));
+    end;
+  end;
+
+  if FLongClickArmed and not (FBandArmed or FBandActive or FMarkArmed or FMarkActive) and
      ((Abs(X - FLongClickPt.X) > 8) or (Abs(Y - FLongClickPt.Y) > 8)) then
     CancelLongClick;
 
-  if FDragReady and (ssLeft in Shift) then
+  if (FBandArmed or FBandActive) and not GFileDrag.Active then
   begin
-    if (Abs(X - FDragStart.X) > 8) or (Abs(Y - FDragStart.Y) > 8) then
+    if not PaintCaptureHeld then
+    begin
+      if FBandActive then
+        FinishLeftGesture(X, Y)
+      else
+        ClearLeftGesture;
+    end
+    else if not LeftButtonHeld(Shift) then
+      FinishLeftGesture(X, Y)
+    else if PointerEndsGesture(Screen.MousePos) then
+      FinishLeftGesture(X, Y)
+    else
+    begin
+      if (not FBandActive) and
+         (Sqr(X - FBandAnchor.X) + Sqr(Y - FBandAnchor.Y) > 16) then
+      begin
+        FBandActive := True;
+        FPendingClick := False;
+        FDragReady := False;
+        CancelLongClick;
+      end;
+      if FBandActive then
+      begin
+        FBandCurrent := TPointF.Create(X, Y);
+        ApplyBandSelection(True);
+        SyncSelectScrollTimer(FBandCurrent);
+      end;
+    end;
+  end;
+
+  if FPendingClick and not FDragReady and not FBandArmed and not FBandActive and
+     not GFileDrag.Active and
+     (Sqr(X - FLongClickPt.X) + Sqr(Y - FLongClickPt.Y) > 16) then
+    FPendingClick := False;
+
+  if FDragReady and not FBandActive and not FMarkActive and LeftButtonHeld(Shift) then
+  begin
+    if Sqr(X - FDragStart.X) + Sqr(Y - FDragStart.Y) > 16 then
     begin
       FDragReady := False;
       CancelLongClick;
+      if FExplorerMouse then
+        FPendingClick := False;
       StartInternalDrag;
+      if GFileDrag.Active then
+      begin
+        FPendingClick := False;
+        FPendingRightSelect := False;
+      end;
       Exit;
     end;
   end;
@@ -5348,8 +7865,41 @@ begin
     FileDragEnd(Button, Shift);
     Exit;
   end;
-  if FPendingRightSelect and (Button = TMouseButton.mbRight) and FLongClickArmed then
-    FSelectionManager.MouseDown(FLongClickIdx, TMouseButton.mbRight, Shift);
+  if Button = TMouseButton.mbRight then
+  begin
+    if FMarkArmed or FMarkActive then
+      FinishMarkGesture(X, Y, True);
+    if FPendingNetHistMenu then
+    begin
+      FPendingNetHistMenu := False;
+      FPendingRightSelect := False;
+      FPendingExplorerMenu := False;
+      if Assigned(FSelectScrollTimer) then
+        FSelectScrollTimer.Enabled := False;
+      ReleasePaintBoxCapture;
+      {$IFDEF MSWINDOWS}
+      ReleaseCapture;
+      {$ENDIF}
+      ShowNetRecentMenu(FLongClickIdx);
+    end
+    else if FExplorerMouse and FPendingExplorerMenu then
+    begin
+      FPendingExplorerMenu := False;
+      FPendingRightSelect := False;
+      if Assigned(FSelectScrollTimer) then
+        FSelectScrollTimer.Enabled := False;
+      ReleasePaintBoxCapture;
+      {$IFDEF MSWINDOWS}
+      ReleaseCapture;
+      {$ENDIF}
+      OpenExplorerItemMenu(FLongClickIdx);
+    end
+    else if FPendingRightSelect and FLongClickArmed then
+      FSelectionManager.MouseDown(FLongClickIdx, TMouseButton.mbRight, Shift);
+  end;
+  if (Button = TMouseButton.mbLeft) and
+     (FBandArmed or FBandActive or FPendingClick) then
+    FinishLeftGesture(X, Y);
   FSuppressSelectUntilUp := False;
   CancelLongClick;
   FDragReady := False;
@@ -5397,7 +7947,18 @@ end;
 procedure TFilePanel.EndRightPaint;
 begin
   FPendingRightSelect := False;
+  FPendingExplorerMenu := False;
+  FMarkArmed := False;
+  if FMarkActive then
+  begin
+    ApplyMarkSelection(False);
+    FMarkActive := False;
+    FMarkRemove := False;
+    SetLength(FMarkAcc, 0);
+  end;
   FSelectionManager.CancelDrag;
+  if FBandArmed or FBandActive then
+    Exit;
   if Assigned(FSelectScrollTimer) then
     FSelectScrollTimer.Enabled := False;
   ReleasePaintBoxCapture;
@@ -5456,53 +8017,8 @@ end;
 
 procedure TFilePanel.ApplyRightPaintMouse(X, Y: Single);
 var
-  SB: TVertScrollBox;
-  ViewY, ViewH, Zone, Dist, Delta, ItemH, VPos, MaxVPos: Single;
-  TS, Cols: Integer;
-  TileH, SlotW, PadX: Single;
   Idx, PrevIdx: Integer;
 begin
-  SB := CurrentScrollBox;
-  if SB = nil then
-    Exit;
-
-  if ViewMode = vmDetails then
-    ItemH := RowHeight
-  else
-  begin
-    GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
-    ItemH := TileH;
-  end;
-  if ItemH <= 0 then
-    ItemH := 22;
-
-  ViewH := SB.Height;
-  ViewY := Y - SB.ViewportPosition.Y;
-  Zone := Max(22.0, ItemH);
-  Delta := 0;
-  if ViewY < Zone then
-  begin
-    Dist := Zone - ViewY;
-    Delta := -Min(ItemH * 3, ItemH * Max(0.35, Dist / Zone));
-  end
-  else if ViewY > ViewH - Zone then
-  begin
-    Dist := ViewY - (ViewH - Zone);
-    Delta := Min(ItemH * 3, ItemH * Max(0.35, Dist / Zone));
-  end;
-
-  if Delta <> 0 then
-  begin
-    VPos := SB.ViewportPosition.Y + Delta;
-    MaxVPos := Max(0.0, SB.ContentBounds.Height - ViewH);
-    VPos := Max(0.0, Min(VPos, MaxVPos));
-    if not SameValue(VPos, SB.ViewportPosition.Y) then
-    begin
-      Y := Y + (VPos - SB.ViewportPosition.Y);
-      SB.ViewportPosition := TPointF.Create(SB.ViewportPosition.X, VPos);
-    end;
-  end;
-
   Idx := GetSelectIndexAt(X, Y);
   if Idx < 0 then
     Exit;
@@ -5512,36 +8028,642 @@ begin
     NotifyCursorChange;
 end;
 
+function TFilePanel.LeftButtonHeld(const AShift: TShiftState): Boolean;
+begin
+  Result := ssLeft in AShift;
+{$IFDEF MSWINDOWS}
+  if not Result then
+    Result := (GetKeyState(VK_LBUTTON) and $8000) <> 0;
+{$ENDIF}
+end;
+
+function TFilePanel.PaintCaptureHeld: Boolean;
+var
+  PB: TPaintBox;
+begin
+  PB := CurrentPaintBox;
+  Result := Assigned(Root) and Assigned(Root.Captured) and (PB <> nil) and
+    (Root.Captured.GetObject = PB);
+end;
+
+function TFilePanel.PointerEndsGesture(const AScreen: TPointF): Boolean;
+var
+  Local: TPointF;
+  Hit: IControl;
+  Obj: TFmxObject;
+begin
+  Result := False;
+  Local := ScreenToLocal(AScreen);
+  if (Local.X < 0) or (Local.X >= Width) then
+    Exit(True);
+  if Local.Y >= 0 then
+    Exit(False);
+  if not Assigned(Root) or not (Root.GetObject is TCommonCustomForm) then
+    Exit(False);
+  Hit := TCommonCustomForm(Root.GetObject).ObjectAtPoint(AScreen);
+  if Hit = nil then
+    Exit(False);
+  Obj := Hit.GetObject;
+  while Obj <> nil do
+  begin
+    if Obj.ClassName = 'TLaunchDock' then
+      Exit(True);
+    Obj := Obj.Parent;
+  end;
+end;
+
+function TFilePanel.ListStride: Single;
+var
+  SB: TVertScrollBox;
+  Cols, TS: Integer;
+  TileH, SlotW, PadX: Single;
+begin
+  if ViewMode = vmDetails then
+    Result := RowHeight
+  else
+  begin
+    SB := CurrentScrollBox;
+    if SB = nil then
+      Exit(0);
+    GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
+    Result := TileH;
+  end;
+end;
+
+function TFilePanel.OutsideScrollDelta(AViewY, AViewH: Single): Single;
+var
+  SB: TVertScrollBox;
+  PB: TPaintBox;
+  Dist, ItemH, MaxV, VPos, NewV: Single;
+  Rows: Integer;
+begin
+  Result := 0;
+  if (AViewH <= 0) or ((AViewY >= 0) and (AViewY <= AViewH)) then
+    Exit;
+  if AViewY < 0 then
+    Dist := -AViewY
+  else
+    Dist := AViewY - AViewH;
+  if Dist < 1 then
+    Exit;
+  ItemH := ListStride;
+  if ItemH <= 0 then
+    Exit;
+  Rows := Ceil(Dist / 24);
+  if Rows < 1 then
+    Rows := 1
+  else if Rows > 4 then
+    Rows := 4;
+  SB := CurrentScrollBox;
+  if SB = nil then
+    Exit;
+  VPos := SB.ViewportPosition.Y;
+  MaxV := Max(0, SB.ContentBounds.Height - AViewH);
+  PB := CurrentPaintBox;
+  if PB <> nil then
+    MaxV := Max(MaxV, PB.Height - AViewH);
+  if MaxV < 0 then
+    MaxV := 0;
+  if AViewY < 0 then
+    NewV := VPos - Rows * ItemH
+  else
+    NewV := VPos + Rows * ItemH;
+  if NewV < 0 then
+    NewV := 0
+  else if NewV > MaxV then
+    NewV := MaxV;
+  Result := NewV - VPos;
+end;
+
+procedure TFilePanel.SyncSelectScrollTimer(const ALocal: TPointF);
+var
+  SB: TVertScrollBox;
+  ViewY: Single;
+begin
+  if not Assigned(FSelectScrollTimer) then
+    Exit;
+  SB := CurrentScrollBox;
+  if (SB = nil) or
+     not (FBandActive or FMarkActive or FSelectionManager.IsDragging) then
+  begin
+    FSelectScrollTimer.Enabled := False;
+    Exit;
+  end;
+  ViewY := ALocal.Y - SB.ViewportPosition.Y;
+  FSelectScrollTimer.Enabled := Abs(OutsideScrollDelta(ViewY, SB.Height)) > 0.5;
+end;
+
+procedure TFilePanel.CollectBandHits(out AHits: TArray<Integer>);
+var
+  N, I, I0, I1, C0, C1, R0, R1, Cols, TS, Col, Row, Idx, Count, MaxRow: Integer;
+  RH: Integer;
+  TileH, SlotW, PadX, X0, X1, Y0, Y1: Single;
+  SB: TVertScrollBox;
+begin
+  SetLength(AHits, 0);
+  N := VisualCount;
+  SB := CurrentScrollBox;
+  if (N <= 0) or (SB = nil) then
+    Exit;
+  X0 := Min(FBandAnchor.X, FBandCurrent.X);
+  X1 := Max(FBandAnchor.X, FBandCurrent.X);
+  Y0 := Min(FBandAnchor.Y, FBandCurrent.Y);
+  Y1 := Max(FBandAnchor.Y, FBandCurrent.Y);
+  if ViewMode = vmDetails then
+  begin
+    RH := RowHeight;
+    if RH <= 0 then
+      Exit;
+    if (X1 <= 6) or (X0 >= SB.Width - SCROLLBAR_RESERVE + 4) then
+      Exit;
+    I0 := Floor(Y0 / RH);
+    I1 := Floor(Y1 / RH);
+    if I1 < 0 then
+      I1 := 0
+    else if I1 >= N then
+      I1 := N - 1;
+    if (I1 > I0) and (Y1 <= I1 * RH) then
+      Dec(I1);
+    if HasParentDirectory and (I0 < 1) then
+      I0 := 1;
+    if I0 < 0 then
+      I0 := 0;
+    if I1 >= N then
+      I1 := N - 1;
+    if I1 < I0 then
+      Exit;
+    SetLength(AHits, I1 - I0 + 1);
+    for I := I0 to I1 do
+      AHits[I - I0] := I;
+  end
+  else
+  begin
+    GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
+    if (Cols <= 0) or (SlotW <= 0) or (TileH <= 0) then
+      Exit;
+    C0 := Floor(X0 / SlotW);
+    C1 := Floor(X1 / SlotW);
+    if (C1 > C0) and (X1 <= C1 * SlotW) then
+      Dec(C1);
+    R0 := Floor(Y0 / TileH);
+    R1 := Floor(Y1 / TileH);
+    if (R1 > R0) and (Y1 <= R1 * TileH) then
+      Dec(R1);
+    if C0 < 0 then
+      C0 := 0;
+    if C1 >= Cols then
+      C1 := Cols - 1;
+    if R0 < 0 then
+      R0 := 0;
+    MaxRow := (N - 1) div Cols;
+    if R1 > MaxRow then
+      R1 := MaxRow;
+    if (C1 < C0) or (R1 < R0) then
+      Exit;
+    SetLength(AHits, (R1 - R0 + 1) * (C1 - C0 + 1));
+    Count := 0;
+    for Row := R0 to R1 do
+      for Col := C0 to C1 do
+      begin
+        Idx := Row * Cols + Col;
+        if (Idx < 0) or (Idx >= N) then
+          Continue;
+        if HasParentDirectory and (Idx = 0) then
+          Continue;
+        if (Col * SlotW + PadX + TS <= X0) or (Col * SlotW + PadX >= X1) or
+           (Row * TileH + TS + TILE_TEXT_ZONE <= Y0) or (Row * TileH >= Y1) then
+          Continue;
+        AHits[Count] := Idx;
+        Inc(Count);
+      end;
+    SetLength(AHits, Count);
+  end;
+end;
+
+procedure TFilePanel.ApplyBandSelection(APaint: Boolean);
+var
+  Hits: TArray<Integer>;
+begin
+  CollectBandHits(Hits);
+  FSelectionManager.ApplyRubberBand(Hits, not FBandCtrl, FBandBase);
+  if APaint then
+    InvalidateView;
+end;
+
+procedure TFilePanel.ArmLeftBand(AIndex: Integer; const AShift: TShiftState;
+  X, Y: Single);
+var
+  Sel: TList<Integer>;
+  I: Integer;
+begin
+  FMarkArmed := False;
+  FMarkActive := False;
+  FMarkRemove := False;
+  SetLength(FMarkAcc, 0);
+  FBandArmed := True;
+  FBandActive := False;
+  FBandCtrl := ssCtrl in AShift;
+  FBandPressIdx := AIndex;
+  FBandAnchor := TPointF.Create(X, Y);
+  FBandCurrent := FBandAnchor;
+  FPendingClick := AIndex >= 0;
+  FPendingClickIdx := AIndex;
+  FPendingClickShift := AShift;
+  SetLength(FBandBase, 0);
+  if FBandCtrl then
+  begin
+    Sel := GetCurrentSelectedIndices;
+    if Assigned(Sel) then
+    begin
+      SetLength(FBandBase, Sel.Count);
+      for I := 0 to Sel.Count - 1 do
+        FBandBase[I] := Sel[I];
+    end;
+  end;
+  CapturePaintBoxMouse;
+end;
+
+procedure TFilePanel.ClearLeftGesture;
+begin
+  FBandArmed := False;
+  FBandActive := False;
+  FBandCtrl := False;
+  FPendingClick := False;
+  FBandPressIdx := -1;
+  SetLength(FBandBase, 0);
+  FMarkArmed := False;
+  FMarkActive := False;
+  FMarkRemove := False;
+  SetLength(FMarkAcc, 0);
+  if Assigned(FSelectScrollTimer) and
+     ((FSelectionManager = nil) or not FSelectionManager.IsDragging) then
+    FSelectScrollTimer.Enabled := False;
+  ReleasePaintBoxCapture;
+end;
+
+procedure TFilePanel.FinishLeftGesture(X, Y: Single);
+var
+  UpIdx: Integer;
+begin
+  if not FBandArmed and not FBandActive and not FPendingClick then
+    Exit;
+  if FBandActive then
+  begin
+    FBandCurrent := TPointF.Create(X, Y);
+    ApplyBandSelection(False);
+    UpIdx := GetIndexAt(X, Y);
+    if UpIdx >= 0 then
+    begin
+      if FSelectionManager.CurrentIndex <> UpIdx then
+      begin
+        FSelectionManager.CurrentIndex := UpIdx;
+        NotifyCursorChange;
+      end;
+      FSelectionManager.AnchorIndex := UpIdx;
+    end
+    else if FBandPressIdx >= 0 then
+      FSelectionManager.AnchorIndex := FBandPressIdx;
+  end
+  else if FPendingClick and (FPendingClickIdx >= 0) then
+    ApplyPendingLeftClick
+  else if FExplorerMouse and (FBandPressIdx < 0) and not FBandCtrl then
+    SetSelectedIndices(nil);
+  ClearLeftGesture;
+  InvalidateView;
+end;
+
+procedure TFilePanel.ApplyPendingLeftClick;
+begin
+  if not FPendingClick or (FPendingClickIdx < 0) or (FSelectionManager = nil) then
+    Exit;
+  FSelectionManager.ExplorerClick := FExplorerMouse and
+    not (HasParentDirectory and (FPendingClickIdx = 0));
+  FSelectionManager.MouseDown(FPendingClickIdx, TMouseButton.mbLeft, FPendingClickShift);
+end;
+
+procedure TFilePanel.ArmMarkGesture(X, Y: Single);
+begin
+  FMarkArmed := True;
+  FMarkActive := False;
+  FMarkRemove := False;
+  FBandAnchor := TPointF.Create(X, Y);
+  FBandCurrent := FBandAnchor;
+  SetLength(FMarkAcc, 0);
+  CapturePaintBoxMouse;
+end;
+
+procedure TFilePanel.ActivateMarkGesture;
+var
+  Sel: TList<Integer>;
+  I: Integer;
+begin
+  FMarkActive := True;
+  FPendingRightSelect := False;
+  FDragReady := False;
+  CancelLongClick;
+  // Старт уже отмечен: протяжка снимает. Иначе ставит. Повторный проход не откатывает до отпускания.
+  FMarkRemove := (FSelectionManager <> nil) and
+    IsItemSelected(FSelectionManager.CurrentIndex);
+  SetLength(FMarkAcc, 0);
+  SetLength(FBandBase, 0);
+  Sel := GetCurrentSelectedIndices;
+  if Assigned(Sel) then
+  begin
+    SetLength(FBandBase, Sel.Count);
+    for I := 0 to Sel.Count - 1 do
+      FBandBase[I] := Sel[I];
+  end;
+end;
+
+procedure TFilePanel.ApplyMarkSelection(APaint: Boolean);
+var
+  Hits, Want: TArray<Integer>;
+  Seen: TDictionary<Integer, Byte>;
+  I, N: Integer;
+  Changed: Boolean;
+begin
+  CollectBandHits(Hits);
+  Seen := TDictionary<Integer, Byte>.Create;
+  try
+    for I := 0 to High(FMarkAcc) do
+      Seen.AddOrSetValue(FMarkAcc[I], 1);
+    for I := 0 to High(Hits) do
+      if not Seen.ContainsKey(Hits[I]) then
+      begin
+        Seen.Add(Hits[I], 1);
+        SetLength(FMarkAcc, Length(FMarkAcc) + 1);
+        FMarkAcc[High(FMarkAcc)] := Hits[I];
+      end;
+    if FMarkRemove then
+    begin
+      SetLength(Want, Length(FBandBase));
+      N := 0;
+      for I := 0 to High(FBandBase) do
+        if not Seen.ContainsKey(FBandBase[I]) then
+        begin
+          Want[N] := FBandBase[I];
+          Inc(N);
+        end;
+      SetLength(Want, N);
+      Changed := FSelectionManager.ApplyRubberBand(Want, True, nil);
+    end
+    else
+      Changed := FSelectionManager.ApplyRubberBand(FMarkAcc, False, FBandBase);
+  finally
+    Seen.Free;
+  end;
+  if APaint and Changed then
+    InvalidateView;
+end;
+
+procedure TFilePanel.FinishMarkGesture(X, Y: Single; AKeepClick: Boolean);
+var
+  UpIdx: Integer;
+begin
+  if not FMarkArmed and not FMarkActive then
+    Exit;
+  if FMarkActive then
+  begin
+    FBandCurrent := TPointF.Create(X, Y);
+    ApplyMarkSelection(False);
+    FPendingRightSelect := False;
+    UpIdx := GetIndexAt(X, Y);
+    if UpIdx >= 0 then
+    begin
+      if FSelectionManager.CurrentIndex <> UpIdx then
+      begin
+        FSelectionManager.CurrentIndex := UpIdx;
+        NotifyCursorChange;
+      end;
+      FSelectionManager.AnchorIndex := UpIdx;
+    end;
+  end
+  else if not AKeepClick then
+    FPendingRightSelect := False;
+  FMarkArmed := False;
+  FMarkActive := False;
+  FMarkRemove := False;
+  SetLength(FMarkAcc, 0);
+  SetLength(FBandBase, 0);
+  if not FBandArmed and not FBandActive then
+  begin
+    if Assigned(FSelectScrollTimer) and
+       ((FSelectionManager = nil) or not FSelectionManager.IsDragging) then
+      FSelectScrollTimer.Enabled := False;
+    ReleasePaintBoxCapture;
+  end;
+  InvalidateView;
+end;
+
+procedure TFilePanel.OpenExplorerItemMenu(AVisualIdx: Integer);
+var
+  None: TArray<Integer>;
+begin
+  if (AVisualIdx < 0) or (FSelectionManager = nil) then
+    Exit;
+  if NetHeadRow(AVisualIdx) then
+    Exit;
+  if NetRecentVisual(AVisualIdx) then
+  begin
+    ShowNetRecentMenu(AVisualIdx);
+    Exit;
+  end;
+  if IsVibeNetworkPath(GetCurrentPathImpl) then
+  begin
+    var NetHit: TFileEntry;
+    if NetEntryAt(AVisualIdx, NetHit) and
+       (SameText(NetHit.IconKey, '#computer') or
+        SameText(NetHit.IconKey, '#router') or
+        SameText(NetHit.IconKey, '#ftp') or
+        StartsText('network://', NetHit.FullPath) or
+        StartsText('ftp://', NetHit.FullPath) or
+        StartsText('ftps://', NetHit.FullPath) or
+        StartsText('sftp://', NetHit.FullPath) or
+        StartsText('http://', NetHit.FullPath) or
+        StartsText('https://', NetHit.FullPath)) then
+      Exit;
+  end;
+  if HasParentDirectory and (AVisualIdx = 0) then
+  begin
+    if FSelectionManager.CurrentIndex <> AVisualIdx then
+    begin
+      FSelectionManager.CurrentIndex := AVisualIdx;
+      NotifyCursorChange;
+    end;
+    Exit;
+  end;
+  if not IsItemSelected(AVisualIdx) then
+  begin
+    FSelectionManager.CurrentIndex := AVisualIdx;
+    FSelectionManager.AnchorIndex := AVisualIdx;
+    SetLength(None, 0);
+    FSelectionManager.ApplyRubberBand([AVisualIdx], True, None);
+    NotifyCursorChange;
+    InvalidateView;
+  end
+  else if FSelectionManager.CurrentIndex <> AVisualIdx then
+  begin
+    FSelectionManager.CurrentIndex := AVisualIdx;
+    FSelectionManager.AnchorIndex := AVisualIdx;
+    NotifyCursorChange;
+  end;
+  ShowShellMenuForIndex(AVisualIdx);
+end;
+
+procedure TFilePanel.ShowMouseModeMenu;
+const
+  Mark: array[Boolean] of string = ('', #$2713);
+begin
+  if FMouseModeMenu = nil then
+  begin
+    FMouseModeMenu := TFluentPopupMenu.Create(Self);
+    FMouseModeMenu.Parent := Self;
+  end;
+  FMouseModeMenu.ClearItems;
+  FMouseModeMenu.AddItem(L('panel.mouse.vibe'), Mark[not FExplorerMouse],
+    MouseModeVibeClick);
+  FMouseModeMenu.AddItem(L('panel.mouse.explorer'), Mark[FExplorerMouse],
+    MouseModeExplorerClick);
+  FMouseModeMenu.ApplyTheme(FColors);
+  FMouseModeMenu.PopupAtCursor;
+end;
+
+procedure TFilePanel.MouseModeExplorerClick(Sender: TObject);
+begin
+  if Assigned(FOnMouseModePick) then
+    FOnMouseModePick(Self, True)
+  else
+    SetExplorerMouse(True);
+end;
+
+procedure TFilePanel.MouseModeVibeClick(Sender: TObject);
+begin
+  if Assigned(FOnMouseModePick) then
+    FOnMouseModePick(Self, False)
+  else
+    SetExplorerMouse(False);
+end;
+
+procedure TFilePanel.SetExplorerMouse(AExplorer: Boolean);
+begin
+  FExplorerMouse := AExplorer;
+  if Assigned(FSelectionManager) then
+    FSelectionManager.ExplorerClick := False;
+end;
+
 procedure TFilePanel.SelectScrollTimerTick(Sender: TObject);
 var
   PB: TPaintBox;
+  SB: TVertScrollBox;
   Local: TPointF;
   ScreenPt: TPointF;
+  ViewY, ViewH, Delta: Single;
 begin
-  if FDestroying then
+  if FDestroying or (FSelectionManager = nil) then
   begin
     if Assigned(FSelectScrollTimer) then
       FSelectScrollTimer.Enabled := False;
     Exit;
   end;
-  if not FSelectionManager.IsDragging then
+  if not FBandActive and not FMarkActive and not FSelectionManager.IsDragging then
   begin
     if Assigned(FSelectScrollTimer) then
       FSelectScrollTimer.Enabled := False;
-    Exit;
-  end;
-  if not RightButtonHeld([]) then
-  begin
-    EndRightPaint;
-    UpdateStatusText;
     Exit;
   end;
   PB := CurrentPaintBox;
-  if PB = nil then
+  SB := CurrentScrollBox;
+  if (PB = nil) or (SB = nil) then
+  begin
+    if Assigned(FSelectScrollTimer) then
+      FSelectScrollTimer.Enabled := False;
     Exit;
+  end;
   ScreenPt := Screen.MousePos;
-  Local := PB.ScreenToLocal(ScreenPt);
-  ApplyRightPaintMouse(Local.X, Local.Y);
+  if FBandActive then
+  begin
+    Local := PB.ScreenToLocal(ScreenPt);
+    if not LeftButtonHeld([]) then
+    begin
+      FinishLeftGesture(Local.X, Local.Y);
+      Exit;
+    end;
+    if not PaintCaptureHeld then
+    begin
+      FinishLeftGesture(Local.X, Local.Y);
+      Exit;
+    end;
+    if PointerEndsGesture(ScreenPt) then
+    begin
+      FinishLeftGesture(Local.X, Local.Y);
+      Exit;
+    end;
+  end
+  else if FMarkActive then
+  begin
+    Local := PB.ScreenToLocal(ScreenPt);
+    if not RightButtonHeld([]) or not PaintCaptureHeld or
+       PointerEndsGesture(ScreenPt) then
+    begin
+      FinishMarkGesture(Local.X, Local.Y, False);
+      UpdateStatusText;
+      Exit;
+    end;
+  end
+  else
+  begin
+    if not RightButtonHeld([]) or not PaintCaptureHeld then
+    begin
+      EndRightPaint;
+      UpdateStatusText;
+      Exit;
+    end;
+    if PointerEndsGesture(ScreenPt) then
+    begin
+      EndRightPaint;
+      UpdateStatusText;
+      Exit;
+    end;
+    Local := PB.ScreenToLocal(ScreenPt);
+  end;
+
+  ViewH := SB.Height;
+  ViewY := Local.Y - SB.ViewportPosition.Y;
+  Delta := OutsideScrollDelta(ViewY, ViewH);
+  if Abs(Delta) < 0.5 then
+  begin
+    if Assigned(FSelectScrollTimer) then
+      FSelectScrollTimer.Enabled := False;
+    if FBandActive then
+    begin
+      FBandCurrent := Local;
+      ApplyBandSelection(True);
+    end
+    else if FMarkActive then
+    begin
+      FBandCurrent := Local;
+      ApplyMarkSelection(True);
+    end
+    else
+      ApplyRightPaintMouse(Local.X, Local.Y);
+    UpdateStatusText;
+    Exit;
+  end;
+
+  if FBandActive then
+  begin
+    FBandCurrent := TPointF.Create(Local.X, Local.Y + Delta);
+    ApplyBandSelection(False);
+  end
+  else if FMarkActive then
+  begin
+    FBandCurrent := TPointF.Create(Local.X, Local.Y + Delta);
+    ApplyMarkSelection(False);
+  end
+  else
+    ApplyRightPaintMouse(Local.X, Local.Y + Delta);
+  SB.ViewportPosition := TPointF.Create(SB.ViewportPosition.X, SB.ViewportPosition.Y + Delta);
+  UpdateStatusText;
 end;
 
 procedure TFilePanel.LongClickTimerTick(Sender: TObject);
@@ -5557,9 +8679,13 @@ begin
   begin
     if (GetKeyState(VK_LBUTTON) and $8000) = 0 then
       Exit;
+    if FPendingClick and (FPendingClickIdx >= 0) and not FBandActive then
+      ApplyPendingLeftClick;
+    ClearLeftGesture;
+    FDragReady := False;
     BeginInlineRename(FLongClickIdx);
   end
-  else if FLongClickBtn = TMouseButton.mbRight then
+  else if (not FExplorerMouse) and (FLongClickBtn = TMouseButton.mbRight) then
   begin
     if (GetKeyState(VK_RBUTTON) and $8000) = 0 then
       Exit;
@@ -5573,7 +8699,13 @@ begin
   end;
   {$ELSE}
   if FLongClickBtn = TMouseButton.mbLeft then
+  begin
+    if FPendingClick and (FPendingClickIdx >= 0) and not FBandActive then
+      ApplyPendingLeftClick;
+    ClearLeftGesture;
+    FDragReady := False;
     BeginInlineRename(FLongClickIdx);
+  end;
   {$ENDIF}
 end;
 
@@ -5778,25 +8910,73 @@ begin
 end;
 {$ENDIF}
 
+function NetworkComputerTarget(const AEntry: TFileEntry): string;
+var
+  Ip, Host: string;
+begin
+  Result := '';
+  if StartsText('ftp://', AEntry.FullPath) or StartsText('ftps://', AEntry.FullPath) or
+     StartsText('sftp://', AEntry.FullPath) or StartsText('http://', AEntry.FullPath) or
+     StartsText('https://', AEntry.FullPath) then
+    Exit(AEntry.FullPath);
+  Ip := Trim(AEntry.DisplayType);
+  if (Ip <> '') and (Pos(' ', Ip) = 0) and (Pos('.', Ip) > 0) then
+    Exit('network://' + Ip);
+  Host := VibeNetworkHost(AEntry.FullPath);
+  if Host = '' then
+    Host := Trim(AEntry.Name);
+  if (Host = '') or SameText(Host, 'Узел') or SameText(Host, 'Шара') or
+     SameText(Host, 'Компьютеры') or SameText(Host, 'Недавние') then
+    Exit;
+  Result := 'network://' + Host;
+end;
+
 procedure TFilePanel.PaintBoxDblClick(Sender: TObject);
 var
   ActualIndex: Integer;
   Sel: TFileEntry;
   Entries: uFileModel.TFileEntryList;
   FocusIdx: Integer;
+  Target: string;
+
+  procedure DropNavGesture;
+  begin
+    { MouseUp ещё применит FPendingClickIdx к уже новому списку.
+      Сброс только здесь: обычный щелчок по-прежнему доходит до ApplyPendingLeftClick. }
+    FDragReady := False;
+    ClearLeftGesture;
+  end;
 begin
   if IsOffline then
   begin
-    ShowNotice('Нет связи');
+    ShowNotice(L('panel.link.lost'));
     Exit;
   end;
   Entries := GetCurrentEntries;
   if not Assigned(Entries) or not Assigned(FSelectionManager) then Exit;
 
-  // Берем индекс текущего элемента под фокусом (курсором) из менеджера выделения/фокуса
-  // (замените .CurrentIndex на название вашего свойства, если оно называется иначе, например .FocusedIndex)
   FocusIdx := FSelectionManager.CurrentIndex;
+  // Двойной щелчок открывает строку под курсором мыши. Enter передаёт nil
+  // и остаётся на CurrentIndex, иначе наведение перехватило бы клавишу.
+  if Sender <> nil then
+  begin
+    var PB := CurrentPaintBox;
+    if PB <> nil then
+    begin
+      var Local := PB.ScreenToLocal(Screen.MousePos);
+      var Hit := GetIndexAt(Local.X, Local.Y);
+      if Hit >= 0 then
+        FocusIdx := Hit;
+    end;
+  end;
+  if FSelectionManager.CurrentIndex <> FocusIdx then
+  begin
+    FSelectionManager.CurrentIndex := FocusIdx;
+    NotifyCursorChange;
+  end;
 
+  if NetHeadRow(FocusIdx) then
+    Exit;
   if HasParentDirectory and (FocusIdx = 0) then
   begin
     if IsSearchView then
@@ -5804,7 +8984,10 @@ begin
     else if IsBranchView then
       ToggleBranchView
     else
+    begin
+      DropNavGesture;
       NavigateToParent;
+    end;
     Exit;
   end;
   if not VisualToActual(FocusIdx, ActualIndex) then
@@ -5813,8 +8996,31 @@ begin
   if (ActualIndex >= 0) and (ActualIndex < Entries.Count) then
   begin
     Sel := Entries[ActualIndex];
+    if SameText(Sel.IconKey, '#nethead') then
+      Exit;
+    if SameText(Sel.IconKey, '#computer') or SameText(Sel.IconKey, '#router') or
+       SameText(Sel.IconKey, '#ftp') then
+    begin
+      Target := NetworkComputerTarget(Sel);
+      if Target = '' then
+        Exit;
+      DropNavGesture;
+      Navigate(Target);
+      Exit;
+    end;
+    if Trim(Sel.FullPath) = '' then
+      Exit;
+    if (not Sel.IsDirectory) and IsVibeNetworkPath(GetCurrentPathImpl) and
+       not IsUncPath(Sel.FullPath) then
+    begin
+      ShowNotice(L('panel.net.nofile'));
+      Exit;
+    end;
     if Sel.IsDirectory or IsArchiveFileName(Sel.Name) or IsArchiveFileName(Sel.FullPath) then
-      Navigate(Sel.FullPath)
+    begin
+      DropNavGesture;
+      Navigate(Sel.FullPath);
+    end
     else
     begin
       var LocalFile: string;
@@ -5946,38 +9152,163 @@ begin
     Refresh('', True);
 end;
 
-procedure TFilePanel.ApplyUiSettings(const ASettings: TAppSettings);
+procedure TFilePanel.SetShowFolderSizes(AShow: Boolean);
+var
+  Sorting: Boolean;
 begin
-  FListFontSize := ASettings.ListFontSize;
-  if FListFontSize < 10 then
-    FListFontSize := 13;
-  InvalidateColLayout;
-  if Assigned(FDriveBar) then
+  SetFolderSizesShown(AShow);
+  if FShowFolderSizes = AShow then
+    Exit;
+  FShowFolderSizes := AShow;
+  FSizeSortPending := False;
+  FSizePaintDue := False;
+  if FDestroying then
+    Exit;
+  SyncFolderSizeRoot;
+  if AShow then
+    QueueFolderSizes(GetCurrentEntries);
+  Sorting := (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) and
+    (FTabs[FActiveTabIndex].SortField = sfSize);
+  if Sorting then
+    ResortActiveEntries(True)
+  else
+    InvalidateView;
+  UpdateStatusText;
+end;
+
+procedure TFilePanel.ApplyUiSettings(const ASettings: TAppSettings);
+var
+  FontSize: Integer;
+  FontChanged, ViewChanged, ChromeChanged, DriveChanged, NetChanged: Boolean;
+  WantExplorer: Boolean;
+begin
+  FSettings := ASettings;
+  if not Assigned(ASettings) then
+    Exit;
+
+  FontSize := ASettings.ListFontSize;
+  if FontSize < 10 then
+    FontSize := 13;
+  FontChanged := FListFontSize <> FontSize;
+  if FontChanged then
+    FListFontSize := FontSize;
+
+  NetChanged := Assigned(FDriveBar) and
+    (FDriveBar.ShowNetwork <> ASettings.ShowNetworkButton);
+  if NetChanged then
     FDriveBar.ShowNetwork := ASettings.ShowNetworkButton;
-  SetShowDriveBar(ASettings.ShowDriveBar);
+
+  DriveChanged := FShowDriveBar <> ASettings.ShowDriveBar;
+  if DriveChanged then
+    SetShowDriveBar(ASettings.ShowDriveBar);
+  ChromeChanged := DriveChanged;
+  if FShowDriveHome <> ASettings.ShowDriveHome then
+  begin
+    SetShowDriveHome(ASettings.ShowDriveHome);
+    ChromeChanged := True;
+  end;
+
   if Assigned(FCrumbsBox) then
     FCrumbsBox.Visible := not (Assigned(FPathEdit) and FPathEdit.Visible);
+
   if Assigned(FFooterPanel) then
   begin
-    FFooterPanel.Visible := ASettings.ShowStatusBar;
-    if ASettings.ShowStatusBar then
-      FFooterPanel.Height := 32
-    else
-      FFooterPanel.Height := 0;
+    if (FFooterPanel.Visible <> ASettings.ShowStatusBar) or
+       (ASettings.ShowStatusBar and (Abs(FFooterPanel.Height - 32) > 0.5)) or
+       ((not ASettings.ShowStatusBar) and (FFooterPanel.Height > 0.5)) then
+    begin
+      FFooterPanel.Visible := ASettings.ShowStatusBar;
+      if ASettings.ShowStatusBar then
+        FFooterPanel.Height := 32
+      else
+        FFooterPanel.Height := 0;
+      ChromeChanged := True;
+    end;
   end;
-  if Assigned(FBtnDetails) then
+
+  ViewChanged := False;
+  if Assigned(FBtnDetails) and (FBtnDetails.Visible <> ASettings.ShowQuickAccess) then
+  begin
     FBtnDetails.Visible := ASettings.ShowQuickAccess;
-  if Assigned(FBtnTiles) then
+    ViewChanged := True;
+  end;
+  if Assigned(FBtnTiles) and (FBtnTiles.Visible <> ASettings.ShowQuickAccess) then
+  begin
     FBtnTiles.Visible := ASettings.ShowQuickAccess;
-  if Assigned(FBtnQuickView) then
+    ViewChanged := True;
+  end;
+  if Assigned(FBtnQuickView) and
+     (FBtnQuickView.Visible <> ASettings.ShowQuickAccess) then
+  begin
     FBtnQuickView.Visible := ASettings.ShowQuickAccess;
+    ViewChanged := True;
+  end;
+
   if Assigned(FTabsBar) then
     FTabsBar.SetTabChrome(ASettings.ShowTabIcons, ASettings.EqualTabWidth);
-  UpdateChromeStackHeight;
-  LockChromeOrder;
-  InvalidateView;
+
+  if ChromeChanged then
+    UpdateChromeStackHeight;
+
+  if FontChanged or ViewChanged then
+  begin
+    InvalidateColLayout;
+    InvalidateView;
+  end;
+
   if FShowHiddenFiles <> ASettings.ShowHiddenFiles then
     SetShowHiddenFiles(ASettings.ShowHiddenFiles);
+  if FShowFolderSizes <> ASettings.ShowFolderSizes then
+    SetShowFolderSizes(ASettings.ShowFolderSizes);
+
+  WantExplorer := ASettings.MouseSelectMode = msmExplorer;
+  if FExplorerMouse <> WantExplorer then
+    SetExplorerMouse(WantExplorer);
+
+  if DriveHomeIsOpen and (NetChanged or DriveChanged) then
+    RebuildDriveHomeList;
+end;
+
+procedure TFilePanel.ApplyLanguage;
+var
+  I, J: Integer;
+  E: TFileEntry;
+  List: uFileModel.TFileEntryList;
+begin
+  if Assigned(FTabsBar) then
+    for I := 0 to FTabs.Count - 1 do
+      FTabsBar.SetTabInfo(I, DisplayNameForPath(FTabs[I].Path), FTabs[I].Path);
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    List := FTabs[I].Entries;
+    if List = nil then
+      Continue;
+    for J := 0 to List.Count - 1 do
+    begin
+      E := List[J];
+      if E.IsDirectory and (E.IconKey = '#dir') and (E.Extension = '') and
+         (E.FreeBytes = 0) then
+      begin
+        E.DisplayType := L('model.folder');
+        List[J] := E;
+      end;
+    end;
+  end;
+  UpdatePathLabel;
+  SyncNetButtons;
+  if Assigned(FDriveBar) then
+    FDriveBar.ApplyLanguage;
+  if DriveHomeIsOpen then
+    RebuildDriveHomeList;
+  if IsVibeNetworkPath(GetCurrentPathImpl) then
+    PublishNetworkList
+  else if IsThisPCPath(GetCurrentPathImpl) then
+    Refresh('', True);
+  UpdateStatusText;
+  InvalidateColLayout;
+  InvalidateView;
+  if Assigned(FPreview) then
+    FPreview.ApplyLanguage;
 end;
 
 procedure TFilePanel.ApplyTheme(const AColors: TThemeColors);
@@ -6012,16 +9343,46 @@ begin
     FTopBar.Stroke.Kind := TBrushKind.None;
   end;
 
+  if Assigned(FNetBar) then
+    FNetBar.Fill.Color := TAlphaColors.Null;
+  if Assigned(FNetSubnet) then
+    FNetSubnet.ApplyTheme(AColors);
+  if Assigned(FNetAdd) then
+    FNetAdd.ApplyTheme(AColors);
+  if Assigned(FNetScan) then
+    FNetScan.ApplyTheme(AColors);
+  if Assigned(FNetStop) then
+    FNetStop.ApplyTheme(AColors);
   if Assigned(FBtnBack) then
     FBtnBack.ApplyTheme(AColors);
   if Assigned(FBtnForward) then
     FBtnForward.ApplyTheme(AColors);
+  if Assigned(FBtnHome) then
+  begin
+    FBtnHome.ApplyTheme(AColors);
+    StyleHomeGlyph;
+  end;
+  if Assigned(FHomeCard) then
+  begin
+    FHomeCard.Fill.Color := AColors.CardBackground;
+    FHomeCard.Stroke.Color := AColors.CardStroke;
+    ApplyFluentShadow(FHomeShadow, AColors.IsDark);
+  end;
+  if Assigned(FHomeBar) then
+    FHomeBar.ApplyTheme(AColors);
+  if DriveHomeIsOpen then
+    RebuildDriveHomeList;
   if Assigned(FRetryBtn) then
     FRetryBtn.ApplyTheme(AColors);
   UpdateHistoryButtons;
 
   if Assigned(FHeaderBar) then
-    FHeaderBar.Fill.Color := AColors.HeaderBackground;
+  begin
+    if TAlphaColorRec(AColors.HeaderBackground).A < 255 then
+      FHeaderBar.Fill.Color := TAlphaColors.Null
+    else
+      FHeaderBar.Fill.Color := AColors.HeaderBackground;
+  end;
   if Assigned(FHeaderPaint) then
     FHeaderPaint.Repaint;
 
@@ -6050,7 +9411,12 @@ begin
   for var Tab in FTabs do
   begin
     if Assigned(Tab.BgRect) then
-      Tab.BgRect.Fill.Color := AColors.PanelBackground;
+    begin
+      if TAlphaColorRec(AColors.PanelBackground).A < 255 then
+        Tab.BgRect.Fill.Color := TAlphaColors.Null
+      else
+        Tab.BgRect.Fill.Color := AColors.PanelBackground;
+    end;
     if Assigned(Tab.Scrollbar) then
       Tab.Scrollbar.ApplyTheme(AColors);
   end;
@@ -6060,6 +9426,30 @@ begin
     PB.Repaint;
 end;
 
+procedure TFilePanel.StyleHomeGlyph;
+var
+  Color: TAlphaColor;
+  Hi, Hj: Integer;
+  Node: TFmxObject;
+begin
+  if not Assigned(FBtnHome) then
+    Exit;
+  if FActive then
+    Color := FColors.TextColor
+  else
+    Color := FColors.SubTextColor;
+  for Hi := 0 to FBtnHome.ChildrenCount - 1 do
+    for Hj := 0 to FBtnHome.Children[Hi].ChildrenCount - 1 do
+    begin
+      Node := FBtnHome.Children[Hi].Children[Hj];
+      if Node is TText then
+      begin
+        TText(Node).Color := Color;
+        TText(Node).TextSettings.FontColor := Color;
+      end;
+    end;
+end;
+
 procedure TFilePanel.SetActive(AIsActive: Boolean);
 var
   PB: TPaintBox;
@@ -6067,6 +9457,7 @@ begin
   FActive := AIsActive;
   ApplyCardChrome;
   RebuildBreadcrumbs;
+  StyleHomeGlyph;
 
   PB := CurrentPaintBox;
   if Assigned(PB) then
@@ -6141,7 +9532,7 @@ procedure TFilePanel.CreateNewFolderInPlace;
 var
   Created: string;
 begin
-  Created := CreateNewFolder(GetCurrentPathImpl, 'Новая папка');
+  Created := CreateNewFolder(GetCurrentPathImpl, L('panel.newfolder'));
   if Created = '' then
     Exit;
   FPendingRenamePath := Created;
@@ -6398,13 +9789,13 @@ begin
   begin
     if IsThisPCPath(Path) then
     begin
-      ShowNotice('Ветвь каталога недоступна в «Этот компьютер»');
+      ShowNotice(L('panel.branch.thispc'));
       Exit;
     end;
     if IsVirtualShellPath(Path) and not TDirectory.Exists(Path) and
        not (SplitArchivePath(Path, Arc, Inner) and IsArchiveFileName(Arc)) then
     begin
-      ShowNotice('Ветвь каталога недоступна здесь');
+      ShowNotice(L('panel.branch.here'));
       Exit;
     end;
   end;
@@ -6800,9 +10191,9 @@ begin
   InvalidateView;
   UpdateStatusText;
   if Marked = 0 then
-    ShowNotice('Каталоги совпадают')
+    ShowNotice(L('panel.compare.same'))
   else
-    ShowNotice(Format('Отмечено отличий: %d', [Marked]));
+    ShowNotice(Lf('panel.compare.diff', [Marked]));
 end;
 
 function TFilePanel.FocusByMask(const AMask: string): Boolean;
@@ -6929,49 +10320,166 @@ end;
 
 procedure TFilePanel.RefreshThumbs;
 var
-  Entries: uFileModel.TFileEntryList;
-  E: TFileEntry;
-  Sz: Integer;
+  IconKey: string;
+  Bucket: TIconBucket;
 begin
   if FDestroying then
     Exit;
-  if Assigned(GlobalIconCache) and not IsRemotePath(GetCurrentPathImpl) then
+  Bucket := SelectIconBucket(CurrentIconTarget);
+  IconKey := GetCurrentPathImpl + #1 + IntToStr(Ord(Bucket)) + #1 +
+    FormatFloat('0.00', IconSceneScale);
+  if IconKey <> FThumbIconKey then
   begin
-    GlobalIconCache.PrefetchTypes(GetCurrentEntries,
-      SelectIconBucket(CurrentIconTarget), IconSceneScale);
-    if Assigned(FThumbTimer) then
-      FThumbTimer.Enabled := True;
-  end;
-  if ViewMode <> vmTiles then
-    Exit;
-  if TileSize < 64 then
-    Exit;
-  if IsRemotePath(GetCurrentPathImpl) then
-    Exit;
-  if not Assigned(GlobalThumbCache) or not GlobalThumbCache.WorkersEnabled then
-    Exit;
-  Entries := GetCurrentEntries;
-  if not Assigned(Entries) then
-    Exit;
-  Sz := TileSize;
-  for E in Entries do
-  begin
-    if IsThumbCandidate(E.FullPath, E.IsDirectory, E.Name) then
-      GlobalThumbCache.RequestAsync(E.FullPath, Sz, nil, E.Name);
-    if Assigned(GlobalMetaCache) and not E.IsDirectory then
-      GlobalMetaCache.RequestAsync(E.FullPath);
+    FThumbIconKey := IconKey;
+    if Assigned(GlobalIconCache) and not IsRemotePath(GetCurrentPathImpl) then
+      GlobalIconCache.PrefetchTypes(GetCurrentEntries, Bucket, IconSceneScale);
   end;
   if Assigned(FThumbTimer) then
+    FThumbTimer.Enabled := True;
+  OrderVisibleThumbs;
+end;
+
+function TFilePanel.ThumbOrderRange(out AStart, AEnd: Integer): Boolean;
+var
+  SB: TVertScrollBox;
+  Cols, TS, Total: Integer;
+  TileH, SlotW, PadX, VPos, ViewH: Single;
+begin
+  AStart := 0;
+  AEnd := -1;
+  Result := False;
+  if FDestroying or (ViewMode <> vmTiles) or (TileSize < 64) then
+    Exit;
+  SB := CurrentScrollBox;
+  if SB = nil then
+    Exit;
+  Total := VisualCount;
+  Result := True;
+  if Total <= 0 then
+    Exit;
+  GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
+  if (Cols <= 0) or (TileH <= 0) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  VPos := SB.ViewportPosition.Y;
+  ViewH := SB.Height;
+  { Как отрисовка: видимые ряды и ещё два ряда снизу. «..» отсекает VisualToActual. }
+  AStart := Max(0, Floor(VPos / TileH) * Cols);
+  AEnd := Min(Total - 1, Ceil((VPos + ViewH) / TileH) * Cols + Cols * 2);
+  if AEnd < AStart then
+    AEnd := -1;
+end;
+
+procedure TFilePanel.OrderVisibleThumbs;
+const
+  RemoteCap = 24;
+var
+  Paths, Hints: TList<string>;
+  Entries: uFileModel.TFileEntryList;
+  Entry: TFileEntry;
+  StartIdx, EndIdx, I, Actual, Added, Cap: Integer;
+  Key: string;
+  Allowed: Boolean;
+begin
+  if FDestroying or not Assigned(GlobalThumbCache) or
+     GlobalThumbCache.ShuttingDown or not GlobalThumbCache.Enabled or
+     not GlobalThumbCache.WorkersEnabled then
+    Exit;
+
+  Allowed := (ViewMode = vmTiles) and (TileSize >= 64);
+  if Allowed and IsRemotePath(GetCurrentPathImpl) and
+     (IsOffline or not WantRemoteThumbs) then
+    Allowed := False;
+  if not Allowed or not ThumbOrderRange(StartIdx, EndIdx) then
+  begin
+    if FThumbKey <> cThumbKeyIdle then
+    begin
+      FThumbKey := cThumbKeyIdle;
+      GlobalThumbCache.Focus(Self, nil, nil, 0);
+    end;
+    Exit;
+  end;
+
+  Key := GetCurrentPathImpl + #1 + IntToStr(StartIdx) + #1 + IntToStr(EndIdx) + #1 +
+    IntToStr(TileSize);
+  if Key = FThumbKey then
+    Exit;
+
+  Paths := TList<string>.Create;
+  Hints := TList<string>.Create;
+  try
+    Entries := GetCurrentEntries;
+    if IsRemotePath(GetCurrentPathImpl) then
+      Cap := RemoteCap
+    else
+      Cap := MaxInt;
+    Added := 0;
+    if Assigned(Entries) and (EndIdx >= StartIdx) then
+      for I := StartIdx to EndIdx do
+      begin
+        if Added >= Cap then
+          Break;
+        if not VisualToActual(I, Actual) then
+          Continue;
+        Entry := Entries[Actual];
+        if Entry.FullPath = '' then
+          Continue;
+        if not IsThumbCandidate(Entry.FullPath, Entry.IsDirectory, Entry.Name) then
+          Continue;
+        Paths.Add(Entry.FullPath);
+        Hints.Add(Entry.Name);
+        Inc(Added);
+      end;
+    FThumbKey := Key;
+    GlobalThumbCache.Focus(Self, Paths.ToArray, Hints.ToArray, TileSize);
+  finally
+    Paths.Free;
+    Hints.Free;
+  end;
+  if Assigned(FThumbTimer) and not FDestroying then
     FThumbTimer.Enabled := True;
 end;
 
 procedure TFilePanel.ThumbTimerTick(Sender: TObject);
+var
+  HoldFocus: Boolean;
+  Pause: UInt64;
 begin
   if FDestroying then
   begin
     if Assigned(FThumbTimer) then
       FThumbTimer.Enabled := False;
     Exit;
+  end;
+  HoldFocus := False;
+  if Assigned(GlobalThumbCache) and GlobalThumbCache.Enabled then
+  begin
+    { Воркеры включаются после первой загрузки каталога. Пока их нет, заказ
+      откладывается, иначе плитки так и не попадут в очередь. }
+    if not GlobalThumbCache.WorkersEnabled then
+    begin
+      if (ViewMode = vmTiles) or FThumbDirty or (FThumbKey = '') then
+        HoldFocus := True;
+    end
+    else if FThumbDirty then
+    begin
+      if IsRemotePath(GetCurrentPathImpl) then
+        Pause := 250
+      else
+        Pause := 80;
+      if (FThumbMoveTick <> 0) and
+         (TThread.GetTickCount64 - FThumbMoveTick < Pause) then
+        HoldFocus := True
+      else
+      begin
+        FThumbDirty := False;
+        RefreshThumbs;
+      end;
+    end
+    else if (FThumbKey = '') and (ViewMode = vmTiles) then
+      RefreshThumbs;
   end;
   if Assigned(GlobalThumbCache) and (FThumbGen <> GlobalThumbCache.Generation) then
   begin
@@ -6982,18 +10490,72 @@ begin
   begin
     FIconGen := GlobalIconCache.Generation;
     InvalidateView;
+    if DriveHomeIsOpen then
+      RefreshHomeFolderIcons;
   end;
   if Assigned(GlobalMetaCache) and (FMetaGen <> GlobalMetaCache.Generation) then
   begin
     FMetaGen := GlobalMetaCache.Generation;
     InvalidateView;
   end;
-  if (not Assigned(GlobalThumbCache) or not GlobalThumbCache.HasWork) and
+  if Assigned(GlobalFolderSizes) and FManualAwait then
+    PollManualSize;
+  if Assigned(GlobalFolderSizes) and FShowFolderSizes then
+  begin
+    var Gen := GlobalFolderSizes.Generation;
+    var NowTick := TThread.GetTickCount64;
+    if Gen <> FFolderSizeGen then
+    begin
+      FFolderSizeGen := Gen;
+      FSizePaintDue := True;
+      if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) and
+         (FTabs[FActiveTabIndex].SortField = sfSize) then
+        FSizeSortPending := True;
+    end;
+    { Числа в ячейках — реже полной перерисовки. Порядок — пачкой, без прыжка к курсору. }
+    if FSizeSortPending and
+       ((FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) or
+        (FTabs[FActiveTabIndex].SortField <> sfSize)) then
+    begin
+      FSizeSortPending := False;
+      FSizeSortTick := 0;
+    end;
+    if FSizeSortPending then
+    begin
+      if FSizeSortTick = 0 then
+        FSizeSortTick := NowTick;
+      if (not GlobalFolderSizes.HasWork) or (NowTick - FSizeSortTick >= 700) then
+      begin
+        FSizeSortTick := 0;
+        FSizeSortPending := False;
+        FSizePaintDue := False;
+        FSizePaintTick := NowTick;
+        ResortActiveEntries(False);
+        UpdateStatusText;
+      end;
+    end;
+    { Последний обход тоже попадает в подвал: очередь уже пуста, 160 мс можно не ждать. }
+    if FSizePaintDue and
+       ((NowTick - FSizePaintTick >= 160) or not GlobalFolderSizes.HasWork) then
+    begin
+      FSizePaintTick := NowTick;
+      FSizePaintDue := False;
+      InvalidateView;
+      UpdateStatusText;
+    end;
+  end;
+  if not HoldFocus and
+     (not Assigned(GlobalThumbCache) or not GlobalThumbCache.HasWork) and
      (not Assigned(GlobalIconCache) or not GlobalIconCache.HasWork) and
-     (not Assigned(GlobalMetaCache) or not GlobalMetaCache.HasWork) then
+     (not Assigned(GlobalMetaCache) or not GlobalMetaCache.HasWork) and
+     (not Assigned(GlobalFolderSizes) or not GlobalFolderSizes.HasWork) and
+     not FManualAwait then
     if Assigned(FThumbTimer) then
       FThumbTimer.Enabled := False;
 end;
+
+procedure ApplyInAppDragCursor(ADropOk: Boolean); forward;
+procedure ClearInAppDragCursor(APanel: TFilePanel); forward;
 
 procedure TFilePanel.StartInternalDrag;
 {$IFDEF MSWINDOWS}
@@ -7001,6 +10563,7 @@ var
   Wnd: HWND;
 {$ENDIF}
 begin
+  CloseDriveHome;
   if GFileDrag.Active then
     Exit;
   if Length(FDragPaths) = 0 then
@@ -7013,9 +10576,9 @@ begin
   GFileDrag.Source := Self;
   GFileDrag.Hover := nil;
   GFileDrag.Paths := FDragPaths;
-  GFileDrag.OleFiles := PrepareOleDragFiles(FDragPaths);
+  SetLength(GFileDrag.OleFiles, 0);
   Capture;
-  Cursor := crDrag;
+  ApplyInAppDragCursor(True);
   {$IFDEF MSWINDOWS}
   if Root is TCommonCustomForm then
   begin
@@ -7131,7 +10694,8 @@ begin
   ReleaseCapture;
   if GetCapture <> 0 then
     Winapi.Windows.ReleaseCapture;
-  Cursor := crDefault;
+  { Пока внутренности архива пишутся во временную папку, курсор не сбрасывать. }
+  ApplyInAppDragCursor(True);
   Hover := GFileDrag.Hover;
   if Assigned(Hover) then
   begin
@@ -7149,6 +10713,8 @@ begin
   end;
   if Length(Paths) = 0 then
   begin
+    ClearInAppDragCursor(Src);
+    ClearInAppDragCursor(Hover);
     GFileDrag.Active := False;
     GFileDrag.OleExport := False;
     GFileDrag.Source := nil;
@@ -7179,7 +10745,7 @@ begin
     SetLength(GFileDrag.OleFiles, 0);
     if Assigned(Src) and not Src.FDestroying then
     begin
-      Src.Cursor := crDefault;
+      ClearInAppDragCursor(Src);
       Src.ApplyCardChrome;
       Src.InvalidateView;
     end;
@@ -7315,12 +10881,13 @@ end;
 procedure TFilePanel.FileDragTrack;
 var
   ScreenPt: TPointF;
-  Target: TFilePanel;
+  Target, Prev: TFilePanel;
   Local: TPointF;
   Dest: string;
   Highlight: Integer;
   PB: TPaintBox;
   Pt: TPoint;
+  Allowed: Boolean;
 begin
   if not GFileDrag.Active or GFileDrag.OleExport then
     Exit;
@@ -7332,30 +10899,37 @@ begin
     Exit;
   end;
   Target := PanelAtScreen(ScreenPt);
-  if (GFileDrag.Hover <> nil) and (GFileDrag.Hover <> Target) then
-    GFileDrag.Hover.SetDropHot(False);
-  GFileDrag.Hover := Target;
-  if Target = nil then
-    Exit;
-  PB := Target.CurrentPaintBox;
-  if PB = nil then
-    Exit;
-  Local := PB.ScreenToLocal(ScreenPt);
-  Dest := Target.ResolveDropPath(Local, Highlight);
-  if not Target.CanDropTo(Dest, GFileDrag.Paths) then
+  Prev := GFileDrag.Hover;
+  if (Prev <> nil) and (Prev <> Target) then
   begin
-    Target.SetDropHot(False);
-    Exit;
+    Prev.SetDropHot(False);
+    if Prev <> GFileDrag.Source then
+      ClearInAppDragCursor(Prev);
   end;
-  if (not Target.FDropTargetHot) or (Target.FDropHighlightIndex <> Highlight) then
+  GFileDrag.Hover := Target;
+  Allowed := Target = nil;
+  if Target <> nil then
   begin
-    Target.FDropTargetHot := True;
-    Target.FDropHighlightIndex := Highlight;
-    Target.ApplyCardChrome;
-    Target.InvalidateView;
-  end
-  else
-    Target.ApplyCardChrome;
+    PB := Target.CurrentPaintBox;
+    if PB <> nil then
+    begin
+      Local := PB.ScreenToLocal(ScreenPt);
+      Dest := Target.ResolveDropPath(Local, Highlight);
+      Allowed := Target.CanDropTo(Dest, GFileDrag.Paths);
+      if not Allowed then
+        Target.SetDropHot(False)
+      else if (not Target.FDropTargetHot) or (Target.FDropHighlightIndex <> Highlight) then
+      begin
+        Target.FDropTargetHot := True;
+        Target.FDropHighlightIndex := Highlight;
+        Target.ApplyCardChrome;
+        Target.InvalidateView;
+      end
+      else
+        Target.ApplyCardChrome;
+    end;
+  end;
+  ApplyInAppDragCursor(Allowed);
 end;
 
 procedure TFilePanel.DragPollTimerTick(Sender: TObject);
@@ -7395,8 +10969,12 @@ begin
   if GetCapture <> 0 then
     Winapi.Windows.ReleaseCapture;
   {$ENDIF}
-  Cursor := crDefault;
   Src := GFileDrag.Source;
+  ClearInAppDragCursor(Src);
+  ClearInAppDragCursor(Target);
+  if Assigned(GFileDrag.Hover) and (GFileDrag.Hover <> Target) and
+     (GFileDrag.Hover <> Src) then
+    ClearInAppDragCursor(GFileDrag.Hover);
   Paths := Copy(GFileDrag.Paths);
   if Assigned(GFileDrag.Hover) then
     GFileDrag.Hover.SetDropHot(False);
@@ -7531,6 +11109,148 @@ begin
   end;
 end;
 
+var
+  GOleCursorLib: HMODULE;
+  GOleCurCopy, GOleCurMove, GOleCurNo: HCURSOR;
+
+procedure EnsureOleDragCursors;
+begin
+  if (GOleCurCopy <> 0) and (GOleCurNo <> 0) then
+    Exit;
+  if GOleCursorLib = 0 then
+  begin
+    GOleCursorLib := GetModuleHandle('ole32.dll');
+    if GOleCursorLib = 0 then
+      GOleCursorLib := LoadLibrary('ole32.dll');
+  end;
+  if GOleCursorLib <> 0 then
+  begin
+    { Ресурсы ole32: 1 запрет, 2 перенос, 3 копирование. crDrag в exe нет. }
+    if GOleCurNo = 0 then
+      GOleCurNo := LoadCursor(GOleCursorLib, MakeIntResource(1));
+    if GOleCurMove = 0 then
+      GOleCurMove := LoadCursor(GOleCursorLib, MakeIntResource(2));
+    if GOleCurCopy = 0 then
+      GOleCurCopy := LoadCursor(GOleCursorLib, MakeIntResource(3));
+  end;
+  if GOleCurNo = 0 then
+    GOleCurNo := LoadCursor(0, IDC_NO);
+  if GOleCurCopy = 0 then
+    GOleCurCopy := LoadCursor(0, IDC_ARROW);
+  if GOleCurMove = 0 then
+    GOleCurMove := GOleCurCopy;
+end;
+
+function NormDropDir(const APath: string): string;
+begin
+  Result := ExcludeTrailingPathDelimiter(APath);
+end;
+
+function DropParentDir(const APath: string): string;
+begin
+  Result := NormDropDir(ExtractFilePath(NormDropDir(APath)));
+end;
+
+function SourcesStayInDir(const ADest: string; const ASources: TArray<string>): Boolean;
+var
+  Src, Dest: string;
+  Seen: Boolean;
+begin
+  Result := False;
+  Dest := NormDropDir(ADest);
+  if Dest = '' then
+    Exit;
+  Seen := False;
+  for Src in ASources do
+  begin
+    if Src = '' then
+      Continue;
+    Seen := True;
+    if not SameText(DropParentDir(Src), Dest) then
+      Exit(False);
+  end;
+  Result := Seen;
+end;
+
+procedure ApplyInAppDragCursor(ADropOk: Boolean);
+var
+  C: TCursor;
+  H: HCURSOR;
+  P: TFilePanel;
+  Ctrl: TControl;
+
+  procedure Mark(APanel: TFilePanel);
+  begin
+    if APanel = nil then
+      Exit;
+    APanel.Cursor := C;
+    Ctrl := APanel.CurrentPaintBox;
+    if Ctrl <> nil then
+      Ctrl.Cursor := C;
+    Ctrl := APanel.CurrentScrollBox;
+    if Ctrl <> nil then
+      Ctrl.Cursor := C;
+    if Assigned(APanel.FCard) then
+      APanel.FCard.Cursor := C;
+    if Assigned(APanel.FHeaderBar) then
+      APanel.FHeaderBar.Cursor := C;
+    if Assigned(APanel.FHeaderPaint) then
+      APanel.FHeaderPaint.Cursor := C;
+    if Assigned(APanel.FCrumbsBox) then
+      APanel.FCrumbsBox.Cursor := C;
+    if Assigned(APanel.FFooterPanel) then
+      APanel.FFooterPanel.Cursor := C;
+  end;
+
+begin
+  if not GFileDrag.Active then
+    Exit;
+  { crDrag/crNoDrop FMX грузит из exe (нет ресурса) и гасит курсор.
+    На контролах — системный crNo или стрелка, поверх — курсор OLE. }
+  if ADropOk then
+    C := crArrow
+  else
+    C := crNo;
+  Mark(GFileDrag.Source);
+  P := GFileDrag.Hover;
+  if P <> GFileDrag.Source then
+    Mark(P);
+  EnsureOleDragCursors;
+  if not ADropOk then
+    H := GOleCurNo
+  else if (GetKeyState(VK_SHIFT) and $8000) <> 0 then
+    H := GOleCurMove
+  else
+    H := GOleCurCopy;
+  if H <> 0 then
+    Winapi.Windows.SetCursor(H);
+end;
+
+procedure ClearInAppDragCursor(APanel: TFilePanel);
+var
+  Ctrl: TControl;
+begin
+  if APanel = nil then
+    Exit;
+  APanel.Cursor := crDefault;
+  Ctrl := APanel.CurrentPaintBox;
+  if Ctrl <> nil then
+    Ctrl.Cursor := crDefault;
+  Ctrl := APanel.CurrentScrollBox;
+  if Ctrl <> nil then
+    Ctrl.Cursor := crDefault;
+  if Assigned(APanel.FCard) then
+    APanel.FCard.Cursor := crDefault;
+  if Assigned(APanel.FHeaderBar) then
+    APanel.FHeaderBar.Cursor := crDefault;
+  if Assigned(APanel.FHeaderPaint) then
+    APanel.FHeaderPaint.Cursor := crHandPoint;
+  if Assigned(APanel.FCrumbsBox) then
+    APanel.FCrumbsBox.Cursor := crDefault;
+  if Assigned(APanel.FFooterPanel) then
+    APanel.FFooterPanel.Cursor := crDefault;
+end;
+
 function TFilePanel.CanDropTo(const ADest: string; const ASources: TArray<string>): Boolean;
 var
   Dest, Src, DestSlash, SrcSlash, ZipFile, ZipInner: string;
@@ -7557,6 +11277,9 @@ begin
        (IsRemotePath(Src) or TDirectory.Exists(Src)) then
       Exit(False);
   end;
+  { Та же папка: не копировать, не перемещать и не дописывать в архив. }
+  if SourcesStayInDir(Dest, ASources) then
+    Result := False;
 end;
 
 procedure TFilePanel.ApplyDrop(const ADest: string; const ASources: TArray<string>;
@@ -7572,7 +11295,7 @@ begin
   for Src in ASources do
   begin
     ParentDir := ExcludeTrailingPathDelimiter(ExtractFilePath(ExcludeTrailingPathDelimiter(Src)));
-    if AMove and SameText(ParentDir, ExcludeTrailingPathDelimiter(ADest)) then
+    if SameText(ParentDir, ExcludeTrailingPathDelimiter(ADest)) then
       Continue;
     SetLength(Paths, Length(Paths) + 1);
     Paths[High(Paths)] := Src;
@@ -7601,7 +11324,7 @@ begin
           SrcPanel.ClearSelection;
           SrcPanel.Refresh(FocusPath);
         end;
-        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
           DestPanel.ShowNotice(ErrorMsg);
       end)
   else
@@ -7612,7 +11335,7 @@ begin
           DestPanel.Refresh;
         if Assigned(SrcPanel) and not SrcPanel.FDestroying then
           SrcPanel.ClearSelection;
-        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
           DestPanel.ShowNotice(ErrorMsg);
       end);
 end;
@@ -7800,11 +11523,20 @@ begin
   end;
 
   for I := 0 to High(AState.Tabs) do
-    DoAddTab(AState.Tabs[I].Path, False);
-
-  for I := 0 to High(AState.Tabs) do
+  begin
+    var Stored := AState.Tabs[I];
+    var Fixed := ResolveStartupTabPath(Stored.Path);
+    if not SameText(ExcludeTrailingPathDelimiter(Fixed),
+      ExcludeTrailingPathDelimiter(Stored.Path)) then
+    begin
+      Stored.Path := Fixed;
+      if Stored.CursorPath <> #1 then
+        Stored.CursorPath := '';
+    end;
+    DoAddTab(Stored.Path, False);
     if I < FTabs.Count then
-      ApplyTabState(I, AState.Tabs[I]);
+      ApplyTabState(I, Stored);
+  end;
 
   Active := AState.ActiveTab;
   if (Active < 0) or (Active >= FTabs.Count) then
@@ -8033,12 +11765,14 @@ var
   Tab: TFileTab;
   Watch, Arc, Inner: string;
 begin
+  if not FDestroying then
+    SyncFolderSizeRoot;
   if FDestroying or not FWatchEnabled then
     Exit;
   if (AIndex < 0) or (AIndex >= FTabs.Count) then
     Exit;
   Tab := FTabs[AIndex];
-  if IsRemotePath(Tab.Path) then
+  if IsVibeNetworkPath(Tab.Path) or IsRemotePath(Tab.Path) then
   begin
     if Assigned(Tab.Watcher) then
       Tab.Watcher.Stop;
@@ -8287,8 +12021,10 @@ begin
     Exit;
   end;
 
+  if not APartial then
+    NoteOpenedUnc(APath);
+
   Tab := FTabs[TargetIdx];
-  UpdateLongestType(List);
   if APartial then
     SortEntries(List, sfName, True)
   else
@@ -8324,6 +12060,7 @@ begin
       end;
       NotifyCursorChange;
       RefreshThumbs;
+      QueueFolderSizes(Tab.Entries);
     end;
     Exit;
   end;
@@ -8364,7 +12101,10 @@ begin
     end;
     NotifyCursorChange;
     if not APartial then
+    begin
+      FThumbKey := '';
       RefreshThumbs;
+    end;
     if Assigned(FOnListReady) and not FListReadyFired then
     begin
       FListReadyFired := True;
@@ -8376,6 +12116,7 @@ begin
         SelectIconBucket(CurrentIconTarget), IconSceneScale);
     if Assigned(FThumbTimer) then
       FThumbTimer.Enabled := True;
+    QueueFolderSizes(List);
     TThread.ForceQueue(nil,
       procedure
       begin
@@ -8398,5 +12139,11 @@ procedure TFilePanel.CaptureSelection(APaths: TStringList; out AFocus: string);
 begin
   CaptureTabSelection(FActiveTabIndex, APaths, AFocus);
 end;
+
+initialization
+  GFilePanels := TList<TFilePanel>.Create;
+
+finalization
+  FreeAndNil(GFilePanels);
 
 end.

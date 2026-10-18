@@ -11,7 +11,8 @@ uses
   System.SysUtils, System.Classes, System.Types, System.UITypes, System.Math,
   FMX.Types, FMX.Controls, FMX.Layouts, FMX.Objects, FMX.Graphics, FMX.StdCtrls,
   FMX.Platform, FMX.Forms, FMX.TextLayout,
-  uAppSettings, uThemeManager, uDocumentData, uCustomScrollbar, uFluentChrome;
+  uAppSettings, uThemeManager, uDocumentData, uCustomScrollbar, uFluentChrome,
+  uLang;
 
 type
   TDocumentView = class(TLayout)
@@ -31,6 +32,8 @@ type
     FPad: Single;
     FGap: Single;
     FActivePage: Integer;
+    FPinning: Boolean;
+    FPageNotify: Boolean;
     FLines: TArray<string>;
     FCaretL: Integer;
     FCaretC: Integer;
@@ -42,6 +45,7 @@ type
     FClickTick: UInt64;
     FMenu: TFluentPopupMenu;
     FOnStatus: TNotifyEvent;
+    FOnPageChange: TNotifyEvent;
     procedure PaintPages(Sender: TObject; Canvas: TCanvas);
     function HitDoc(X, Y: Single; out ALine, ACol: Integer): Boolean;
     procedure SetCaretDoc(ALine, ACol: Integer; AExtend: Boolean);
@@ -65,6 +69,10 @@ type
     function ViewW: Single;
     function ViewH: Single;
     function PaperRect(AIndex: Integer): TRectF;
+    function PageAtScroll: Integer;
+    procedure NotifyActivePage;
+    procedure AssignActivePage(AIndex: Integer);
+    procedure TrackVisiblePage;
     procedure EnsurePageVisible(AIndex: Integer);
     procedure CopyText;
     procedure UpdateScale;
@@ -96,6 +104,7 @@ type
     function CaretCol: Integer;
     function SelCount: Integer;
     property OnStatus: TNotifyEvent read FOnStatus write FOnStatus;
+    property OnPageChange: TNotifyEvent read FOnPageChange write FOnPageChange;
   end;
 
 implementation
@@ -450,6 +459,7 @@ begin
   finally
     FBusy := False;
   end;
+  TrackVisiblePage;
 end;
 
 procedure TDocumentView.SyncCustomScroll;
@@ -499,25 +509,99 @@ end;
 
 procedure TDocumentView.ScrollChanged(Sender: TObject);
 begin
-  if not FUpdating and not FPainting and not FBusy and Assigned(FPaint) then
+  if FUpdating or FPainting or FBusy then
+    Exit;
+  if (Sender = FVbar) and not FPinning then
+    TrackVisiblePage;
+  if Assigned(FPaint) then
     FPaint.Repaint;
+end;
+
+function TDocumentView.PageAtScroll: Integer;
+var
+  I, N: Integer;
+  TopY, H, Anchor: Single;
+begin
+  Result := FActivePage;
+  if not Assigned(FDoc) or not Assigned(FVbar) then
+    Exit;
+  N := FDoc.Pages.Count;
+  if N = 0 then
+    Exit(0);
+  { Весь документ влез в окно — прокрутка страницу не выбирает. }
+  if FVbar.Max <= 1 then
+    Exit;
+  if FVbar.Value <= 1 then
+    Exit(0);
+  if FVbar.Value >= FVbar.Max - 1 then
+    Exit(N - 1);
+  Anchor := FVbar.Value + ViewH * 0.42;
+  TopY := FPad;
+  for I := 0 to N - 1 do
+  begin
+    H := FDoc.Pages[I].PaperH * FScale;
+    if Anchor < TopY + H + FGap * 0.5 then
+      Exit(I);
+    TopY := TopY + H + FGap;
+  end;
+  Result := N - 1;
+end;
+
+procedure TDocumentView.NotifyActivePage;
+begin
+  if FPageNotify or not Assigned(FOnPageChange) then
+    Exit;
+  FPageNotify := True;
+  try
+    FOnPageChange(Self);
+  finally
+    FPageNotify := False;
+  end;
+end;
+
+procedure TDocumentView.AssignActivePage(AIndex: Integer);
+begin
+  if not Assigned(FDoc) or (FDoc.Pages.Count = 0) then
+    Exit;
+  AIndex := EnsureRange(AIndex, 0, FDoc.Pages.Count - 1);
+  if AIndex = FActivePage then
+    Exit;
+  FActivePage := AIndex;
+  NotifyActivePage;
+end;
+
+procedure TDocumentView.TrackVisiblePage;
+begin
+  if FPinning or FPageNotify or FUpdating or FBusy then
+    Exit;
+  AssignActivePage(PageAtScroll);
 end;
 
 procedure TDocumentView.EnsurePageVisible(AIndex: Integer);
 var
   R: TRectF;
+  Changed: Boolean;
 begin
-  if FDoc = nil then
+  if (FDoc = nil) or not Assigned(FVbar) then
     Exit;
   AIndex := EnsureRange(AIndex, 0, Max(0, FDoc.Pages.Count - 1));
-  FActivePage := AIndex;
-  R := PaperRect(AIndex);
-  if R.Top < FPad then
-    FVbar.Value := FVbar.Value + (R.Top - FPad);
-  if R.Bottom > ViewH - 8 then
-    FVbar.Value := FVbar.Value + (R.Bottom - ViewH + 8);
-  FVbar.Value := EnsureRange(FVbar.Value, 0, FVbar.Max);
-  SyncCustomScroll;
+  Changed := AIndex <> FActivePage;
+  { Пока лист подгоняется под страницу, прокрутка не должна выбирать другую. }
+  FPinning := True;
+  try
+    FActivePage := AIndex;
+    R := PaperRect(AIndex);
+    if R.Top < FPad then
+      FVbar.Value := FVbar.Value + (R.Top - FPad);
+    if R.Bottom > ViewH - 8 then
+      FVbar.Value := FVbar.Value + (R.Bottom - ViewH + 8);
+    FVbar.Value := EnsureRange(FVbar.Value, 0, FVbar.Max);
+    SyncCustomScroll;
+  finally
+    FPinning := False;
+  end;
+  if Changed then
+    NotifyActivePage;
 end;
 
 procedure TDocumentView.GoToPage(AIndex: Integer);
@@ -790,7 +874,7 @@ begin
     R := PaperRect(I);
     if R.Contains(TPointF.Create(X, Y)) then
     begin
-      FActivePage := I;
+      AssignActivePage(I);
       Break;
     end;
   end;
@@ -803,8 +887,8 @@ begin
       if Assigned(FMenu) then
       begin
         FMenu.ClearItems;
-        FMenu.AddItem('Копировать', 'Ctrl+C', MenuCopy);
-        FMenu.AddItem('Выделить всё', 'Ctrl+A', MenuAll);
+        FMenu.AddItem(uLang.L('doc.copy'), 'Ctrl+C', MenuCopy);
+        FMenu.AddItem(uLang.L('doc.all'), 'Ctrl+A', MenuAll);
         FMenu.ApplyTheme(FColors);
         FMenu.PopupAtCursor;
       end;
@@ -1072,7 +1156,7 @@ begin
     Canvas.Fill.Color := FColors.SubTextColor;
     Canvas.Font.Family := 'Segoe UI';
     Canvas.Font.Size := 13;
-    Canvas.FillText(FPaint.LocalRect, 'Нет страниц', False, 1, [], TTextAlign.Center, TTextAlign.Center);
+    Canvas.FillText(FPaint.LocalRect, L('doc.nopages'), False, 1, [], TTextAlign.Center, TTextAlign.Center);
     Exit;
   end;
 
@@ -1192,7 +1276,7 @@ begin
     Canvas.Font.Family := 'Segoe UI';
     Canvas.Font.Size := 10;
     Canvas.Font.Style := [];
-    Canvas.FillText(LabelR, Format('Страница %d из %d', [I + 1, Doc.Pages.Count]),
+    Canvas.FillText(LabelR, Lf('doc.page', [I + 1, Doc.Pages.Count]),
       False, 1, [], TTextAlign.Center, TTextAlign.Leading);
   end;
   except

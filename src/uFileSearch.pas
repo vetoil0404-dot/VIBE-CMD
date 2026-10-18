@@ -21,6 +21,8 @@ type
     Size: Int64;
     Modified: TDateTime;
     IsDirectory: Boolean;
+    SizeText: string;
+    DateText: string;
   end;
 
   TSearchParams = record
@@ -83,10 +85,16 @@ type
     FFound: Integer;
     FLastFlush: UInt64;
     FLastProg: UInt64;
+    FMail: TList<TSearchHit>;
+    FMailLock: TCriticalSection;
+    FHitsQueued: Boolean;
+    FProgQueued: Boolean;
+    FProgText: string;
     FOnHits: TSearchHitsProc;
     FOnProgress: TSearchTextProc;
     FOnDone: TSearchDoneProc;
     procedure FlushHits;
+    procedure QueueHits(const ACopy: TArray<TSearchHit>);
     procedure ReportProgress(const ADir: string);
     procedure ScanDir(const ADir: string; AStack: TStack<string>);
     function NameMatches(const AName: string): Boolean;
@@ -97,6 +105,7 @@ type
   public
     constructor Create(const AParams: TSearchParams; const AMasks: TArray<string>;
       AOnHits: TSearchHitsProc; AOnProgress: TSearchTextProc; AOnDone: TSearchDoneProc);
+    destructor Destroy; override;
   end;
 
 function FileTimeToLocalDateTime(const FT: TFileTime): TDateTime;
@@ -245,6 +254,15 @@ begin
   FOnProgress := AOnProgress;
   FOnDone := AOnDone;
   SetLength(FBuf, BUF_SIZE);
+  FMail := TList<TSearchHit>.Create;
+  FMailLock := TCriticalSection.Create;
+end;
+
+destructor TSearchThread.Destroy;
+begin
+  FMailLock.Free;
+  FMail.Free;
+  inherited;
 end;
 
 function TSearchThread.NameMatches(const AName: string): Boolean;
@@ -430,42 +448,103 @@ begin
   Result := True;
 end;
 
+procedure TSearchThread.QueueHits(const ACopy: TArray<TSearchHit>);
+var
+  Snap: TArray<TSearchHit>;
+begin
+  Snap := ACopy;
+  TThread.Queue(Self,
+    procedure
+    var
+      More: TArray<TSearchHit>;
+      Again: Boolean;
+    begin
+      Again := False;
+      try
+        if Assigned(FOnHits) then
+          FOnHits(Snap);
+      finally
+        FMailLock.Enter;
+        try
+          Again := FMail.Count > 0;
+          if Again then
+          begin
+            More := FMail.ToArray;
+            FMail.Clear;
+          end
+          else
+            FHitsQueued := False;
+        finally
+          FMailLock.Leave;
+        end;
+      end;
+      if Again then
+        QueueHits(More);
+    end);
+end;
+
 procedure TSearchThread.FlushHits;
 var
   Copy: TArray<TSearchHit>;
-  I, N: Integer;
+  I: Integer;
+  Send: Boolean;
 begin
-  if FBufN = 0 then
-    Exit;
-  N := FBufN;
-  SetLength(Copy, N);
-  for I := 0 to N - 1 do
-    Copy[I] := FBuf[I];
-  FBufN := 0;
-  FLastFlush := GetTickCount64;
-  TThread.Queue(Self,
-    procedure
+  FMailLock.Enter;
+  try
+    for I := 0 to FBufN - 1 do
+      FMail.Add(FBuf[I]);
+    FBufN := 0;
+    FLastFlush := GetTickCount64;
+    Send := (not FHitsQueued) and (FMail.Count > 0);
+    if Send then
     begin
-      if Assigned(FOnHits) then
-        FOnHits(Copy);
-    end);
+      Copy := FMail.ToArray;
+      FMail.Clear;
+      FHitsQueued := True;
+    end;
+  finally
+    FMailLock.Leave;
+  end;
+  if Send then
+    QueueHits(Copy);
 end;
 
 procedure TSearchThread.ReportProgress(const ADir: string);
 var
   NowTick: UInt64;
   Text: string;
+  Send: Boolean;
 begin
   NowTick := GetTickCount64;
   if NowTick - FLastProg < 90 then
     Exit;
   FLastProg := NowTick;
-  Text := ADir;
+  FMailLock.Enter;
+  try
+    FProgText := ADir;
+    Send := not FProgQueued;
+    if Send then
+      FProgQueued := True;
+    Text := FProgText;
+  finally
+    FMailLock.Leave;
+  end;
+  if not Send then
+    Exit;
   TThread.Queue(Self,
     procedure
+    var
+      Latest: string;
     begin
+      FMailLock.Enter;
+      try
+        Latest := FProgText;
+        FProgQueued := False;
+      finally
+        FMailLock.Leave;
+      end;
       if Assigned(FOnProgress) then
-        FOnProgress(Text);
+        FOnProgress(Latest);
     end);
 end;
 
@@ -566,6 +645,19 @@ begin
     FlushHits;
   finally
     Stack.Free;
+  end;
+
+  while not Terminated do
+  begin
+    FMailLock.Enter;
+    try
+      if (not FHitsQueued) and (FMail.Count = 0) and (FBufN = 0) then
+        Break;
+    finally
+      FMailLock.Leave;
+    end;
+    FlushHits;
+    Sleep(2);
   end;
 
   Stopped := Terminated;

@@ -55,6 +55,7 @@ function ArchiveInvolved(const ASrc, ADestDir: string): Boolean;
 
 function ListArchiveChildren(const APath: string; out AChildren: TArray<TArcChild>): Boolean;
 function ListArchiveBranch(const APath: string): TArray<TArcItem>;
+function ListArchiveAll(const APath: string; out AItems: TArray<TArcItem>): Boolean;
 function ScanArchivePath(const APath: string; out AFiles: Integer; out ABytes: Int64): Boolean;
 
 procedure CopyArchiveEntry(const ASrcPath, ADstDir: string);
@@ -65,6 +66,8 @@ function CreateArchiveFolder(const AParentDir, ABaseName: string): string;
 procedure PackToArchive(const ASources: TArray<string>; const ADestFile: string;
   AReplace: Boolean);
 function MaterializeArchiveFile(const APath: string; out ALocal: string): Boolean;
+function ArchiveEntryInfo(const APath: string; out ASize: Int64;
+  out AModified: TDateTime; out AEncrypted: Boolean): Boolean;
 procedure InvalidateArchive(const APath: string);
 procedure ReplaceFileAtomic(const ADest, ATemp: string);
 
@@ -78,7 +81,7 @@ implementation
 uses
   System.IOUtils, System.StrUtils, System.SyncObjs, System.Zip, System.ZLib,
   System.DateUtils, System.Math,
-  uFileModel
+  uFileModel, uLang
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 const
@@ -294,7 +297,7 @@ begin
       if (P = '') or (P = '.') then
         Continue;
       if (P = '..') or (Pos(':', P) > 0) or (Pos('\', P) > 0) then
-        raise Exception.Create('Некорректный путь в архиве: ' + ARel);
+        raise Exception.Create(Lf('arch.badpath', [ARel]));
       if Acc.Length > 0 then
         Acc.Append('/');
       Acc.Append(P);
@@ -372,7 +375,7 @@ begin
     akTgz: Result := 'TAR.GZ';
     akSevenZ: Result := '7Z';
     akRar: Result := 'RAR';
-    akOther: Result := 'архив';
+    akOther: Result := L('arch.kind.other');
   else
     Result := '';
   end;
@@ -530,7 +533,7 @@ var
 
 begin
   if not TFile.Exists(ATemp) then
-    raise Exception.Create('Нет временного файла архива');
+    raise Exception.Create(L('arch.notemp'));
   LastErr := '';
   for Attempt := 1 to 10 do
   begin
@@ -542,17 +545,15 @@ begin
       begin
         LastErr := E.Message;
         if Attempt = 10 then
-          raise Exception.Create('Не удалось заменить архив (файл занят): ' +
-            ADest + sLineBreak + LastErr);
+          raise Exception.Create(Lf('arch.busy', [ADest + sLineBreak + LastErr]));
       end;
     end;
     Sleep(40 * Attempt);
   end;
   if LastErr <> '' then
-    raise Exception.Create('Не удалось заменить архив (файл занят): ' +
-      ADest + sLineBreak + LastErr)
+    raise Exception.Create(Lf('arch.busy', [ADest + sLineBreak + LastErr]))
   else
-    raise Exception.Create('Не удалось заменить архив (файл занят): ' + ADest);
+    raise Exception.Create(Lf('arch.busy', [ADest]));
 end;
 
 function QuoteArg(const S: string): string;
@@ -768,7 +769,7 @@ var
 begin
   Exe := FindSevenZipExe;
   if Exe = '' then
-    raise Exception.Create('Для 7Z/RAR установите 7-Zip (7z.exe)');
+    raise Exception.Create(L('arch.need7z'));
   Cmd := QuoteArg(Exe) + ' ' + AArgs;
 {$IFDEF MSWINDOWS}
   Result := RunHidden(Exe, Cmd, nil, AText, 30 * 60 * 1000);
@@ -785,7 +786,7 @@ var
 begin
   Exe := FindSevenZipExe;
   if Exe = '' then
-    raise Exception.Create('Для 7Z/RAR установите 7-Zip (7z.exe)');
+    raise Exception.Create(L('arch.need7z'));
   Cmd := QuoteArg(Exe) + ' ' + AArgs;
   FS := TFileStream.Create(AOutFile, fmCreate);
   try
@@ -809,8 +810,7 @@ end;
 procedure Ensure7z(AKind: TArchiveKind);
 begin
   if Need7z(AKind) and not SevenZipAvailable then
-    raise Exception.Create('Для открытия ' + ArchiveKindCaption(AKind) +
-      ' установите 7-Zip (https://www.7-zip.org)');
+    raise Exception.Create(Lf('arch.need7zopen', [ArchiveKindCaption(AKind)]));
 end;
 
 function OpenZip(const APath: string; AWrite, ACreate: Boolean): TZipFile;
@@ -1301,8 +1301,8 @@ var
 begin
   Code := Run7z('l -slt -ba -sccUTF-8 -- ' + QuoteArg(APath), Text);
   if Code <> 0 then
-    raise Exception.Create('Не удалось прочитать архив: ' + ExtractFileName(APath) +
-      sLineBreak + Trim(Text));
+    raise Exception.Create(Lf('arch.readfail', [ExtractFileName(APath) +
+      sLineBreak + Trim(Text)]));
   Result := Parse7zList(Text);
 end;
 
@@ -1406,7 +1406,7 @@ begin
     Zip := OpenZip(AZip, False, False);
     Idx := ZipIndexOf(Zip, AInner);
     if Idx < 0 then
-      raise Exception.Create('Нет в архиве: ' + AInner);
+      raise Exception.Create(Lf('arch.missing', [AInner]));
     Zip.Read(Idx, Stm, Hdr);
     try
       FS := TFileStream.Create(AOutFile, fmCreate);
@@ -1535,7 +1535,7 @@ begin
     if Skip > 0 then
       AStm.Seek(Skip, soCurrent);
   end;
-  raise Exception.Create('Нет в архиве: ' + AInner);
+  raise Exception.Create(Lf('arch.missing', [AInner]));
 end;
 
 procedure CopyInflated(ASrc, ADst: TStream);
@@ -1602,7 +1602,7 @@ begin
           if (Length(Items) = 1) and SameText(ArcLeaf(AInner), Items[0].Path) then
             It := Items[0]
           else
-            raise Exception.Create('Нет в архиве: ' + AInner);
+            raise Exception.Create(Lf('arch.missing', [AInner]));
         ForceDirectories(ExtractFilePath(AOutFile));
         FS := TFileStream.Create(APhysical, fmOpenRead or fmShareDenyNone);
         try
@@ -1628,7 +1628,7 @@ begin
         end;
       end;
   else
-    raise Exception.Create('Формат не поддержан нативно');
+    raise Exception.Create(L('arch.native'));
   end;
 end;
 
@@ -1644,12 +1644,12 @@ begin
     Code := Run7z('x -y -aoa -sccUTF-8 -o' + QuoteArg(Tmp) + ' -- ' +
       QuoteArg(APhysical) + ' ' + QuoteArg(StringReplace(AInner, '/', '\', [rfReplaceAll])), Text);
     if Code <> 0 then
-      raise Exception.Create('Не удалось извлечь: ' + Leaf + sLineBreak + Trim(Text));
+      raise Exception.Create(Lf('arch.extract', [Leaf + sLineBreak + Trim(Text)]));
     Found := TPath.Combine(Tmp, StringReplace(AInner, '/', PathDelim, [rfReplaceAll]));
     if not TFile.Exists(Found) then
       Found := TPath.Combine(Tmp, Leaf);
     if not TFile.Exists(Found) then
-      raise Exception.Create('Не удалось извлечь: ' + Leaf);
+      raise Exception.Create(Lf('arch.extract', [Leaf]));
     ForceDirectories(ExtractFilePath(AOutFile));
     if TFile.Exists(AOutFile) then
       TFile.Delete(AOutFile);
@@ -1956,6 +1956,25 @@ begin
       SetLength(Result, N);
       Result[N - 1] := Items[I];
     end;
+  end;
+end;
+
+function ListArchiveAll(const APath: string; out AItems: TArray<TArcItem>): Boolean;
+var
+  Ref: TArcRef;
+begin
+  SetLength(AItems, 0);
+  Result := False;
+  try
+    Ref := ResolvePath(APath);
+    if (Ref.Physical = '') or (Ref.Kind = akNone) then
+      Exit;
+    if Need7z(Ref.Kind) then
+      Ensure7z(Ref.Kind);
+    AItems := GetItems(Ref.Physical, Ref.Kind);
+    Result := True;
+  except
+    Result := False;
   end;
 end;
 
@@ -2654,7 +2673,7 @@ begin
   end;
   InvalidateArchive(AArchive);
   if Code <> 0 then
-    raise Exception.Create('Не удалось добавить в архив' + sLineBreak + Trim(Text));
+    raise Exception.Create(L('arch.addfail') + sLineBreak + Trim(Text));
 end;
 
 procedure SevenDelete(const AArchive, AInner: string);
@@ -2668,7 +2687,7 @@ begin
   Code := Run7z('d -y -sccUTF-8 -- ' + QuoteArg(AArchive) + ' ' + QuoteArg(Inner), Text);
   InvalidateArchive(AArchive);
   if Code <> 0 then
-    raise Exception.Create('Не удалось удалить из архива' + sLineBreak + Trim(Text));
+    raise Exception.Create(L('arch.delfail') + sLineBreak + Trim(Text));
 end;
 
 procedure WriteTarHeader(ADst: TStream; const AName: string; ASize: Int64;
@@ -2854,7 +2873,7 @@ begin
   if Kind = akNone then
     Kind := akZip;
   if Kind = akRar then
-    raise Exception.Create('Запись RAR не поддерживается. Используйте ZIP или 7Z.');
+    raise Exception.Create(L('arch.rarwrite'));
   if Need7z(Kind) then
     Ensure7z(Kind);
   ForceDirectories(ExtractFilePath(ADestFile));
@@ -2901,10 +2920,10 @@ begin
   if Kind = akGz then
   begin
     if Length(ASources) <> 1 then
-      raise Exception.Create('GZ содержит один файл. Для нескольких используйте ZIP или TAR.GZ.');
+      raise Exception.Create(L('arch.gzone'));
     Src := ASources[0];
     if TDirectory.Exists(Src) then
-      raise Exception.Create('Папку в GZ упаковать нельзя. Используйте TAR.GZ или ZIP.');
+      raise Exception.Create(L('arch.gzdir'));
     Tmp := UniqueTempFile('pack.gz');
     if TFile.Exists(Src) then
       GzipFile(Src, Tmp)
@@ -2912,7 +2931,7 @@ begin
     begin
       Tmp2 := UniqueTempFile(ExtractFileName(Src));
       if not MaterializeArchiveFile(Src, Tmp2) then
-        raise Exception.Create('Нет файла: ' + Src);
+        raise Exception.Create(Lf('arch.nofile', [Src]));
       GzipFile(Tmp2, Tmp);
       TFile.Delete(Tmp2);
     end;
@@ -2921,7 +2940,7 @@ begin
     else
     begin
       TFile.Delete(Tmp);
-      raise Exception.Create('GZ нельзя дописать. Выберите перезапись.');
+      raise Exception.Create(L('arch.gzappend'));
     end;
     InvalidateArchive(ADestFile);
     Exit;
@@ -2965,7 +2984,7 @@ begin
       end;
     end;
     if Run7z(Text, Src) <> 0 then
-      raise Exception.Create('7-Zip не смог создать архив' + sLineBreak + Trim(Src));
+      raise Exception.Create(L('arch.7zcreate') + sLineBreak + Trim(Src));
     if Tmp <> '' then
       ReplaceFileAtomic(ADestFile, Tmp);
     InvalidateArchive(ADestFile);
@@ -2988,13 +3007,13 @@ begin
       Ref.DiskArchive := ADestArchiveDir;
     end
     else
-      raise Exception.Create('Назначение не архив: ' + ADestArchiveDir);
+      raise Exception.Create(Lf('arch.destnot', [ADestArchiveDir]));
   end;
   Kind := Ref.Kind;
   if Kind = akRar then
-    raise Exception.Create('RAR только для чтения');
+    raise Exception.Create(L('arch.raronly'));
   if not IsWritableArchiveKind(Kind) then
-    raise Exception.Create('Запись в этот тип архива не поддерживается');
+    raise Exception.Create(L('arch.nowrite'));
   if Kind = akZip then
     AddPathToZip(ASource, Ref.Physical, Ref.Inner)
   else if Need7z(Kind) then
@@ -3002,8 +3021,7 @@ begin
   else
   begin
     { tar/gz/tgz: extract-modify-repack would be huge; stage via temp zip-like rebuild }
-    raise Exception.Create('Добавление в ' + ArchiveKindCaption(Kind) +
-      ' пока через перепаковку: используйте ZIP или 7Z для правки.');
+    raise Exception.Create(Lf('arch.addvia', [ArchiveKindCaption(Kind)]));
   end;
 end;
 
@@ -3031,7 +3049,7 @@ begin
       if (Ref.Physical = '') or (Ref.Inner = '') then
         Continue;
       if Ref.Kind = akRar then
-        raise Exception.Create('RAR только для чтения');
+        raise Exception.Create(L('arch.raronly'));
       Key := CacheKey(Ref.Physical);
       if not ByArc.TryGetValue(Key, List) then
       begin
@@ -3057,8 +3075,7 @@ begin
           SevenDelete(Pair.Value[0], Drop[I]);
       end
       else
-        raise Exception.Create('Удаление из ' + ArchiveKindCaption(Kind) +
-          ' не поддерживается. Распакуйте архив.');
+        raise Exception.Create(Lf('arch.delvia', [ArchiveKindCaption(Kind)]));
     end;
   finally
     ByArc.Free;
@@ -3073,14 +3090,13 @@ begin
   ANewPath := '';
   Ref := ResolvePath(AOldPath);
   if (Ref.Physical = '') or (Ref.Inner = '') then
-    raise Exception.Create('Нечего переименовывать');
+    raise Exception.Create(L('arch.norename'));
   NewInner := ArcJoin(ArcParent(Ref.Inner), ANewName);
   NewInner := ArcSafeRel(NewInner);
   if Ref.Kind = akZip then
     RebuildZip(Ref.Physical, [], Ref.Inner, NewInner)
   else
-    raise Exception.Create('Переименование внутри ' + ArchiveKindCaption(Ref.Kind) +
-      ' не поддерживается');
+    raise Exception.Create(Lf('arch.renvia', [ArchiveKindCaption(Ref.Kind)]));
   ANewPath := Ref.DiskArchive + '\' + StringReplace(NewInner, '/', '\', [rfReplaceAll]);
 end;
 
@@ -3095,7 +3111,7 @@ var
 begin
   Ref := ResolvePath(AParentDir);
   if Ref.Physical = '' then
-    raise Exception.Create('Не архив');
+    raise Exception.Create(L('arch.notarchive'));
   Name := ArcJoin(Ref.Inner, ABaseName);
   N := 1;
   Items := GetItems(Ref.Physical, Ref.Kind);
@@ -3105,7 +3121,7 @@ begin
     Name := ArcJoin(Ref.Inner, ABaseName + ' (' + IntToStr(N) + ')');
   end;
   if Ref.Kind <> akZip then
-    raise Exception.Create('Новая папка пока только в ZIP');
+    raise Exception.Create(L('arch.newdir'));
   Zip := nil;
   BeginArchiveAccess(Ref.Physical);
   try
@@ -3118,6 +3134,29 @@ begin
     InvalidateArchive(Ref.Physical);
   end;
   Result := Ref.DiskArchive + '\' + StringReplace(Name, '/', '\', [rfReplaceAll]);
+end;
+
+function ArchiveEntryInfo(const APath: string; out ASize: Int64;
+  out AModified: TDateTime; out AEncrypted: Boolean): Boolean;
+var
+  Ref: TArcRef;
+  Items: TArray<TArcItem>;
+  It: TArcItem;
+begin
+  ASize := 0;
+  AModified := 0;
+  AEncrypted := False;
+  Result := False;
+  Ref := ResolvePath(APath);
+  if (Ref.Physical = '') or (Ref.Inner = '') or (Ref.Kind = akNone) then
+    Exit;
+  Items := GetItems(Ref.Physical, Ref.Kind);
+  if not FindItem(Items, Ref.Inner, It) or It.IsDir then
+    Exit;
+  ASize := It.Size;
+  AModified := It.Modified;
+  AEncrypted := It.Encrypted;
+  Result := True;
 end;
 
 function MaterializeArchiveFile(const APath: string; out ALocal: string): Boolean;
@@ -3175,7 +3214,7 @@ begin
   begin
     SrcRef := ResolvePath(ASrcPath);
     if SrcRef.Physical = '' then
-      raise Exception.Create('Не удалось открыть архив: ' + ASrcPath);
+      raise Exception.Create(Lf('arch.openfail', [ASrcPath]));
     Items := GetItems(SrcRef.Physical, SrcRef.Kind);
     SrcFolder := FindItem(Items, SrcRef.Inner, It) and It.IsDir;
     if not TDirectory.Exists(ADstDir) then

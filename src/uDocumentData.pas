@@ -171,7 +171,7 @@ const
 implementation
 
 uses
-  System.Zip, System.IOUtils, System.StrUtils, System.Character;
+  System.Zip, System.IOUtils, System.StrUtils, System.Character, uLang;
 
 type
   TStylePack = record
@@ -2579,7 +2579,7 @@ begin
     DocXml := ZipReadUtf8(Zip, 'word/document.xml');
     if DocXml = '' then
     begin
-      AError := 'Нет word/document.xml';
+      AError := L('data.nodocxml');
       Exit;
     end;
     StylesXml := ZipReadUtf8(Zip, 'word/styles.xml');
@@ -2833,7 +2833,7 @@ begin
     StylesXml := ZipReadUtf8(Zip, 'styles.xml');
     if Content = '' then
     begin
-      AError := 'Нет content.xml';
+      AError := L('data.nocontent');
       Exit;
     end;
     DefaultRun.InitDefault;
@@ -3092,13 +3092,13 @@ begin
   end;
   if Length(Raw) < 5 then
   begin
-    AError := 'Пустой RTF';
+    AError := L('data.emptyrtf');
     Exit;
   end;
   S := TEncoding.ANSI.GetString(Raw);
   if not StartsText('{\rtf', S) then
   begin
-    AError := 'Не RTF';
+    AError := L('data.notrtf');
     Exit;
   end;
   Result := TDocDocument.Create;
@@ -3835,7 +3835,7 @@ begin
           Inner.Color := $FF555555;
           Inner.HasColor := True;
           if LabelTxt = '' then
-            LabelTxt := 'изображение';
+            LabelTxt := L('data.image');
           AddRun(LabelTxt, Inner);
           I := K + 1;
           Continue;
@@ -4143,7 +4143,7 @@ begin
     else
       Result := LoadPlainTextFromString(AText, APath);
     if Result = nil then
-      AError := 'Не удалось разобрать текст'
+      AError := L('data.textfail')
     else
     try
       Result.BuildLayout;
@@ -4172,12 +4172,12 @@ begin
   AError := '';
   if (APath = '') or not TFile.Exists(APath) then
   begin
-    AError := 'Файл не найден';
+    AError := L('data.notfound');
     Exit;
   end;
   if not IsDocumentFile(APath) then
   begin
-    AError := 'Формат не поддерживается';
+    AError := L('data.unsupported');
     Exit;
   end;
   try
@@ -4187,7 +4187,7 @@ begin
   end;
   if Sz > DocQVMaxBytes then
   begin
-    AError := 'Файл слишком большой для просмотра';
+    AError := L('data.toobig');
     Exit;
   end;
   Ext := LowerCase(ExtractFileExt(APath));
@@ -4198,7 +4198,7 @@ begin
   else if Ext = '.rtf' then
     Result := LoadRtf(APath, AError)
   else
-    AError := 'Формат не поддерживается';
+    AError := L('data.unsupported');
 end;
 
 function RenderLaidDocThumb(ADoc: TDocDocument; AWidth, AHeight: Integer;

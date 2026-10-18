@@ -30,6 +30,8 @@ type
     FLastPos: Double;
     FLastDur: Double;
     FArSet: Boolean;
+    FPixW: Integer;
+    FPixH: Integer;
     FLastBounds: TRect;
     function EnsureCom: Boolean;
     function AsPlayer(out P: IUnknown): Boolean;
@@ -59,6 +61,8 @@ type
     procedure Pump;
     function Active: Boolean;
     function HasEngine: Boolean;
+    function VideoPixelSize(out W, H: Integer): Boolean;
+    function HostWindow(out AWnd: HWND): Boolean;
   end;
 {$ENDIF}
 
@@ -509,6 +513,8 @@ begin
   if APath = '' then
     Exit;
   FShowVideo := AShowVideo;
+  FPixW := 0;
+  FPixH := 0;
   try
     ShutdownMf;
   except
@@ -792,6 +798,16 @@ begin
       FillChar(AR, SizeOf(AR), 0);
       if Succeeded(MP.GetNativeVideoSize(@Vid, @AR)) then
       begin
+        if (Vid.cx > 8) and (Vid.cy > 8) then
+        begin
+          FPixW := Vid.cx;
+          FPixH := Vid.cy;
+        end
+        else if (AR.cx > 64) and (AR.cy > 64) then
+        begin
+          FPixW := AR.cx;
+          FPixH := AR.cy;
+        end;
         if (AR.cx > 8) and (AR.cy > 8) then
         begin
           VW := AR.cx;
@@ -872,6 +888,19 @@ end;
 function TMpvSession.HasEngine: Boolean;
 begin
   Result := FMci or (FPlayer <> nil);
+end;
+
+function TMpvSession.VideoPixelSize(out W, H: Integer): Boolean;
+begin
+  W := FPixW;
+  H := FPixH;
+  Result := (W > 8) and (H > 8);
+end;
+
+function TMpvSession.HostWindow(out AWnd: HWND): Boolean;
+begin
+  AWnd := FWnd;
+  Result := FShowVideo and (FWnd <> 0) and IsWindow(FWnd) and IsWindowVisible(FWnd);
 end;
 
 function MpvExportClip(const ASrc, ADst: string; AStart, AEnd: Double;

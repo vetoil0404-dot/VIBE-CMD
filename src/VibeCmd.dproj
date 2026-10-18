@@ -187,6 +187,7 @@
         <DCCReference Include="uFileModel.pas"/>
         <DCCReference Include="uArchiveEngine.pas"/>
         <DCCReference Include="uThumbCache.pas"/>
+        <DCCReference Include="uHtmlThumb.pas"/>
         <DCCReference Include="uIconCache.pas"/>
         <DCCReference Include="uWinFileDrag.pas"/>
         <DCCReference Include="uClipboardImage.pas"/>
@@ -201,11 +202,14 @@
         <DCCReference Include="uDriveBar.pas"/>
         <DCCReference Include="uLaunchDock.pas"/>
         <DCCReference Include="uAppSettings.pas"/>
+        <DCCReference Include="uLang.pas"/>
+        <DCCReference Include="uLangBind.pas"/>
         <DCCReference Include="uFileOps.pas"/>
         <DCCReference Include="uFileOpEngine.pas"/>
         <DCCReference Include="uFileOpProgressForm.pas"/>
         <DCCReference Include="uConflictDialog.pas"/>
         <DCCReference Include="uFilePreview.pas"/>
+        <DCCReference Include="uFontConvert.pas"/>
         <DCCReference Include="uQuickViewForm.pas"/>
         <DCCReference Include="uSettingsForm.pas"/>
         <DCCReference Include="uMultiRename.pas"/>
@@ -221,8 +225,13 @@
         <DCCReference Include="uImageSniff.pas"/>
         <DCCReference Include="uPdfium.pas"/>
         <DCCReference Include="uPsdPreview.pas"/>
+        <DCCReference Include="uVecPreview.pas"/>
         <DCCReference Include="uMpvPlayer.pas"/>
         <DCCReference Include="uMetaCache.pas"/>
+        <DCCReference Include="uFolderSize.pas"/>
+        <DCCReference Include="uPeInfo.pas"/>
+        <DCCReference Include="uNetworkVfs.pas"/>
+        <DCCReference Include="uNetworkPanel.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

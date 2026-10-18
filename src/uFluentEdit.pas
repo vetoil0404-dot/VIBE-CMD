@@ -12,7 +12,7 @@ uses
   System.Rtti,
   FMX.Types, FMX.Controls, FMX.Objects, FMX.Graphics, FMX.Platform, FMX.TextLayout,
   FMX.Forms, FMX.Layouts, FMX.Effects,
-  uThemeManager, uFluentChrome;
+  uThemeManager, uFluentChrome, uLang;
 
 type
   TFluentEditFill = (fefTransparent, fefSubtle, fefSolid);
@@ -34,7 +34,11 @@ type
     FScrollX: Single;
     FOnChange: TNotifyEvent;
     FOnSubmit: TNotifyEvent;
+    FOnCancel: TNotifyEvent;
+    FPrompt: string;
+    FPromptColor: TAlphaColor;
     procedure SetText(const AValue: string);
+    procedure SetPrompt(const AValue: string);
     procedure SetFontSize(const AValue: Single);
     procedure SetFillMode(const AValue: TFluentEditFill);
     procedure BlinkTick(Sender: TObject);
@@ -65,6 +69,7 @@ type
     destructor Destroy; override;
     procedure SelectAll;
     procedure SelectRange(AStart, ALength: Integer);
+    procedure QueryInsertPoint(out AFrom, ATo: Integer);
     procedure InsertSnippet(const AValue: string);
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure ApplyColors(AText, ASel, ACaret: TAlphaColor);
@@ -73,6 +78,8 @@ type
     property FillMode: TFluentEditFill read FFillMode write SetFillMode;
     property OnChange: TNotifyEvent read FOnChange write FOnChange;
     property OnSubmit: TNotifyEvent read FOnSubmit write FOnSubmit;
+    property OnCancel: TNotifyEvent read FOnCancel write FOnCancel;
+    property Placeholder: string read FPrompt write SetPrompt;
   end;
 
 function CreateFluentEdit(AOwner: TComponent; AParent: TFmxObject): TFluentEdit;
@@ -105,6 +112,7 @@ begin
   FScrollX := 0;
   ClipChildren := True;
   FTextColor := TAlphaColors.White;
+  FPromptColor := $FF8A8A8A;
   FSelColor := $360078D4;
   FCaretColor := $FF0078D4;
   FBlink := TTimer.Create(Self);
@@ -123,6 +131,7 @@ end;
 procedure TFluentEdit.ApplyTheme(const AColors: TThemeColors);
 begin
   FTextColor := AColors.TextColor;
+  FPromptColor := AColors.SubTextColor;
   FSelColor := AColors.AccentSubtle;
   FCaretColor := AColors.SelectionColor;
   case FFillMode of
@@ -166,6 +175,14 @@ begin
   if SameValue(FFontSize, AValue) then
     Exit;
   FFontSize := Max(9, AValue);
+  Repaint;
+end;
+
+procedure TFluentEdit.SetPrompt(const AValue: string);
+begin
+  if FPrompt = AValue then
+    Exit;
+  FPrompt := AValue;
   Repaint;
 end;
 
@@ -286,6 +303,11 @@ begin
   Repaint;
 end;
 
+procedure TFluentEdit.QueryInsertPoint(out AFrom, ATo: Integer);
+begin
+  SelBounds(AFrom, ATo);
+end;
+
 procedure TFluentEdit.InsertSnippet(const AValue: string);
 begin
   InsertText(AValue);
@@ -365,21 +387,30 @@ begin
   Canvas.IntersectClipRect(TRectF.Create(0, 0, Width, Height));
   L := LayoutFor(FText);
   try
-    if SelBounds(A, B) and IsFocused then
+    if (FText = '') and (FPrompt <> '') then
     begin
-      L.Text := Copy(FText, 1, A);
-      X1 := OriginX + L.TextWidth;
-      L.Text := Copy(FText, 1, B);
-      X2 := OriginX + L.TextWidth;
+      L.Text := FPrompt;
+      L.Color := FPromptColor;
+      L.RenderLayout(Canvas);
+    end
+    else
+    begin
+      if SelBounds(A, B) and IsFocused then
+      begin
+        L.Text := Copy(FText, 1, A);
+        X1 := OriginX + L.TextWidth;
+        L.Text := Copy(FText, 1, B);
+        X2 := OriginX + L.TextWidth;
+        L.Text := FText;
+        R := TRectF.Create(X1, 3, X2, Height - 3);
+        Canvas.Fill.Kind := TBrushKind.Solid;
+        Canvas.Fill.Color := FSelColor;
+        Canvas.FillRect(R, 2, 2, AllCorners, AbsoluteOpacity);
+      end;
       L.Text := FText;
-      R := TRectF.Create(X1, 3, X2, Height - 3);
-      Canvas.Fill.Kind := TBrushKind.Solid;
-      Canvas.Fill.Color := FSelColor;
-      Canvas.FillRect(R, 2, 2, AllCorners, AbsoluteOpacity);
+      L.Color := FTextColor;
+      L.RenderLayout(Canvas);
     end;
-    L.Text := FText;
-    L.Color := FTextColor;
-    L.RenderLayout(Canvas);
     if IsFocused and FCaretOn then
     begin
       L.Text := Copy(FText, 1, CaretIndex);
@@ -524,6 +555,8 @@ begin
       end;
     vkEscape:
       begin
+        if Assigned(FOnCancel) then
+          FOnCancel(Self);
         inherited;
         Key := 0;
         Exit;
@@ -686,12 +719,12 @@ begin
   Footer.Stroke.Kind := TBrushKind.None;
   Footer.Fill.Kind := TBrushKind.None;
 
-  FBtnCancel := CreateFluentButton(Self, Footer, '', 'Отмена', fbkStandard, 100, CancelClick);
+  FBtnCancel := CreateFluentButton(Self, Footer, '', L('ask.cancel'), fbkStandard, 100, CancelClick);
   FBtnCancel.Align := TAlignLayout.Right;
   FBtnCancel.Margins.Rect := TRectF.Create(8, 4, 0, 4);
   FBtnCancel.ApplyTheme(AColors);
 
-  FBtnOk := CreateFluentButton(Self, Footer, '', 'ОК', fbkAccent, 100, OkClick);
+  FBtnOk := CreateFluentButton(Self, Footer, '', L('ask.ok'), fbkAccent, 100, OkClick);
   FBtnOk.Align := TAlignLayout.Right;
   FBtnOk.Margins.Rect := TRectF.Create(0, 4, 0, 4);
   FBtnOk.ApplyTheme(AColors);

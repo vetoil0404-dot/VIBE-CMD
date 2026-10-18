@@ -28,10 +28,13 @@ type
     FContent: TLayout;
     FOnInvoke: TNotifyEvent;
     FBusy: Boolean;
+    FClickWhileBusy: Boolean;
     FBusyJobs: Integer;
     FBusyFrame: Integer;
     FBusyTimer: TTimer;
     FBusyPaint: TPaintBox;
+    FKeyFocus: Boolean;
+    FOnArm: TNotifyEvent;
     procedure ApplyVisual;
     procedure BusyTick(Sender: TObject);
     procedure PaintSpinner(Sender: TObject; Canvas: TCanvas);
@@ -54,13 +57,18 @@ type
     procedure HoldHover(AHold: Boolean);
     procedure StartBusy(AJobs: Integer = 1);
     procedure EndBusy;
+    procedure SetKeyFocus(AOn: Boolean);
+    procedure Invoke;
     property Kind: TFluentButtonKind read FKind write FKind;
     property Busy: Boolean read FBusy;
+    property ClickWhileBusy: Boolean read FClickWhileBusy write FClickWhileBusy;
+    property OnArm: TNotifyEvent read FOnArm write FOnArm;
   end;
 
 function CreateFluentButton(AOwner: TComponent; AParent: TFmxObject;
   const AIcon, ACaption: string; AKind: TFluentButtonKind; AWidth: Single;
   AOnClick: TNotifyEvent): TFluentButton;
+function FluentButtonLive(AButton: TFluentButton): Boolean;
 
 procedure ApplyFluentText(AText: TText; ASize: Single; ABold: Boolean = False);
 procedure ApplyFluentShadow(AShadow: TShadowEffect; ADark: Boolean);
@@ -79,6 +87,7 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     procedure Setup(AParent: TFmxObject; const ACaption: string; AChecked: Boolean);
+    procedure SetCaption(const AText: string);
     procedure ApplyTheme(const AColors: TThemeColors);
     property Checked: Boolean read FChecked write SetChecked;
     property OnChange: TNotifyEvent read FOnChange write FOnChange;
@@ -257,8 +266,36 @@ end;
 
 procedure TFluentButton.SetCaption(const AText: string);
 begin
-  if Assigned(FCaption) then
-    FCaption.Text := AText;
+  { Кнопку часто собирают с пустой подписью, а текст ставят следом.
+    Без этой ветки FCaption нет, и подпись пропадает. }
+  if not Assigned(FCaption) then
+  begin
+    if (AText = '') or (FContent = nil) then
+    begin
+      ApplyVisual;
+      Exit;
+    end;
+    if Assigned(FIcon) and (FIcon.Align = TAlignLayout.Client) then
+    begin
+      FIcon.Align := TAlignLayout.Left;
+      FIcon.Width := 22;
+      FIcon.Margins.Rect := TRectF.Create(8, 0, 0, 0);
+    end;
+    FCaption := TText.Create(Self);
+    FCaption.Parent := FContent;
+    FCaption.Align := TAlignLayout.Client;
+    if Assigned(FIcon) then
+      FCaption.Margins.Rect := TRectF.Create(6, 0, 10, 0)
+    else
+      FCaption.Margins.Rect := TRectF.Create(10, 0, 10, 0);
+    ApplyFluentText(FCaption, 12, False);
+    FCaption.TextSettings.HorzAlign := TTextAlign.Leading;
+    FCaption.TextSettings.VertAlign := TTextAlign.Center;
+    FCaption.HitTest := False;
+    FCaption.WordWrap := False;
+    FCaption.TextSettings.Trimming := TTextTrimming.Character;
+  end;
+  FCaption.Text := AText;
   ApplyVisual;
 end;
 
@@ -361,26 +398,14 @@ begin
 end;
 
 procedure TFluentButton.ApplyTheme(const AColors: TThemeColors);
-var
-  Glyph: TAlphaColor;
 begin
   FColors := AColors;
-  if FKind = fbkAccent then
-    Glyph := AColors.OnAccentTextColor
-  else if FKind = fbkNeon then
-    Glyph := $FF111111
-  else
-    Glyph := AColors.TextColor;
-  if Assigned(FIcon) then
-    FIcon.TextSettings.FontColor := Glyph;
-  if Assigned(FCaption) then
-    FCaption.TextSettings.FontColor := Glyph;
-  if Assigned(FHotkey) then
-    FHotkey.TextSettings.FontColor := Glyph;
   ApplyVisual;
 end;
 
 procedure TFluentButton.ApplyVisual;
+var
+  Glyph: TAlphaColor;
 begin
   { Как кнопки на статусбаре: при select/busy меняем только заливку, не цвет значка. }
   Stroke.Kind := TBrushKind.None;
@@ -438,6 +463,38 @@ begin
     else
       Fill.Color := TAlphaColors.Null;
   end;
+  { Фокус клавиатуры в диалоге файлов: вся кнопка акцентом, не обводка. }
+  if FKeyFocus then
+  begin
+    Stroke.Kind := TBrushKind.None;
+    if FPressed then
+      Fill.Color := DarkenColor(FColors.SelectionColor, 0.10)
+    else if FHovered then
+      Fill.Color := FColors.AccentHover
+    else
+      Fill.Color := FColors.SelectionColor;
+  end;
+  if FKeyFocus or (FKind = fbkAccent) then
+    Glyph := FColors.OnAccentTextColor
+  else if FKind = fbkNeon then
+    Glyph := $FF111111
+  else
+    Glyph := FColors.TextColor;
+  if Assigned(FIcon) then
+  begin
+    FIcon.TextSettings.FontColor := Glyph;
+    FIcon.Color := Glyph;
+  end;
+  if Assigned(FCaption) then
+  begin
+    FCaption.TextSettings.FontColor := Glyph;
+    FCaption.Color := Glyph;
+  end;
+  if Assigned(FHotkey) then
+  begin
+    FHotkey.TextSettings.FontColor := Glyph;
+    FHotkey.Color := Glyph;
+  end;
 end;
 
 procedure TFluentButton.HandleEnter(Sender: TObject);
@@ -458,6 +515,8 @@ procedure TFluentButton.HandleDown(Sender: TObject; Button: TMouseButton;
 begin
   if Button = TMouseButton.mbLeft then
   begin
+    if Assigned(FOnArm) then
+      FOnArm(Self);
     FPressed := True;
     ApplyVisual;
   end;
@@ -472,10 +531,42 @@ end;
 
 procedure TFluentButton.HandleClick(Sender: TObject);
 begin
-  if FBusy then
+  if FBusy and not FClickWhileBusy then
     Exit;
   if Assigned(FOnInvoke) then
     FOnInvoke(Self);
+end;
+
+procedure TFluentButton.SetKeyFocus(AOn: Boolean);
+begin
+  if FKeyFocus = AOn then
+    Exit;
+  FKeyFocus := AOn;
+  ApplyVisual;
+end;
+
+procedure TFluentButton.Invoke;
+begin
+  HandleClick(Self);
+end;
+
+function FluentButtonLive(AButton: TFluentButton): Boolean;
+var
+  P: TFmxObject;
+begin
+  Result := Assigned(AButton) and AButton.Visible and AButton.Enabled and
+    (AButton.Opacity > 0.5);
+  if not Result then
+    Exit;
+  P := AButton.Parent;
+  while P <> nil do
+  begin
+    if P.Parent = nil then
+      Break;
+    if (P is TControl) and not TControl(P).Visible then
+      Exit(False);
+    P := P.Parent;
+  end;
 end;
 
 function CreateFluentButton(AOwner: TComponent; AParent: TFmxObject;
@@ -539,6 +630,12 @@ begin
   FCaption.Text := ACaption;
   FChecked := AChecked;
   FMark.Visible := FChecked;
+end;
+
+procedure TFluentCheckRow.SetCaption(const AText: string);
+begin
+  if Assigned(FCaption) then
+    FCaption.Text := AText;
 end;
 
 procedure TFluentCheckRow.SetChecked(AValue: Boolean);

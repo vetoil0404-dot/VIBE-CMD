@@ -47,6 +47,7 @@ type
     FForAll: TFluentCheckRow;
     FBtnSkip, FBtnAuto, FBtnOver: TFluentButton;
     FPoll: TTimer;
+    FKeyBtn: TFluentButton;
 
     procedure BuildUI;
     function MakeCard(AParent: TFmxObject; const ACaption: string;
@@ -60,6 +61,13 @@ type
     procedure SkipClick(Sender: TObject);
     procedure AutoClick(Sender: TObject);
     procedure OverClick(Sender: TObject);
+    procedure ArmClick(Sender: TObject);
+    procedure SetKeyBtn(AButton: TFluentButton);
+    procedure CollectKeyRow(out ARow: TArray<TFluentButton>);
+    procedure SyncKeyFocus;
+    procedure MoveKeyFocus(ADelta: Integer);
+    procedure PressKeyBtn;
+    function FocusInField: Boolean;
     procedure PollTick(Sender: TObject);
     procedure Finish;
   protected
@@ -76,6 +84,9 @@ type
   end;
 
 implementation
+
+uses
+  uLang, uLangBind;
 
 const
   DLG_W = 700;
@@ -125,7 +136,7 @@ begin
   Height := DLG_H;
   BorderStyle := TFmxFormBorderStyle.Single;
   BorderIcons := [TBorderIcon.biSystemMenu];
-  Caption := 'Конфликт имени';
+  TrForm(Self, 'conflict.title');
   Position := TFormPosition.OwnerFormCenter;
   ShowHint := True;
   BuildUI;
@@ -191,20 +202,154 @@ begin
 end;
 
 
-procedure TConflictDialog.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
+procedure TConflictDialog.ArmClick(Sender: TObject);
 begin
+  if (Sender is TFluentButton) and FluentButtonLive(TFluentButton(Sender)) then
+    SetKeyBtn(TFluentButton(Sender));
+end;
+
+procedure TConflictDialog.SetKeyBtn(AButton: TFluentButton);
+begin
+  if FKeyBtn = AButton then
+  begin
+    if Assigned(FKeyBtn) then
+      FKeyBtn.SetKeyFocus(True);
+    Exit;
+  end;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(False);
+  FKeyBtn := AButton;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(True);
+end;
+
+procedure TConflictDialog.CollectKeyRow(out ARow: TArray<TFluentButton>);
+  procedure AddLive(AButton: TFluentButton);
+  var
+    N: Integer;
+  begin
+    if not FluentButtonLive(AButton) then
+      Exit;
+    N := Length(ARow);
+    SetLength(ARow, N + 1);
+    ARow[N] := AButton;
+  end;
+begin
+  SetLength(ARow, 0);
+  AddLive(FBtnOver);
+  AddLive(FBtnSkip);
+  AddLive(FBtnAuto);
+end;
+
+procedure TConflictDialog.SyncKeyFocus;
+var
+  Row: TArray<TFluentButton>;
+  I: Integer;
+  Accent: TFluentButton;
+begin
+  CollectKeyRow(Row);
+  if Assigned(FKeyBtn) then
+    for I := 0 to High(Row) do
+      if Row[I] = FKeyBtn then
+      begin
+        FKeyBtn.SetKeyFocus(True);
+        Exit;
+      end;
+  Accent := FBtnOver;
+  if not FluentButtonLive(Accent) and (Length(Row) > 0) then
+    Accent := Row[0]
+  else if not FluentButtonLive(Accent) then
+    Accent := nil;
+  SetKeyBtn(Accent);
+end;
+
+procedure TConflictDialog.MoveKeyFocus(ADelta: Integer);
+var
+  Row: TArray<TFluentButton>;
+  I, At, N: Integer;
+  Found: Boolean;
+begin
+  CollectKeyRow(Row);
+  N := Length(Row);
+  if N = 0 then
+    Exit;
+  Found := False;
+  At := 0;
+  if Assigned(FKeyBtn) then
+    for I := 0 to High(Row) do
+      if Row[I] = FKeyBtn then
+      begin
+        At := I;
+        Found := True;
+        Break;
+      end;
+  if not Found then
+  begin
+    SyncKeyFocus;
+    Exit;
+  end;
+  At := (At + ADelta) mod N;
+  if At < 0 then
+    Inc(At, N);
+  SetKeyBtn(Row[At]);
+end;
+
+procedure TConflictDialog.PressKeyBtn;
+begin
+  SyncKeyFocus;
+  if Assigned(FKeyBtn) and FluentButtonLive(FKeyBtn) then
+    FKeyBtn.Invoke;
+end;
+
+function TConflictDialog.FocusInField: Boolean;
+begin
+  Result := (Focused <> nil) and (Focused.GetObject <> Self);
+end;
+
+procedure TConflictDialog.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
+var
+  Plain: Boolean;
+begin
+  if Key in [vkF2..vkF8] then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if FocusInField then
+  begin
+    inherited;
+    Exit;
+  end;
+  Plain := not (ssAlt in Shift) and not (ssCtrl in Shift);
+  if Plain and ((Key = vkLeft) or (Key = vkRight) or (Key = vkTab)) then
+  begin
+    if (Key = vkLeft) or ((Key = vkTab) and (ssShift in Shift)) then
+      MoveKeyFocus(-1)
+    else
+      MoveKeyFocus(1);
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Plain and ((Key = vkUp) or (Key = vkDown)) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
   if Key = vkEscape then
   begin
     Key := 0;
+    KeyChar := #0;
     ApplyAction(caSkip);
     Exit;
   end;
-  if Key = vkReturn then
+  if (Key = vkReturn) or (Key = vkSpace) then
   begin
     Key := 0;
-    ApplyAction(caOverwrite);
-    if not FFinished then
-      Finish;
+    KeyChar := #0;
+    PressKeyBtn;
     Exit;
   end;
   inherited;
@@ -247,11 +392,11 @@ begin
   Head.Height := 22;
 
   ACap := MkText(Self, Head, 12, True, FColors.SubTextColor, TAlignLayout.Client);
-  ACap.Text := ACaption;
+  TrText(ACap, ACaption);
 
   ANewer := MkText(Self, Head, 11, True, FColors.SelectionColor, TAlignLayout.Right);
-  ANewer.Width := 64;
-  ANewer.Text := 'новее';
+  ANewer.Width := 84;
+  TrText(ANewer, 'conflict.newer');
   ANewer.TextSettings.HorzAlign := TTextAlign.Trailing;
   ANewer.Visible := False;
 
@@ -306,10 +451,11 @@ begin
   Head.Height := 32;
 
   FTitle := MkText(Self, Head, 18, True, FColors.TextColor, TAlignLayout.Client);
-  FTitle.Text := 'Конфликт имени';
+  TrText(FTitle, 'conflict.title');
 
   FForAll := TFluentCheckRow.Create(Self);
-  FForAll.Setup(FRoot, 'Для всех оставшихся', False);
+  FForAll.Setup(FRoot, L('conflict.forall'), False);
+  TrCheck(FForAll, 'conflict.forall');
   FForAll.Align := TAlignLayout.Top;
   FForAll.Height := 32;
   FForAll.Margins.Top := 4;
@@ -325,9 +471,9 @@ begin
   FCards.Height := CARD_H;
 
 
-  MakeCard(FCards, 'Источник (копируем)', FSrcCard, FSrcCap, FSrcNewer, FSrcImg,
+  MakeCard(FCards, 'conflict.src', FSrcCard, FSrcCap, FSrcNewer, FSrcImg,
     FSrcName, FSrcSize, FSrcDate);
-  MakeCard(FCards, 'Назначение (уже есть)', FDstCard, FDstCap, FDstNewer, FDstImg,
+  MakeCard(FCards, 'conflict.dst', FDstCard, FDstCap, FDstNewer, FDstImg,
     FDstName, FDstSize, FDstDate);
   FSrcCard.Align := TAlignLayout.Left;
   FSrcCard.Width := 322;
@@ -360,19 +506,32 @@ begin
 
 
 
-    FBtnOver := CreateFluentButton(Self, Btns, '', 'Перезаписать', fbkAccent, 150, OverClick);
-  FBtnSkip := CreateFluentButton(Self, Btns, '', 'Пропустить', fbkStandard, 130, SkipClick);
-  FBtnAuto := CreateFluentButton(Self, Btns, '', 'Автоимя', fbkStandard, 130, AutoClick);
+    FBtnOver := CreateFluentButton(Self, Btns, '', L('conflict.overwrite'), fbkStandard, 150, OverClick);
+  TrButton(FBtnOver, 'conflict.overwrite');
+  FBtnSkip := CreateFluentButton(Self, Btns, '', L('conflict.skip'), fbkStandard, 130, SkipClick);
+  TrButton(FBtnSkip, 'conflict.skip');
+  FBtnAuto := CreateFluentButton(Self, Btns, '', L('conflict.auto'), fbkStandard, 130, AutoClick);
+  TrButton(FBtnAuto, 'conflict.auto');
 
   FBtnSkip.Align := TAlignLayout.Left;
   FBtnAuto.Align := TAlignLayout.Left;
   FBtnOver.Align := TAlignLayout.Left;
+  FBtnOver.CanFocus := False;
+  FBtnSkip.CanFocus := False;
+  FBtnAuto.CanFocus := False;
+  FBtnOver.TabStop := False;
+  FBtnSkip.TabStop := False;
+  FBtnAuto.TabStop := False;
+  FBtnOver.OnArm := ArmClick;
+  FBtnSkip.OnArm := ArmClick;
+  FBtnAuto.OnArm := ArmClick;
 
   FPoll := TTimer.Create(Self);
   FPoll.Interval := 200;
   FPoll.OnTimer := PollTick;
   FPoll.Enabled := False;
    ApplyTheme(FColors);
+  SyncKeyFocus;
 end;
 
 procedure TConflictDialog.SetFallbackIcon(const APath: string; AIsDir: Boolean;
@@ -462,7 +621,7 @@ begin
   end;
   Inc(FGen);
   It := FItems[FIndex];
-  FCounter.Text := Format('%d из %d', [FIndex + 1, Length(FItems)]);
+  FCounter.Text := Lf('conflict.of', [FIndex + 1, Length(FItems)]);
   FSrcName.Text := ExtractFileName(ExcludeTrailingPathDelimiter(It.SourcePath));
   FDstName.Text := ExtractFileName(ExcludeTrailingPathDelimiter(It.DestPath));
   if It.SourceSize > 0 then

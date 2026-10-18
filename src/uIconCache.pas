@@ -83,6 +83,7 @@ type
     procedure InvalidatePath(const APath: string);
     procedure InvalidateFolder(const AFolder: string);
     procedure Shutdown;
+    function Quiescent: Boolean;
     procedure Clear;
   end;
 
@@ -203,9 +204,12 @@ begin
   inherited;
 end;
 
+function TIconCache.Quiescent: Boolean;
+begin
+  Result := (FBusy = 0) and (FTypeBusy = 0) and (FQueued = 0);
+end;
+
 procedure TIconCache.Shutdown;
-var
-  Guard: Integer;
 begin
   FShuttingDown := True;
   FLock.Enter;
@@ -216,15 +220,6 @@ begin
     FTypePending.Clear;
   finally
     FLock.Leave;
-  end;
-  Guard := 0;
-  while ((FBusy > 0) or (FTypeBusy > 0) or (FQueued > 0)) and (Guard < 12) do
-  begin
-    if TThread.CurrentThread.ThreadID = MainThreadID then
-      CheckSynchronize(15)
-    else
-      Sleep(15);
-    Inc(Guard);
   end;
 end;
 
@@ -838,8 +833,11 @@ initialization
 
 finalization
   if Assigned(GlobalIconCache) then
+  begin
     GlobalIconCache.Shutdown;
-  FreeAndNil(GlobalIconCache);
+    if GlobalIconCache.Quiescent then
+      FreeAndNil(GlobalIconCache);
+  end;
 
 end.
 

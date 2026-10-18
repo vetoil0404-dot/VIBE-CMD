@@ -1,4 +1,4 @@
-unit uImageSniff;
+﻿unit uImageSniff;
 
 {
   Сигнатура картинки, кадры ICO/CUR и запись multi-size ICO.
@@ -23,6 +23,13 @@ function ImageExtMatches(ASig: TImageSig; const AExt: string): Boolean;
 function LoadIcoFrames(const APath: string; out AFrames: TArray<TBitmap>;
   out ALabels: TArray<string>): Boolean;
 function SaveMultiIco(const ASource: TBitmap; const APath: string): Boolean;
+
+type
+  TImageSaveFormat = (isfPng, isfJpeg, isfWebp, isfBmp, isfIco);
+
+{ Запись кадра без окна. Пакетный конвертер зовёт эту же функцию. }
+function SaveImage(const ABitmap: TBitmap; const APath: string;
+  AFormat: TImageSaveFormat; AQuality: Integer): Boolean;
 
 implementation
 
@@ -413,6 +420,131 @@ begin
     end;
   finally
     FS.Free;
+  end;
+end;
+
+function FlattenOnWhite(const ASource: TBitmap): TBitmap;
+var
+  Src: ISkImage;
+begin
+  Result := TBitmap.Create(ASource.Width, ASource.Height);
+  Src := ASource.ToSkImage;
+  Result.SkiaDraw(
+    procedure(const C: ISkCanvas)
+    begin
+      C.Clear(TAlphaColors.White);
+      if Src <> nil then
+        C.DrawImage(Src, 0, 0);
+    end);
+end;
+
+function SaveBmpFile(const ABitmap: TBitmap; const APath: string): Boolean;
+var
+  Data: TBitmapData;
+  FS: TFileStream;
+  W, H, X, Y, RowBytes, Stride, FileSize: Integer;
+  Hdr: array[0..53] of Byte;
+  Row: TBytes;
+  C: TAlphaColorRec;
+begin
+  Result := False;
+  if (ABitmap = nil) or (ABitmap.Width < 1) or (ABitmap.Height < 1) or
+     (APath = '') then
+    Exit;
+  if not ABitmap.Map(TMapAccess.Read, Data) then
+    Exit;
+  FS := nil;
+  try
+    try
+      W := ABitmap.Width;
+      H := ABitmap.Height;
+      RowBytes := W * 3;
+      Stride := ((RowBytes + 3) div 4) * 4;
+      FileSize := 54 + Stride * H;
+      FillChar(Hdr, SizeOf(Hdr), 0);
+      Hdr[0] := Ord('B');
+      Hdr[1] := Ord('M');
+      PCardinal(@Hdr[2])^ := Cardinal(FileSize);
+      PCardinal(@Hdr[10])^ := 54;
+      PCardinal(@Hdr[14])^ := 40;
+      PInteger(@Hdr[18])^ := W;
+      PInteger(@Hdr[22])^ := H;
+      PWord(@Hdr[26])^ := 1;
+      PWord(@Hdr[28])^ := 24;
+      PCardinal(@Hdr[34])^ := Cardinal(Stride * H);
+      SetLength(Row, Stride);
+      FS := TFileStream.Create(APath, fmCreate);
+      FS.WriteBuffer(Hdr, 54);
+      for Y := H - 1 downto 0 do
+      begin
+        FillChar(Row[0], Stride, 0);
+        for X := 0 to W - 1 do
+        begin
+          C := TAlphaColorRec(Data.GetPixel(X, Y));
+          Row[X * 3] := C.B;
+          Row[X * 3 + 1] := C.G;
+          Row[X * 3 + 2] := C.R;
+        end;
+        FS.WriteBuffer(Row[0], Stride);
+      end;
+      Result := FS.Size = FileSize;
+    except
+      Result := False;
+    end;
+  finally
+    ABitmap.Unmap(Data);
+    FS.Free;
+  end;
+  if not Result and TFile.Exists(APath) then
+    try
+      TFile.Delete(APath);
+    except
+    end;
+end;
+
+function SaveImage(const ABitmap: TBitmap; const APath: string;
+  AFormat: TImageSaveFormat; AQuality: Integer): Boolean;
+var
+  Img: ISkImage;
+  Fmt: TSkEncodedImageFormat;
+  Q: Integer;
+  Flat, SrcBmp: TBitmap;
+begin
+  Result := False;
+  if (ABitmap = nil) or (ABitmap.Width < 1) or (ABitmap.Height < 1) or
+     (APath = '') then
+    Exit;
+  if AFormat = isfIco then
+    Exit(SaveMultiIco(ABitmap, APath));
+  Flat := nil;
+  SrcBmp := ABitmap;
+  if AFormat in [isfJpeg, isfBmp] then
+  begin
+    Flat := FlattenOnWhite(ABitmap);
+    SrcBmp := Flat;
+  end;
+  try
+    if AFormat = isfBmp then
+      Exit(SaveBmpFile(SrcBmp, APath));
+    case AFormat of
+      isfJpeg: Fmt := TSkEncodedImageFormat.JPEG;
+      isfWebp: Fmt := TSkEncodedImageFormat.WEBP;
+    else
+      Fmt := TSkEncodedImageFormat.PNG;
+    end;
+    Q := 100;
+    if AFormat in [isfJpeg, isfWebp] then
+      Q := EnsureRange(AQuality, 1, 100);
+    Img := SrcBmp.ToSkImage;
+    if Img = nil then
+      Exit;
+    try
+      Result := Img.EncodeToFile(APath, Fmt, Q);
+    except
+      Result := False;
+    end;
+  finally
+    Flat.Free;
   end;
 end;
 

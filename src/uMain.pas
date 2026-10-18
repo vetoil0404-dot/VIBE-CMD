@@ -12,9 +12,9 @@ Winapi.Windows, Winapi.Messages, Winapi.DwmApi, Winapi.UxTheme,
   FMX.TextLayout, FMX.Effects,
   FileSelectionManager,
 
-  uAppSettings, uThemeManager, uFluentChrome, uFluentEdit, uFluentComboBox,
+  uAppSettings, uLang, uThemeManager, uFluentChrome, uFluentEdit, uFluentComboBox,
   uFilePanel, uThumbCache,
-  uIconCache, uMetaCache,
+  uIconCache, uMetaCache, uFolderSize,
   uQuickViewForm, uLaunchDock,
   uSettingsForm, uFileOps, uFileOpEngine, uFileModel, UCoreEngine, uMultiRenameForm, uSearchForm
   , uWinBrowserDrop;
@@ -72,12 +72,22 @@ type
     FOpScrollY: Single;
     FOpViewH: Single;
     FMidStackH: Single;
+    FOpPillTop: Single;
 
     FFnBar: TRectangle;
     FFnCells: array[0..6] of TLayout;
     FFnButtons: array[0..6] of TFluentButton;
-    FCmdLine: TRectangle;
+    FCmdBar: TLayout;
+    FCmdBack: TRectangle;
+    FCmdTopLine: TRectangle;
+    FCmdIcon: TText;
+    FCmdPath: TText;
+    FCmdSplit: TRectangle;
     FCmdEdit: TFluentEdit;
+    FCmdHist: TStringList;
+    FCmdHistPos: Integer;
+    FCmdDraft: string;
+    FCmdPrompt: string;
 
     FWorkArea: TLayout;
     FCenterCluster: TLayout;
@@ -98,6 +108,7 @@ type
     FFrameHooked: Boolean;
     FOldWndProc: Pointer;
     FPendingMaximized: Boolean;
+    FCenterAtShow: Boolean;
     FCenterOnRestore: Boolean;
     FStartupDone: Boolean;
     FFading: Boolean;
@@ -105,12 +116,17 @@ type
     FFirstPaintLogged: Boolean;
     FLeftReady: Boolean;
     FRightReady: Boolean;
+    FSessionTimer: TTimer;
+    FSessionDirty: Boolean;
+    FSessionSnap: Boolean;
+    FSessionSaved: Boolean;
     FFadeTimer: TTimer;
     FStartupTimer: TTimer;
     FIdlePlusTimer: TTimer;
     FStaleTimer: TTimer;
     FPreviewDebounce: TTimer;
     FPreviewPending: string;
+    FPreviewWindowPending: string;
     FFadeStart: UInt64;
     FLastHistNavTick: UInt64;
 
@@ -128,6 +144,10 @@ type
     procedure BuildDock;
     procedure BuildMidBar;
     procedure BuildFunctionBar;
+    procedure BuildCommandLine;
+    procedure CmdBarResize(Sender: TObject);
+    procedure LayoutCmdBar;
+    procedure SyncCmdPath;
     procedure BuildWorkArea;
     procedure LayoutFunctionBar;
     procedure LayoutWorkArea;
@@ -137,6 +157,8 @@ type
     procedure BuildOpPill;
     procedure LayoutMidButtons;
     procedure LayoutOpPill;
+    function OpPillOnRail: Boolean;
+    procedure ParkOpPill;
     procedure RefreshOpUi;
     procedure OpHubChanged(Sender: TObject);
     procedure OpTick(Sender: TObject);
@@ -173,12 +195,21 @@ type
     function CurrentWorkArea: TRectF;
     procedure CaptureNormalGeometry;
     procedure ApplyStartupGeometry;
+    function CalcMinWindowHeight: Integer;
+    procedure ApplyMinWindowHeight;
+    function NativeScale: Single;
+    procedure ApplyNativeWindowRect;
+    procedure ApplySavedWindowRect;
     procedure CenterNormalWindow;
     procedure PersistWindowState;
     procedure NativeSysCommand(ACmd: NativeUInt);
     procedure StartStartupFade;
     procedure FadeTick(Sender: TObject);
     procedure FinishStartupFade;
+    procedure KickFolderSizes;
+    procedure MarkSessionDirty;
+    procedure SnapshotSession;
+    procedure SessionTimerTick(Sender: TObject);
     procedure StartupIdleTick(Sender: TObject);
     procedure StartupIdlePlusTick(Sender: TObject);
     procedure StartupStaleTick(Sender: TObject);
@@ -217,12 +248,18 @@ type
     procedure OnSelFiles(Sender: TObject);
     procedure OnSelFolders(Sender: TObject);
     procedure OnSelCompare(Sender: TObject);
+    procedure OnSelModeExplorer(Sender: TObject);
+    procedure OnSelModeVibe(Sender: TObject);
+    procedure SetMouseSelectMode(AExplorer: Boolean);
+    procedure PanelMouseModePick(Sender: TObject; AExplorer: Boolean);
+    procedure BuildSelMenu;
     procedure AskSelectMask(ASelect: Boolean);
     procedure ShowSearch;
     procedure SearchFormClosed(Sender: TObject; var Action: TCloseAction);
     procedure SearchStateChanged(Sender: TObject);
     procedure HistoryShortcut(ADelta: Integer; AFromMouse: Boolean = False);
     function PanelAtCursor: TFilePanel;
+    procedure CloseDriveHomes;
     procedure PanelActivate(Sender: TObject);
 
     procedure LeftPanelPathChanged(Sender: TObject; const APath: string);
@@ -231,14 +268,32 @@ type
     procedure PanelQuickView(Sender: TObject; const APath: string);
     procedure PanelCursorChanged(Sender: TObject);
     procedure PreviewDebounceTick(Sender: TObject);
+    procedure ArmPreviewDebounce;
+    function QuickViewFollows: Boolean;
+    procedure FollowQuickViewWindow(const APath: string);
+    procedure FollowActivePanelPreview;
+    procedure CloseColumnQuickView;
+    procedure ApplyPanelView(APanel: TFilePanel; AMode: TPanelViewMode);
+    procedure PanelStatusView(Sender: TObject; AMode: TPanelViewMode);
     procedure TogglePanelQuickView;
     procedure ShowQuickViewWindow(const APath: string);
     procedure ShowQuickViewForPath(const APath: string);
     function PreviewWantsKeys: Boolean;
 
+    procedure ApplyLanguage;
     procedure ApplyThemeToAll(const AColors: TThemeColors);
+    procedure ApplyWindowBackground;
+    procedure ApplyBandLayout;
+    procedure ApplyPanelSettings;
     procedure ApplyDriveOptions;
+    procedure ApplySessionBehavior;
     procedure CmdLineSubmit(Sender: TObject);
+    procedure CmdLineCancel(Sender: TObject);
+    procedure CmdHistStep(ADelta: Integer);
+    procedure RememberCmd(const ACmd: string);
+    function CmdLineFocused: Boolean;
+    function TryCmdLineDrop(const AScreen: TPointF; const APaths: TArray<string>): Boolean;
+    procedure InsertCmdDrop(const APaths: TArray<string>);
     procedure OnThemeChangedFromSettings(NewTheme: TAppTheme);
     procedure HandleSystemChromeChanged;
     procedure UpdateViewButtons;
@@ -280,7 +335,10 @@ procedure StartupLog(const AStage: string);
 implementation
 
 uses
-  uFileOpProgressForm;
+  Winapi.MultiMon,
+  System.Win.Registry, System.IniFiles,
+  FMX.Platform,
+  uFileOpProgressForm, uDriveBar;
 
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
@@ -296,7 +354,11 @@ const
   ICON_CHROME_CLOSE = #$E8BB;
   ICON_CHROME_SETTINGS = #$E713;
   FNBAR_HEIGHT = 42;
+  CMDLINE_HEIGHT = 36;
+  CMD_HIST_MAX = 24;
+  CMD_PROMPT_ICON = #$E756;
   MIDBAR_WIDTH = 40;
+  OP_PILL_H = 32;
   SPLITTER_WIDTH = 4;
   CENTER_CLUSTER_WIDTH = SPLITTER_WIDTH + MIDBAR_WIDTH + SPLITTER_WIDTH;
   MIN_PANEL_WIDTH = 180;
@@ -307,6 +369,9 @@ const
 
   MIDBAR_TOP = 38;
   MIDBAR_BOTTOM = 8;
+  MID_BTN_Y0 = 4;
+  MIN_WINDOW_SLACK = 8;
+  MIN_WINDOW_FLOOR = 480;
   MIN_WINDOW_HEIGHT = 700;
 
 var
@@ -352,29 +417,59 @@ function TryActivateRunningInstance: Boolean;
 var
   Wnd: Winapi.Windows.HWND;
   Pid: DWORD;
+  Started: UInt64;
+  Held: THandle;
 begin
   Result := False;
-  GAppMutex := CreateMutex(nil, True, APP_MUTEX_NAME);
-  if (GAppMutex = 0) or (GetLastError <> ERROR_ALREADY_EXISTS) then
+  if not SingleInstanceWanted then
     Exit;
-  GFoundWnd := 0;
-  Winapi.Windows.EnumWindows(@EnumVibeWnd, 0);
-  if GFoundWnd = 0 then
-    GFoundWnd := Winapi.Windows.FindWindow(nil, PChar('V!BE CMD'));
-  Wnd := GFoundWnd;
-  if Wnd <> 0 then
+  Started := GetTickCount64;
+  while True do
   begin
-    GetWindowThreadProcessId(Wnd, Pid);
-    if Pid <> 0 then
-      AllowSetForegroundWindow(Pid);
-    if IsIconic(Wnd) then
-      Winapi.Windows.ShowWindow(Wnd, SW_RESTORE)
-    else
-      Winapi.Windows.ShowWindow(Wnd, SW_SHOW);
-    SetForegroundWindow(Wnd);
-    BringWindowToTop(Wnd);
+    Held := CreateMutex(nil, True, APP_MUTEX_NAME);
+    if Held = 0 then
+      Exit;
+    if GetLastError <> ERROR_ALREADY_EXISTS then
+    begin
+      GAppMutex := Held;
+      Exit;
+    end;
+    { Чужой хэндл не держим: иначе мьютекс живёт, пока мы ждём. }
+    CloseHandle(Held);
+    GFoundWnd := 0;
+    Winapi.Windows.EnumWindows(@EnumVibeWnd, 0);
+    if GFoundWnd = 0 then
+      GFoundWnd := Winapi.Windows.FindWindow(nil, PChar('V!BE CMD'));
+    Wnd := GFoundWnd;
+    if (Wnd <> 0) and IsWindowVisible(Wnd) then
+    begin
+      GetWindowThreadProcessId(Wnd, Pid);
+      if Pid <> 0 then
+        AllowSetForegroundWindow(Pid);
+      if IsIconic(Wnd) then
+        Winapi.Windows.ShowWindow(Wnd, SW_RESTORE)
+      else
+        Winapi.Windows.ShowWindow(Wnd, SW_SHOW);
+      SetForegroundWindow(Wnd);
+      BringWindowToTop(Wnd);
+      Result := True;
+      Exit;
+    end;
+    if GetTickCount64 - Started >= 300 then
+    begin
+      with TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini') do
+      try
+        SetLanguage(ReadString('Main', 'Language', 'system'));
+      finally
+        Free;
+      end;
+      MessageBox(0, PChar(L('main.stillclosing')),
+        'V!BE CMD', MB_OK or MB_ICONINFORMATION or MB_SETFOREGROUND);
+      Result := True;
+      Exit;
+    end;
+    Sleep(40);
   end;
-  Result := True;
 end;
 {$ELSE}
 begin
@@ -393,10 +488,13 @@ begin
 
   FSettings := TAppSettings.Create;
   FSettings.Load;
+  SetLanguage(FSettings.Language);
+  ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  SeedDockIfNeeded(FSettings);
   SetActiveAppTheme(FSettings.Theme);
   SetFileOpMode(FSettings.FileOpMode);
 
-  Constraints.MinHeight := MIN_WINDOW_HEIGHT;
+  Constraints.MinHeight := MIN_WINDOW_FLOOR;
   Constraints.MaxHeight := 0;
   ApplyStartupGeometry;
 
@@ -410,6 +508,7 @@ begin
   BuildTitleBar;
   BuildDock;
   BuildFunctionBar;
+  BuildCommandLine;
   BuildWorkArea;
 
   OnResize := FormResizeHandler;
@@ -442,6 +541,10 @@ begin
   FStaleTimer.Interval := 80;
   FStaleTimer.Enabled := False;
   FStaleTimer.OnTimer := StartupStaleTick;
+  FSessionTimer := TTimer.Create(Self);
+  FSessionTimer.Interval := 1200;
+  FSessionTimer.Enabled := False;
+  FSessionTimer.OnTimer := SessionTimerTick;
   FQuickView := nil;
   FChromeWatch := nil;
   SetFileOpHubChanged(OpHubChanged);
@@ -466,50 +569,33 @@ begin
   end;
   FreeAndNil(FChromeWatch);
 
-  { Сначала сохранить настройки (пока объекты живы), потом гасить кэши. }
   if Assigned(FSettings) then
   begin
-    if Assigned(FSearchHist) then
+    if not FSessionSaved then
     begin
-      SetLength(FSettings.SearchHistory, FSearchHist.Count);
-      for var HI := 0 to FSearchHist.Count - 1 do
-        FSettings.SearchHistory[HI] := FSearchHist[HI];
-    end;
-    PersistWindowState;
-    FSettings.SplitterPos := FLeftPanelRatio;
-    if FActivePanel = FRightPanel then
-      FSettings.ActivePanel := 1
-    else
-      FSettings.ActivePanel := 0;
-    if Assigned(FLeftPanel) then
-      FLeftPanel.CaptureTabs(FSettings.Left);
-    if Assigned(FRightPanel) then
-      FRightPanel.CaptureTabs(FSettings.Right);
-    if Assigned(FDock) then
-    begin
-      FDock.CollectState(FSettings.DockItems, FSettings.DockItemX,
-        FSettings.DockKinds, FSettings.DockCaptions, FSettings.DockIcons,
-        FSettings.DockIconLocked);
-      FSettings.DockAlign := FDock.AlignMode;
-      FSettings.DockShowSeparators := FDock.ShowSeparators;
-    end;
-    try
-      FSettings.Save;
-    except
+      if FSessionDirty or not FSessionSnap then
+        SnapshotSession;
+      try
+        FSettings.SaveSession;
+      except
+      end;
     end;
     FreeAndNil(FSettings);
   end;
   if Assigned(FSearchDebounce) then
     FSearchDebounce.Enabled := False;
   FreeAndNil(FSearchHist);
+  FreeAndNil(FCmdHist);
 
-  { Shutdown кэшей короткий (FShuttingDown + малый timeout). }
+  { Флаг стоп и сброс очереди. Потоки не ждём. }
   if Assigned(GlobalThumbCache) then
     GlobalThumbCache.Shutdown;
   if Assigned(GlobalIconCache) then
     GlobalIconCache.Shutdown;
   if Assigned(GlobalMetaCache) then
     GlobalMetaCache.Shutdown;
+  if Assigned(GlobalFolderSizes) then
+    GlobalFolderSizes.Shutdown;
 
   if Assigned(FQuickView) then FQuickView.Free;
   {$IFDEF MSWINDOWS}
@@ -554,6 +640,7 @@ begin
   ApplyNativeWindowChrome(FormToHWND(Self), FColors.IsDark);
   InstallFormDropTarget(Self);
   {$ENDIF}
+  ApplyMinWindowHeight;
   StartupLog('Handle');
 end;
 
@@ -576,27 +663,7 @@ begin
   end;
   {$ENDIF}
   inherited;
-  ApplyCustomFrame;
-  {$IFDEF MSWINDOWS}
-  ApplyNativeWindowChrome(FormToHWND(Self), FColors.IsDark);
-  {$ENDIF}
-  LayoutWorkArea;
-  LayoutQuickSearch;
-  if Assigned(FLeftPanel) and Assigned(FRightPanel) then
-  begin
-    if FActivePanel = FRightPanel then
-    begin
-      FRightPanel.SetActive(True);
-      FLeftPanel.SetActive(False);
-    end
-    else
-    begin
-      FActivePanel := FLeftPanel;
-      FLeftPanel.SetActive(True);
-      FRightPanel.SetActive(False);
-    end;
-  end;
-  LayoutFunctionBar;
+  { Тема, полосы и раскладка уже стоят с конструктора. Здесь только альфа и fade. }
   UpdateViewButtons;
   if not FStartupDone then
     StartStartupFade;
@@ -610,19 +677,39 @@ end;
 
 procedure TMainForm.DoClose(var CloseAction: TCloseAction);
 begin
-  { Сразу убрать окно — пользователь не ждёт Shutdown/Save. }
+  if Assigned(FSessionTimer) then
+    FSessionTimer.Enabled := False;
+  if FSessionDirty or not FSessionSnap then
+    SnapshotSession
+  else
+    PersistWindowState;
   try
     Visible := False;
 {$IFDEF MSWINDOWS}
-  if FormToHWND(Self) <> 0 then
-  ShowWindow(FormToHWND(Self), SW_HIDE);
+    if FormToHWND(Self) <> 0 then
+      ShowWindow(FormToHWND(Self), SW_HIDE);
+    if GAppMutex <> 0 then
+    begin
+      CloseHandle(GAppMutex);
+      GAppMutex := 0;
+    end;
 {$ENDIF}
   except
   end;
-  CancelListFileOps;
-  PersistWindowState;
-  inherited;
   Application.Terminate;
+  CancelListFileOps;
+  DismissFileOpProgress;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.CancelPendingIO;
+  if Assigned(FRightPanel) then
+    FRightPanel.CancelPendingIO;
+  try
+    if Assigned(FSettings) then
+      FSettings.SaveSession;
+  except
+  end;
+  FSessionSaved := True;
+  inherited;
 end;
 
 function ReadAppVersion: string;
@@ -785,7 +872,14 @@ begin
 
      WM_ACTIVATE:
     begin
-      if LoWord(wParam) <> WA_INACTIVE then
+      if LoWord(wParam) = WA_INACTIVE then
+      begin
+        if (GetForegroundWindow <> 0) and
+           (GetAncestor(GetForegroundWindow, GA_ROOT) <> hWnd) and
+           Assigned(GHookForm) then
+          GHookForm.CloseDriveHomes;
+      end
+      else
       begin
         // Как только окно активировалось, сбрасываем системные флаги
       //  SendMessage(hWnd, WM_CANCELMODE, 0, 0);
@@ -813,6 +907,30 @@ begin
           begin
             if Assigned(GHookForm) then
               GHookForm.OnBtnSearchClick(nil);
+          end);
+        Exit(0);
+      end
+      else if (wParam = VK_F1) and (GetKeyState(VK_CONTROL) >= 0) and
+              Assigned(GHookForm) and Assigned(GHookForm.FLeftPanel) and
+              GHookForm.FLeftPanel.DriveHomeEnabled then
+      begin
+        TThread.ForceQueue(nil,
+          procedure
+          begin
+            if Assigned(GHookForm) and Assigned(GHookForm.FLeftPanel) then
+              GHookForm.FLeftPanel.ToggleDriveHome;
+          end);
+        Exit(0);
+      end
+      else if (wParam = VK_F2) and (GetKeyState(VK_CONTROL) >= 0) and
+              Assigned(GHookForm) and Assigned(GHookForm.FRightPanel) and
+              GHookForm.FRightPanel.DriveHomeEnabled then
+      begin
+        TThread.ForceQueue(nil,
+          procedure
+          begin
+            if Assigned(GHookForm) and Assigned(GHookForm.FRightPanel) then
+              GHookForm.FRightPanel.ToggleDriveHome;
           end);
         Exit(0);
       end
@@ -883,46 +1001,47 @@ begin
       end;
 
 
-WM_SYSCOMMAND:
+    WM_SYSCOMMAND:
       begin
-       if (NativeUInt(wParam) and $FFF0) = SC_CLOSE then
-  begin
-    PostMessage(hWnd, WM_CLOSE, 0, 0);
-    Exit(0);
-  end;
+        Cmd := NativeUInt(wParam) and $FFF0;
+        if Cmd = SC_CLOSE then
+        begin
+          PostMessage(hWnd, WM_CLOSE, 0, 0);
+          Exit(0);
+        end;
 
-        // ИСПРАВЛЕНИЕ: Используем DefWindowProc вместо FMX обработчика для системных кнопок
         if (Cmd = SC_MAXIMIZE) or (Cmd = SC_RESTORE) or (Cmd = SC_MINIMIZE) then
         begin
           if Cmd = SC_MAXIMIZE then
             GHookForm.CaptureNormalGeometry;
 
-          // Важно: Вызываем DefWindowProc, чтобы Windows сама управляла состоянием HWND
           Result := DefWindowProc(hWnd, Msg, wParam, lParam);
 
-          // Синхронизируем состояние FMX и настроек ПОСЛЕ того как Windows изменила окно
           TThread.ForceQueue(nil,
             procedure
             var
               LPlacement: TWindowPlacement;
+              Maxed: Boolean;
             begin
-              if (GHookForm <> nil) and (hWnd <> 0) then
+              if (GHookForm = nil) or (hWnd = 0) or not Assigned(GHookForm.FSettings) then
+                Exit;
+              { showCmd после восстановления с панели часто SW_SHOWNORMAL,
+                хотя окно уже развёрнуто. Ориентир — само окно. }
+              Maxed := IsZoomed(hWnd);
+              if (not Maxed) and IsIconic(hWnd) then
               begin
+                FillChar(LPlacement, SizeOf(LPlacement), 0);
                 LPlacement.length := SizeOf(LPlacement);
                 if GetWindowPlacement(hWnd, @LPlacement) then
-                begin
-                  // Синхронизируем флаг
-                  GHookForm.FSettings.WindowMaximized := (LPlacement.showCmd = SW_SHOWMAXIMIZED);
-                  // Принудительно уведомляем FMX о смене состояния, чтобы он не конфликтовал
-                  if GHookForm.FSettings.WindowMaximized then
-                    GHookForm.WindowState := TWindowState.wsMaximized
-                  else if LPlacement.showCmd = SW_SHOWNORMAL then
-                    GHookForm.WindowState := TWindowState.wsNormal;
-                end;
-                GHookForm.UpdateWindowButtons;
-                // Лечим баг с фокусом и залипшим Alt
-                PostMessage(hWnd, WM_REFRESH_FOCUS, 0, 0);
+                  Maxed := (LPlacement.flags and WPF_RESTORETOMAXIMIZED) <> 0;
               end;
+              GHookForm.FSettings.WindowMaximized := Maxed;
+              { Поверх IsZoomed не писать ни wsNormal, ни wsMaximized:
+                FMX от wsMaximized снимает разворот и ставит его снова. }
+              if (not IsZoomed(hWnd)) and (not Maxed) then
+                GHookForm.WindowState := TWindowState.wsNormal;
+              GHookForm.UpdateWindowButtons;
+              PostMessage(hWnd, WM_REFRESH_FOCUS, 0, 0);
             end);
           Exit;
         end;
@@ -931,13 +1050,7 @@ WM_SYSCOMMAND:
 
 
 
-      if Cmd = SC_MINIMIZE then
-      begin
-        if not IsZoomed(hWnd) then
-          GHookForm.CaptureNormalGeometry;
-        Exit(DefWindowProc(hWnd, Msg, wParam, lParam));
       end;
-    end;
 
     WM_NCCALCSIZE:
       if wParam <> 0 then
@@ -1126,6 +1239,8 @@ var
   R: TRect;
 {$ENDIF}
 begin
+  { SPI_GETWORKAREA — рабочая область только основного монитора.
+    Сохранённое окно по ней не проверять: второй монитор сюда не попадает. }
   Result := TRectF.Create(0, 0, 1280, 800);
   {$IFDEF MSWINDOWS}
   if SystemParametersInfo(SPI_GETWORKAREA, 0, @R, 0) then
@@ -1155,48 +1270,75 @@ begin
   FSettings.WindowLeft := Round(Left);
   FSettings.WindowTop := Round(Top);
   FSettings.WindowWidth := Round(Width);
-  FSettings.WindowHeight := Max(Round(Height), MIN_WINDOW_HEIGHT);
+  FSettings.WindowHeight := Max(Round(Height), Round(Constraints.MinHeight));
+end;
+
+function TMainForm.NativeScale: Single;
+begin
+  Result := 1;
+  {$IFDEF MSWINDOWS}
+  if (Handle <> nil) and (Handle is TWinWindowHandle) then
+  begin
+    Result := TWinWindowHandle(Handle).Scale;
+    if Result < 0.5 then
+      Result := 1;
+  end;
+  {$ENDIF}
 end;
 
 procedure TMainForm.ApplyStartupGeometry;
 var
   WA: TRectF;
-  W, H, L, T: Single;
+  Scale, W, H, L, T: Single;
 begin
-  WA := CurrentWorkArea;
-  if WA.Width < 200 then
-    WA := TRectF.Create(0, 0, 1280, 800);
   W := FSettings.WindowWidth;
   H := FSettings.WindowHeight;
   if W < 400 then
     W := 1200;
-  if H < MIN_WINDOW_HEIGHT then
-    H := MIN_WINDOW_HEIGHT;
+  if H < MIN_WINDOW_FLOOR then
+    H := MIN_WINDOW_FLOOR;
 
   FPendingMaximized := FSettings.WindowMaximized;
   FCenterOnRestore := FPendingMaximized;
+  { Позиции нет, только если в ini не было Left/Top. Отрицательные — левый или верхний монитор. }
+  FCenterAtShow := (not FSettings.WindowPosSaved) and (not FPendingMaximized);
+  Position := TFormPosition.Designed;
+  Width := Round(W);
+  Height := Round(H);
+
+  if FSettings.WindowPosSaved then
+  begin
+    { До хэндла FMX обрежет Left по основному экрану. Это только подсказка.
+      В настройки не пишем: иначе пропадёт отрицательная координата.
+      Итог ставит ApplySavedWindowRect уже по хэндлу. }
+    Left := FSettings.WindowLeft;
+    Top := FSettings.WindowTop;
+    Exit;
+  end;
+
+  { Первый запуск. CurrentWorkArea здесь — основной монитор, это и нужно. }
+  Scale := NativeScale;
+  WA := CurrentWorkArea;
+  if Scale > 0 then
+    WA := TRectF.Create(WA.Left / Scale, WA.Top / Scale, WA.Right / Scale, WA.Bottom / Scale);
+  if WA.Width < 200 then
+    WA := TRectF.Create(0, 0, 1280, 800);
   if FPendingMaximized then
   begin
     if W > WA.Width * 0.92 then
       W := Min(1200, Max(480, WA.Width * 0.72));
     if H > WA.Height * 0.92 then
       H := Min(Max(MIN_WINDOW_HEIGHT, 700), Max(MIN_WINDOW_HEIGHT, WA.Height * 0.72));
-    L := WA.Left + (WA.Width - W) / 2;
-    T := WA.Top + (WA.Height - H) / 2;
   end
   else
   begin
-    L := FSettings.WindowLeft;
-    T := FSettings.WindowTop;
-    if L + Min(W, 160) < WA.Left then
-      L := WA.Left;
-    if T < WA.Top then
-      T := WA.Top;
-    if L > WA.Right - 80 then
-      L := WA.Right - Min(W, WA.Width);
-    if T > WA.Bottom - 40 then
-      T := WA.Top;
+    if W > WA.Width then
+      W := WA.Width;
+    if H > WA.Height then
+      H := WA.Height;
   end;
+  L := WA.Left + (WA.Width - W) / 2;
+  T := WA.Top + (WA.Height - H) / 2;
   Width := Round(W);
   Height := Round(H);
   Left := Round(L);
@@ -1207,26 +1349,352 @@ begin
   FSettings.WindowHeight := Height;
 end;
 
-procedure TMainForm.CenterNormalWindow;
+function TMainForm.CalcMinWindowHeight: Integer;
+const
+  CmdGap = 4;
 var
-  WA: TRectF;
-  W, H: Single;
+  TopH, BotH, Need, Stack: Single;
+
+  function ChromeFrameHeight: Single;
+  {$IFDEF MSWINDOWS}
+  var
+    Px: Integer;
+    Scale, Measured: Single;
+    Wnd: HWND;
+  {$ENDIF}
+  begin
+    { WM_NCCALCSIZE отступает только снизу. Высота формы — внешняя,
+      клиент короче на эту рамку. }
+    {$IFDEF MSWINDOWS}
+    Px := GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+    if Px < 1 then
+      Px := 8;
+    Scale := NativeScale;
+    if Scale < 0.5 then
+      Scale := 1;
+    Result := Px / Scale;
+    Wnd := FormToHWND(Self);
+    if (Wnd <> 0) and (not IsZoomed(Wnd)) and (not IsIconic(Wnd)) and
+       (ClientHeight > 0) and (Height > ClientHeight) then
+    begin
+      Measured := Height - ClientHeight;
+      if (Measured > 0) and (Measured < Result + 12) then
+        Result := Measured;
+    end;
+    {$ELSE}
+    Result := 0;
+    {$ENDIF}
+  end;
+
+begin
+  { Поля рабочей области и отступ кнопок тоже занимают высоту.
+    Футер панели лежит внутри карточки и сюда не входит. }
+  TopH := TITLEBAR_HEIGHT;
+  if (not Assigned(FSettings)) or FSettings.ShowDock then
+    TopH := TopH + DOCK_HEIGHT;
+  BotH := 0;
+  if (not Assigned(FSettings)) or FSettings.ShowFnBar then
+    BotH := BotH + FNBAR_HEIGHT;
+  if Assigned(FSettings) and FSettings.ShowCommandLine then
+    BotH := BotH + CMDLINE_HEIGHT + CmdGap;
+  Need := TopH + BotH;
+  if (not Assigned(FSettings)) or FSettings.ShowMidBar then
+  begin
+    Stack := FMidStackH;
+    if Stack < 0 then
+      Stack := 0;
+    Need := Need + WORK_PAD_T + MIDBAR_TOP + MID_BTN_Y0 + Stack +
+      MIDBAR_BOTTOM + WORK_PAD_B + MIN_WINDOW_SLACK;
+  end;
+  Result := Ceil(Need + ChromeFrameHeight);
+  if Result < MIN_WINDOW_FLOOR then
+    Result := MIN_WINDOW_FLOOR;
+end;
+
+procedure TMainForm.ApplyMinWindowHeight;
+var
+  MinH: Integer;
+begin
+  if csDestroying in ComponentState then
+    Exit;
+  MinH := CalcMinWindowHeight;
+  if Constraints.MinHeight <> MinH then
+    Constraints.MinHeight := MinH;
+  {$IFDEF MSWINDOWS}
+  if (not IsWindowMaximized) and
+     ((FormToHWND(Self) = 0) or not IsIconic(FormToHWND(Self))) and
+     (Height < MinH) then
+    Height := MinH;
+  {$ELSE}
+  if (not IsWindowMaximized) and (Height < MinH) then
+    Height := MinH;
+  {$ENDIF}
+  LayoutMidButtons;
+end;
+
+procedure TMainForm.ApplyNativeWindowRect;
+{$IFDEF MSWINDOWS}
+var
+  Wnd: HWND;
+  Mon: HMONITOR;
+  Info: TMonitorInfo;
+  Scale: Single;
+  PxW, PxH, L, T, WaW, WaH: Integer;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  if not FCenterAtShow then
+    Exit;
+  Wnd := FormToHWND(Self);
+  if (Wnd = 0) or IsZoomed(Wnd) or IsIconic(Wnd) then
+    Exit;
+  Scale := NativeScale;
+  Mon := MonitorFromWindow(Wnd, MONITOR_DEFAULTTONEAREST);
+  FillChar(Info, SizeOf(Info), 0);
+  Info.cbSize := SizeOf(Info);
+  if not GetMonitorInfo(Mon, @Info) then
+    Exit;
+  PxW := Max(1, Round(Width * Scale));
+  PxH := Max(1, Round(Height * Scale));
+  WaW := Info.rcWork.Right - Info.rcWork.Left;
+  WaH := Info.rcWork.Bottom - Info.rcWork.Top;
+  if WaW < 200 then
+    Exit;
+  if PxW > WaW then
+    PxW := WaW;
+  if PxH > WaH then
+    PxH := WaH;
+  L := Info.rcWork.Left + (WaW - PxW) div 2;
+  T := Info.rcWork.Top + (WaH - PxH) div 2;
+  SetWindowPos(Wnd, 0, L, T, PxW, PxH, SWP_NOZORDER or SWP_NOACTIVATE);
+  FCenterAtShow := False;
+  Left := Round(L / Scale);
+  Top := Round(T / Scale);
+  if Abs(Width - PxW / Scale) > 1 then
+    Width := Round(PxW / Scale);
+  if Abs(Height - PxH / Scale) > 1 then
+    Height := Round(PxH / Scale);
+  if Assigned(FSettings) then
+  begin
+    FSettings.WindowLeft := Left;
+    FSettings.WindowTop := Top;
+    FSettings.WindowWidth := Round(Width);
+    FSettings.WindowHeight := Round(Height);
+  end;
+  {$ENDIF}
+end;
+
+type
+  PMonWorkScan = ^TMonWorkScan;
+  TMonWorkScan = record
+    Saved: TRect;
+    Hit: Boolean;
+    BestArea: Int64;
+    BestWork: TRect;
+    BestMon: HMONITOR;
+  end;
+
+{ stdcall: вложенная процедура сюда не годится. r — весь монитор, не rcWork. }
+function EnumMonWork(hm: HMONITOR; dc: HDC; r: PRect; l: LPARAM): Boolean; stdcall;
+var
+  Info: TMonitorInfo;
+  Scan: PMonWorkScan;
+  Lft, Tp, Rt, Bt: Integer;
+  Area: Int64;
+begin
+  Result := True;
+  if (l = 0) or (hm = 0) then
+    Exit;
+  Scan := PMonWorkScan(l);
+  FillChar(Info, SizeOf(Info), 0);
+  Info.cbSize := SizeOf(Info);
+  if not GetMonitorInfo(hm, @Info) then
+    Exit;
+  if (Info.rcWork.Right <= Info.rcWork.Left) or
+     (Info.rcWork.Bottom <= Info.rcWork.Top) then
+    Exit;
+  Lft := Max(Scan.Saved.Left, Info.rcWork.Left);
+  Tp := Max(Scan.Saved.Top, Info.rcWork.Top);
+  Rt := Min(Scan.Saved.Right, Info.rcWork.Right);
+  Bt := Min(Scan.Saved.Bottom, Info.rcWork.Bottom);
+  if (Rt <= Lft) or (Bt <= Tp) then
+    Exit;
+  Area := Int64(Rt - Lft) * Int64(Bt - Tp);
+  if (not Scan.Hit) or (Area > Scan.BestArea) then
+  begin
+    Scan.Hit := True;
+    Scan.BestArea := Area;
+    Scan.BestWork := Info.rcWork;
+    Scan.BestMon := hm;
+  end;
+end;
+
+procedure TMainForm.ApplySavedWindowRect;
+{$IFDEF MSWINDOWS}
+var
+  Wnd: HWND;
+  Info: TMonitorInfo;
+  Scan: TMonWorkScan;
+  Scale, MonScale: Single;
+  DipW, DipH, MinDip: Integer;
+  Saved: TRect;
+  WorkW, WorkH, PxW, PxH, MinPx, FitL, FitT: Integer;
+  Dp: TPointF;
+
+  function ScaleOf(AMon: HMONITOR): Single;
+  var
+    Svc: IFMXMultiDisplayService;
+    I: Integer;
+    Disp: TDisplay;
+  begin
+    Result := 0;
+    if (AMon = 0) or
+       not TPlatformServices.Current.SupportsPlatformService(IFMXMultiDisplayService, Svc) then
+      Exit;
+    for I := 0 to Svc.DisplayCount - 1 do
+    begin
+      Disp := Svc.Displays[I];
+      if Disp.Id = NativeUInt(AMon) then
+        Exit(Disp.Scale);
+    end;
+  end;
+
+  function RectAt(AScale: Single): TRect;
+  var
+    Org: TPoint;
+  begin
+    Org := DpToPx(PointF(FSettings.WindowLeft, FSettings.WindowTop));
+    if AScale < 0.5 then
+      AScale := 1;
+    Result.Left := Org.X;
+    Result.Top := Org.Y;
+    Result.Right := Org.X + Max(1, Round(DipW * AScale));
+    Result.Bottom := Org.Y + Max(1, Round(DipH * AScale));
+  end;
+
+  procedure Collect(const ARect: TRect);
+  begin
+    Scan.Saved := ARect;
+    Scan.Hit := False;
+    Scan.BestArea := 0;
+    Scan.BestMon := 0;
+    EnumDisplayMonitors(0, nil, EnumMonWork, LPARAM(@Scan));
+  end;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  if (not Assigned(FSettings)) or (not FSettings.WindowPosSaved) then
+    Exit;
+  Wnd := FormToHWND(Self);
+  if Wnd = 0 then
+    Exit;
+
+  DipW := FSettings.WindowWidth;
+  DipH := FSettings.WindowHeight;
+  if DipW < 400 then
+    DipW := 1200;
+  if DipH < MIN_WINDOW_FLOOR then
+    DipH := MIN_WINDOW_FLOOR;
+
+  { Размер — масштаб монитора, на котором лежит прямоугольник, не масштаб хэндла.
+    Хэндл до SetWindowPos ещё на основном экране. }
+  Scale := NativeScale;
+  if Scale < 0.5 then
+    Scale := 1;
+  Saved := RectAt(Scale);
+  MonScale := ScaleOf(MonitorFromRect(@Saved, MONITOR_DEFAULTTONEAREST));
+  if MonScale >= 0.5 then
+    Scale := MonScale;
+  Saved := RectAt(Scale);
+  Collect(Saved);
+  if Scan.Hit then
+  begin
+    MonScale := ScaleOf(Scan.BestMon);
+    if (MonScale >= 0.5) and (Abs(MonScale - Scale) > 0.01) then
+    begin
+      Scale := MonScale;
+      Saved := RectAt(Scale);
+      Collect(Saved);
+    end;
+  end;
+
+  if not Scan.Hit then
+  begin
+    Scan.BestMon := MonitorFromRect(@Saved, MONITOR_DEFAULTTONEAREST);
+    FillChar(Info, SizeOf(Info), 0);
+    Info.cbSize := SizeOf(Info);
+    if (Scan.BestMon = 0) or (not GetMonitorInfo(Scan.BestMon, @Info)) then
+      Exit;
+    if (Info.rcWork.Right <= Info.rcWork.Left) or
+       (Info.rcWork.Bottom <= Info.rcWork.Top) then
+      Exit;
+    Scan.BestWork := Info.rcWork;
+    MonScale := ScaleOf(Scan.BestMon);
+    if (MonScale >= 0.5) and (Abs(MonScale - Scale) > 0.01) then
+    begin
+      Scale := MonScale;
+      Saved := RectAt(Scale);
+      { Другой масштаб меняет размер: прямоугольник мог начать пересекать rcWork. }
+      Collect(Saved);
+      if not Scan.Hit then
+        Scan.BestWork := Info.rcWork;
+    end;
+  end;
+
+  WorkW := Scan.BestWork.Right - Scan.BestWork.Left;
+  WorkH := Scan.BestWork.Bottom - Scan.BestWork.Top;
+  if (WorkW < 1) or (WorkH < 1) then
+    Exit;
+
+  PxW := Saved.Right - Saved.Left;
+  PxH := Saved.Bottom - Saved.Top;
+  MinDip := Round(Constraints.MinHeight);
+  if MinDip < MIN_WINDOW_FLOOR then
+    MinDip := MIN_WINDOW_FLOOR;
+  MinPx := Max(1, Round(MinDip * Scale));
+  if PxW > WorkW then
+    PxW := WorkW;
+  if PxH > WorkH then
+    PxH := WorkH;
+  if PxH < MinPx then
+    PxH := MinPx;
+  if PxW < 1 then
+    PxW := 1;
+
+  { Сначала правый и нижний край, потом левый и верхний: заголовок остаётся у Work.Top. }
+  FitL := Saved.Left;
+  FitT := Saved.Top;
+  if FitL + PxW > Scan.BestWork.Right then
+    FitL := Scan.BestWork.Right - PxW;
+  if FitT + PxH > Scan.BestWork.Bottom then
+    FitT := Scan.BestWork.Bottom - PxH;
+  if FitL < Scan.BestWork.Left then
+    FitL := Scan.BestWork.Left;
+  if FitT < Scan.BestWork.Top then
+    FitT := Scan.BestWork.Top;
+
+  SetWindowPos(Wnd, 0, FitL, FitT, PxW, PxH, SWP_NOZORDER or SWP_NOACTIVATE);
+
+  { Не переписывать ini, если пиксели те же: иначе DIP округляется на каждом старте.
+    Сдвиг пишем сразу: закрытие в развёрнутом виде геометрию не снимает. }
+  if (Abs(FitL - Saved.Left) <= 1) and (Abs(FitT - Saved.Top) <= 1) and
+     (Abs(PxW - (Saved.Right - Saved.Left)) <= 1) and
+     (Abs(PxH - (Saved.Bottom - Saved.Top)) <= 1) then
+    Exit;
+  Dp := PxToDp(Point(FitL, FitT));
+  FSettings.WindowLeft := Round(Dp.X);
+  FSettings.WindowTop := Round(Dp.Y);
+  FSettings.WindowWidth := Max(1, Round(PxW / Scale));
+  FSettings.WindowHeight := Max(1, Round(PxH / Scale));
+  {$ENDIF}
+end;
+
+procedure TMainForm.CenterNormalWindow;
 begin
   if (csDestroying in ComponentState) or IsWindowMaximized then
     Exit;
-  WA := CurrentWorkArea;
-  W := FSettings.WindowWidth;
-  H := Max(FSettings.WindowHeight, MIN_WINDOW_HEIGHT);
-  if W < 400 then
-    W := 1200;
-  if W > WA.Width * 0.92 then
-    W := Min(1200, Max(480, WA.Width * 0.72));
-  if H > WA.Height * 0.92 then
-    H := Min(Max(MIN_WINDOW_HEIGHT, 700), Max(MIN_WINDOW_HEIGHT, WA.Height * 0.72));
-  Left := Round(WA.Left + (WA.Width - W) / 2);
-  Top := Round(WA.Top + (WA.Height - H) / 2);
-  Width := Round(W);
-  Height := Round(H);
+  FCenterAtShow := True;
+  ApplyNativeWindowRect;
   CaptureNormalGeometry;
   FCenterOnRestore := False;
 end;
@@ -1270,12 +1738,24 @@ begin
   begin
     SetWindowLong(Wnd, GWL_EXSTYLE, GetWindowLong(Wnd, GWL_EXSTYLE) or WS_EX_LAYERED);
     SetLayeredWindowAttributes(Wnd, 0, 0, LWA_ALPHA);
+    { Visible := True уже мог вернуть окно на основной экран. Ставим место до показа. }
+    if not FCenterAtShow then
+      ApplySavedWindowRect;
     if FPendingMaximized then
       ShowCmd := SW_SHOWMAXIMIZED
     else
       ShowCmd := SW_SHOWNA;
     FPendingMaximized := False;
     ShowWindow(Wnd, ShowCmd);
+    if ShowCmd <> SW_SHOWMAXIMIZED then
+    begin
+      { ShowWindow снова может сдвинуть на основной. Развёрнутое не трогаем:
+        его монитор уже задан прямоугольником перед SW_SHOWMAXIMIZED. }
+      if FCenterAtShow then
+        ApplyNativeWindowRect
+      else
+        ApplySavedWindowRect;
+    end;
     if WindowAnimEnabled then
     begin
       FFadeStart := GetTickCount64;
@@ -1291,6 +1771,7 @@ begin
   FStartupDone := True;
   FFading := False;
   Visible := True;
+  KickFolderSizes;
   {$ENDIF}
 end;
 
@@ -1346,6 +1827,7 @@ begin
     FLeftPanel.LoadActiveTab;
   if Assigned(FIdlePlusTimer) then
     FIdlePlusTimer.Enabled := True;
+  MarkSessionDirty;
 end;
 
 procedure TMainForm.LeftListReady(Sender: TObject);
@@ -1436,6 +1918,7 @@ begin
       ApplyCustomFrame;
   end;
   {$ENDIF}
+  KickFolderSizes;
 end;
 
 procedure TMainForm.BuildTitleBar;
@@ -1520,11 +2003,11 @@ begin
   FQuickSearch := TFluentComboBox.Create(Self);
   FQuickSearch.Parent := FTitleBar;
   FQuickSearch.Suggest := True;
-  FQuickSearch.TextPrompt := 'Поиск в панели';
+  FQuickSearch.TextPrompt := L('main.search.prompt');
   FQuickSearch.Glyph := #$E721;
   FQuickSearch.Items.Assign(FSearchHist);
   if FSearchHist.Count > 0 then
-    FQuickSearch.FooterCaption := 'Очистить историю';
+    FQuickSearch.FooterCaption := L('main.search.clear');
   FQuickSearch.OnChange := SearchChanged;
   FQuickSearch.OnSelChange := SearchSelected;
   FQuickSearch.OnSubmit := SearchSubmit;
@@ -1567,10 +2050,13 @@ begin
 end;
 
 procedure TMainForm.UsePanel(APanel: TFilePanel; AFocus: Boolean);
+var
+  Switched: Boolean;
 begin
   if not Assigned(APanel) then
     Exit;
-  if FActivePanel <> APanel then
+  Switched := FActivePanel <> APanel;
+  if Switched then
   begin
     if Assigned(FActivePanel) and FActivePanel.HasFilter then
       FActivePanel.ClearFilter;
@@ -1594,8 +2080,16 @@ begin
   UpdateViewButtons;
   if AFocus and APanel.CanFocus then
     APanel.SetFocus;
-  if Assigned(FOpPill) and FOpPill.Visible and (FOpPill.Parent <> FMidBar) then
+  SyncCmdPath;
+  if Assigned(FOpPill) and FOpPill.Visible and not OpPillOnRail then
     LayoutOpPill;
+  { После текущего клика: курсор уже сдвинут, окно берёт итоговый файл. }
+  if Switched then
+    TThread.ForceQueue(nil,
+      procedure
+      begin
+        FollowActivePanelPreview;
+      end);
 end;
 
 procedure TMainForm.SearchChanged(Sender: TObject);
@@ -1650,7 +2144,7 @@ begin
     Exit;
   FQuickSearch.Items.Assign(FSearchHist);
   if FSearchHist.Count > 0 then
-    FQuickSearch.FooterCaption := 'Очистить историю'
+    FQuickSearch.FooterCaption := L('main.search.clear')
   else
     FQuickSearch.FooterCaption := '';
 end;
@@ -1691,7 +2185,7 @@ begin
   if Assigned(FQuickSearch) then
   begin
     FQuickSearch.Items.Assign(FSearchHist);
-    FQuickSearch.FooterCaption := 'Очистить историю';
+    FQuickSearch.FooterCaption := L('main.search.clear');
   end;
   if Assigned(FSettings) then
   begin
@@ -1827,6 +2321,10 @@ procedure TMainForm.DockChanged(Sender: TObject);
 begin
   if not Assigned(FSettings) or not Assigned(FDock) then
     Exit;
+  { До LoadItems контрол ещё пуст: не затирать стартовый набор. }
+  if FStartupPhase < 2 then
+    Exit;
+  FSettings.DockSeedPending := False;
   { CollectState — быстро (только массивы в памяти). }
   FDock.CollectState(FSettings.DockItems, FSettings.DockItemX,
     FSettings.DockKinds, FSettings.DockCaptions, FSettings.DockIcons,
@@ -1835,6 +2333,78 @@ begin
   FSettings.DockShowSeparators := FDock.ShowSeparators;
   { Запись INI в фоне — не блокирует UI после reorder/drop. }
   FSettings.SaveDockAsync;
+  MarkSessionDirty;
+end;
+
+procedure TMainForm.MarkSessionDirty;
+begin
+  if (csDestroying in ComponentState) or not Assigned(FSettings) then
+    Exit;
+  if FStartupPhase < 2 then
+    Exit;
+  FSessionDirty := True;
+  if Assigned(FSessionTimer) and not FSessionTimer.Enabled then
+    FSessionTimer.Enabled := True;
+end;
+
+procedure TMainForm.SnapshotSession;
+var
+  HI: Integer;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  if Assigned(FSearchHist) then
+  begin
+    SetLength(FSettings.SearchHistory, FSearchHist.Count);
+    for HI := 0 to FSearchHist.Count - 1 do
+      FSettings.SearchHistory[HI] := FSearchHist[HI];
+  end;
+  PersistWindowState;
+  FSettings.SplitterPos := FLeftPanelRatio;
+  if FActivePanel = FRightPanel then
+    FSettings.ActivePanel := 1
+  else
+    FSettings.ActivePanel := 0;
+  if (FStartupPhase >= 2) and Assigned(FLeftPanel) then
+    FLeftPanel.CaptureTabs(FSettings.Left);
+  if (FStartupPhase >= 2) and Assigned(FRightPanel) then
+    FRightPanel.CaptureTabs(FSettings.Right);
+  if (FStartupPhase >= 2) and Assigned(FDock) then
+  begin
+    FDock.CollectState(FSettings.DockItems, FSettings.DockItemX,
+      FSettings.DockKinds, FSettings.DockCaptions, FSettings.DockIcons,
+      FSettings.DockIconLocked);
+    FSettings.DockAlign := FDock.AlignMode;
+    FSettings.DockShowSeparators := FDock.ShowSeparators;
+    FSettings.DockSeedPending := False;
+  end;
+  FSessionDirty := False;
+  FSessionSnap := True;
+  if Assigned(FSessionTimer) then
+    FSessionTimer.Enabled := False;
+end;
+
+procedure TMainForm.SessionTimerTick(Sender: TObject);
+begin
+  if Assigned(FSessionTimer) then
+    FSessionTimer.Enabled := False;
+  if (csDestroying in ComponentState) or not FSessionDirty then
+    Exit;
+  SnapshotSession;
+  if Assigned(FSettings) then
+  try
+    FSettings.SaveSessionAsync;
+  except
+  end;
+end;
+
+procedure TMainForm.KickFolderSizes;
+begin
+  AllowFolderSizeWalks;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.ArmFolderSizes;
+  if Assigned(FRightPanel) then
+    FRightPanel.ArmFolderSizes;
 end;
 
 function TMainForm.MakeMidButton(const AIcon, AHint: string;
@@ -1920,19 +2490,8 @@ begin
 end;
 
 function OpCountWord(N: Integer): string;
-var
-  M: Integer;
 begin
-  M := N mod 100;
-  if (M >= 11) and (M <= 14) then
-    Result := Format('%d операций', [N])
-  else
-    case N mod 10 of
-      1: Result := Format('%d операция', [N]);
-      2, 3, 4: Result := Format('%d операции', [N]);
-    else
-      Result := Format('%d операций', [N]);
-    end;
+  Result := LCount(N, 'main.ops.one', 'main.ops.few', 'main.ops.many');
 end;
 
 procedure TMainForm.OpHubChanged(Sender: TObject);
@@ -1953,15 +2512,29 @@ begin
     SyncOpRows;
 end;
 
+function TMainForm.OpPillOnRail: Boolean;
+begin
+  Result := Assigned(FOpPill) and
+    ((FOpPill.Parent = FMidGroup) or (FOpPill.Parent = FMidBar));
+end;
+
+procedure TMainForm.ParkOpPill;
+begin
+  if not Assigned(FOpPill) or not Assigned(FMidGroup) then
+    Exit;
+  if FOpPill.Parent <> FMidGroup then
+    FOpPill.Parent := FMidGroup;
+  FOpPill.SetBounds(4, FOpPillTop, MIDBAR_WIDTH - 8, OP_PILL_H);
+  FOpPill.Visible := False;
+end;
+
 procedure TMainForm.LayoutMidButtons;
 var
   Y0, Avail, Y: Single;
 begin
   if not Assigned(FMidBar) or not Assigned(FMidGroup) then
     Exit;
-  Y0 := 4;
-  if Assigned(FOpPill) and FOpPill.Visible and (FOpPill.Parent = FMidBar) then
-    Y0 := 4 + 28 + 6;
+  Y0 := MID_BTN_Y0;
   if FMidStackH <= 0 then
     FMidStackH := FMidGroup.Height;
   Avail := FMidBar.Height - Y0;
@@ -2279,7 +2852,7 @@ begin
   if Vis > 5 then
     Vis := 5;
   H := Vis * RowH;
-  if FOpPill.Parent <> FMidBar then
+  if not OpPillOnRail then
   begin
     Room := FOpPill.AbsoluteRect.Top - 12;
     if (Room > RowH) and (H > Room) then
@@ -2290,7 +2863,7 @@ begin
   FOpPop.Width := BodyW + PadL + PadR;
   FOpPop.Height := H + PadT + PadB;
   FOpPop.PlacementTarget := FOpPill;
-  if FOpPill.Parent = FMidBar then
+  if OpPillOnRail then
   begin
     OpenRight := Assigned(FActivePanel) and (FActivePanel = FLeftPanel);
     if OpenRight then
@@ -2333,10 +2906,10 @@ begin
   N := FileOpHubCount;
   if N = 0 then
   begin
-    FOpPill.Visible := False;
     if Assigned(FOpPop) and FOpPop.IsOpen then
       FOpPop.IsOpen := False;
     ClearFootInsets;
+    ParkOpPill;
     LayoutMidButtons;
     Exit;
   end;
@@ -2359,9 +2932,9 @@ begin
   FOpPill.Align := TAlignLayout.None;
   if OnRail then
   begin
-    if FOpPill.Parent <> FMidBar then
-      FOpPill.Parent := FMidBar;
-    FOpPill.SetBounds(4, 4, MIDBAR_WIDTH - 8, 28);
+    if FOpPill.Parent <> FMidGroup then
+      FOpPill.Parent := FMidGroup;
+    FOpPill.SetBounds(4, FOpPillTop, MIDBAR_WIDTH - 8, OP_PILL_H);
     FOpPillText.Visible := False;
     FOpPillArc.Visible := (N = 1) and (BadN = 0);
     FOpPillIcon.Visible := True;
@@ -2387,7 +2960,7 @@ begin
       FOpPillIcon.TextSettings.Font.Family := FluentFontFamily;
       FOpPillIcon.TextSettings.Font.Size := 12;
       FOpPillIcon.TextSettings.Font.Style := [TFontStyle.fsBold];
-      FOpPill.Hint := 'Фоновые операции';
+      FOpPill.Hint := L('main.ops.hint');
     end;
     ClearFootInsets;
   end
@@ -2432,7 +3005,7 @@ begin
         Cap := Cap + '  ' + V.PercentText;
     end
     else if (RunN = 0) and (BadN = 0) then
-      Cap := Format('В очереди %d', [QueN])
+      Cap := Lf('main.ops.queue', [QueN])
     else
       Cap := OpCountWord(N);
     W := 36 + MeasurePillText(Cap, 12);
@@ -2504,7 +3077,7 @@ begin
     if N = 1 then
       FOpPill.Hint := Cap
     else
-      FOpPill.Hint := 'Фоновые операции';
+      FOpPill.Hint := L('main.ops.hint');
   end;
   if BadN > 0 then
   begin
@@ -2538,9 +3111,10 @@ begin
   if not Assigned(FOpRows) then
     FOpRows := TObjectList<TObject>.Create(True);
   FOpPill := TRectangle.Create(Self);
-  FOpPill.Parent := FMidBar;
+  FOpPill.Parent := FMidGroup;
   FOpPill.Align := TAlignLayout.None;
   FOpPill.Visible := False;
+  FOpPill.SetBounds(4, FOpPillTop, MIDBAR_WIDTH - 8, OP_PILL_H);
   FOpPill.HitTest := True;
   FOpPill.Cursor := crHandPoint;
   FOpPill.XRadius := 8;
@@ -2550,7 +3124,7 @@ begin
   FOpPill.Fill.Color := FColors.ControlFill;
   FOpPill.OnClick := OpPillClick;
   FOpPill.ShowHint := True;
-  FOpPill.Hint := 'Фоновые операции';
+  FOpPill.Hint := L('main.ops.hint');
 
   FOpPillArc := TPaintBox.Create(Self);
   FOpPillArc.Parent := FOpPill;
@@ -2648,6 +3222,7 @@ begin
   FMidBar.XRadius := 6;
   FMidBar.YRadius := 6;
   FMidBar.HitTest := True;
+  FMidBar.ClipChildren := True;
 
   FMidGroup := TLayout.Create(Self);
   FMidGroup.Parent := FMidBar;
@@ -2655,72 +3230,122 @@ begin
   FMidGroup.Width := MIDBAR_WIDTH;
 
   Y := 0;
-  FCmdCopy := MakeMidButton('', 'Копировать (F5)', OnBtnCopyClick);
+  FCmdCopy := MakeMidButton('', L('cmd.copy'), OnBtnCopyClick);
   PlaceBtn(FCmdCopy);
-  FCmdMove := MakeMidButton('', 'Переместить (F6)', OnBtnMoveClick);
+  FCmdMove := MakeMidButton('', L('cmd.move'), OnBtnMoveClick);
   PlaceBtn(FCmdMove);
 
-  FCmdRename := MakeMidButton('', 'Переименовать (F2)', OnBtnRenameClick);
+  FCmdRename := MakeMidButton('', L('cmd.rename'), OnBtnRenameClick);
   PlaceBtn(FCmdRename);
-  FCmdArchive := MakeMidButton('', 'Архивировать (Alt+F5)', OnBtnArchiveClick);
+  FCmdArchive := MakeMidButton('', L('cmd.archive'), OnBtnArchiveClick);
   PlaceBtn(FCmdArchive);
   AddDivider;
-  FCmdDelete := MakeMidButton('', 'Удалить (F8)', OnBtnDeleteClick);
+  FCmdDelete := MakeMidButton('', L('cmd.delete'), OnBtnDeleteClick);
   PlaceBtn(FCmdDelete);
   AddDivider;
-  FCmdNewFolder := MakeMidButton('', 'Новая папка (F7)', OnBtnNewFolderClick);
+  FCmdNewFolder := MakeMidButton('', L('cmd.newfolder'), OnBtnNewFolderClick);
   PlaceBtn(FCmdNewFolder);
   AddDivider;
-  FCmdSearch := MakeMidButton('', 'Поиск (F4)', OnBtnSearchClick);
+  FCmdSearch := MakeMidButton('', L('cmd.search'), OnBtnSearchClick);
+  FCmdSearch.ClickWhileBusy := True;
   PlaceBtn(FCmdSearch);
-  FCmdSelect := MakeMidButton(#$E9D5, 'Выделение', OnBtnSelectClick);
+  FCmdSelect := MakeMidButton(#$E9D5, L('cmd.select'), OnBtnSelectClick);
   PlaceBtn(FCmdSelect);
-  FCmdRefresh := MakeMidButton('', 'Обновить', OnBtnRefreshClick);
+  FCmdRefresh := MakeMidButton('', L('cmd.refresh'), OnBtnRefreshClick);
   PlaceBtn(FCmdRefresh);
   AddDivider;
-  FCmdQuickView := MakeMidButton('', 'Быстрый просмотр (Ctrl+Q)', OnBtnQuickViewToggle);
+  FCmdQuickView := MakeMidButton('', L('cmd.quickview'), OnBtnQuickViewToggle);
   PlaceBtn(FCmdQuickView);
-  FCmdDetails := MakeMidButton('', 'Подробно', OnBtnViewDetailsClick);
+  FCmdDetails := MakeMidButton('', L('cmd.details'), OnBtnViewDetailsClick);
   PlaceBtn(FCmdDetails);
-  FCmdTiles := MakeMidButton('', 'Плитки', OnBtnViewTilesClick);
+  FCmdTiles := MakeMidButton('', L('cmd.tiles'), OnBtnViewTilesClick);
   PlaceBtn(FCmdTiles);
+  { Место пилюли занято всегда: показ только Visible, кнопки не прыгают. }
+  AddDivider;
+  FOpPillTop := Y;
+  Y := Y + BTN_H + BTN_GAP;
 
   FMidGroup.Height := Y;
   FMidStackH := Y;
   BuildOpPill;
-  LayoutMidButtons;
+  ApplyMinWindowHeight;
 
   FLastSelectMask := '*.*';
   FSelMenu := TFluentPopupMenu.Create(Self);
   FSelMenu.Parent := Self;
+  BuildSelMenu;
+end;
 
- FSelMenu.AddItem('Выделить всё', 'Ctrl+A', OnSelAll);
-
-  FSelMenu.AddItem('Сравнить каталоги', '', OnSelCompare);
-
+procedure TMainForm.BuildSelMenu;
+  function Mark(AOn: Boolean): string;
+  begin
+    if AOn then
+      Result := #$2713
+    else
+      Result := '';
+  end;
+begin
+  if FSelMenu = nil then
+    Exit;
+  FSelMenu.ClearItems;
+  FSelMenu.AddItem(L('main.sel.all'), 'Ctrl+A', OnSelAll);
+  FSelMenu.AddItem(L('main.sel.compare'), '', OnSelCompare);
   FSelMenu.AddSeparator;
-  FSelMenu.AddItem('Выделить только папки', '', OnSelFolders);
-  FSelMenu.AddItem('Выделить только файлы', '', OnSelFiles);
-   FSelMenu.AddItem('Снять с таким же типом', 'Alt+-', OnUnselExt);
-   FSelMenu.AddItem('Выделить с таким же типом', 'Alt++', OnSelExt);
-   FSelMenu.AddItem('Снять по маске...', '-', OnUnselMask);
-  FSelMenu.AddItem('Выделить по маске...', '+', OnSelMask);
+  FSelMenu.AddItem(L('main.sel.folders'), '', OnSelFolders);
+  FSelMenu.AddItem(L('main.sel.files'), '', OnSelFiles);
+  FSelMenu.AddItem(L('main.sel.unext'), 'Alt+-', OnUnselExt);
+  FSelMenu.AddItem(L('main.sel.ext'), 'Alt++', OnSelExt);
+  FSelMenu.AddItem(L('main.sel.unmask'), '-', OnUnselMask);
+  FSelMenu.AddItem(L('main.sel.mask'), '+', OnSelMask);
+  FSelMenu.AddSeparator;
+  FSelMenu.AddItem(L('main.sel.invert'), '*', OnSelInvert);
+  FSelMenu.AddItem(L('main.sel.none'), 'Ctrl+-', OnSelNone);
+  FSelMenu.AddSeparator;
+  FSelMenu.AddItem(L('set.sel.vibe'),
+    Mark(FSettings.MouseSelectMode <> msmExplorer), OnSelModeVibe);
+  FSelMenu.AddItem(L('set.sel.explorer'),
+    Mark(FSettings.MouseSelectMode = msmExplorer), OnSelModeExplorer);
+end;
 
+procedure TMainForm.SetMouseSelectMode(AExplorer: Boolean);
+var
+  Mode: TMouseSelectMode;
+begin
+  if AExplorer then
+    Mode := msmExplorer
+  else
+    Mode := msmVibe;
+  if FSettings.MouseSelectMode = Mode then
+    Exit;
+  FSettings.MouseSelectMode := Mode;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.SetExplorerMouse(AExplorer);
+  if Assigned(FRightPanel) then
+    FRightPanel.SetExplorerMouse(AExplorer);
+  FSettings.SaveAsync;
+end;
 
+procedure TMainForm.PanelMouseModePick(Sender: TObject; AExplorer: Boolean);
+begin
+  SetMouseSelectMode(AExplorer);
+end;
 
- FSelMenu.AddSeparator;
+procedure TMainForm.OnSelModeExplorer(Sender: TObject);
+begin
+  SetMouseSelectMode(True);
+end;
 
-   FSelMenu.AddItem('Инвертировать', '*', OnSelInvert);
-  FSelMenu.AddItem('Снять всё', 'Ctrl+-', OnSelNone);
-
+procedure TMainForm.OnSelModeVibe(Sender: TObject);
+begin
+  SetMouseSelectMode(False);
 end;
 
 procedure TMainForm.BuildFunctionBar;
 const
-  Caps: array[0..6] of string =
-    ('Переименовать', 'Просмотр', 'Поиск', 'Копирование', 'Переместить',
-     'Новая папка', 'Удалить');
   Keys: array[0..6] of string = ('F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8');
+  CapKeys: array[0..6] of string = (
+    'fn.rename', 'fn.view', 'fn.search', 'fn.copy', 'fn.move',
+    'fn.newfolder', 'fn.delete');
 var
   I: Integer;
   Handlers: array[0..6] of TNotifyEvent;
@@ -2731,19 +3356,7 @@ begin
   FFnBar.Height := FNBAR_HEIGHT;
   FFnBar.Stroke.Kind := TBrushKind.None;
   FFnBar.Fill.Kind := TBrushKind.Solid;
-  FFnBar.Padding.Rect := TRectF.Create(8, 5, 8, 6);
-
-  FCmdLine := TRectangle.Create(Self);
-  FCmdLine.Parent := FFnBar;
-  FCmdLine.Align := TAlignLayout.Top;
-  FCmdLine.Height := 30;
-  FCmdLine.Stroke.Kind := TBrushKind.None;
-  FCmdLine.Fill.Color := TAlphaColors.Null;
-  FCmdLine.Visible := False;
-  FCmdEdit := CreateFluentEdit(Self, FCmdLine);
-  FCmdEdit.Align := TAlignLayout.Client;
-  FCmdEdit.FillMode := fefSubtle;
-  FCmdEdit.OnSubmit := CmdLineSubmit;
+  FFnBar.Padding.Rect := TRectF.Create(0, 5, 0, 6);
 
   Handlers[0] := OnBtnRenameClick;
   Handlers[1] := OnBtnViewClick;
@@ -2762,7 +3375,7 @@ begin
     FFnCells[I].Height := 32;
 
     FFnButtons[I] := TFluentButton.Create(Self);
-    FFnButtons[I].Setup(FFnCells[I], '', Caps[I], fbkKey, Handlers[I]);
+    FFnButtons[I].Setup(FFnCells[I], '', L(CapKeys[I]), fbkKey, Handlers[I]);
     FFnButtons[I].Align := TAlignLayout.Client;
     FFnButtons[I].Margins.Rect := TRectF.Create(3, 0, 3, 0);
     FFnButtons[I].SetHotkey(Keys[I]);
@@ -2782,6 +3395,8 @@ begin
   FLeftPanel.OnPathChanged := LeftPanelPathChanged;
   FLeftPanel.OnQuickView := PanelQuickView;
   FLeftPanel.OnCursorChange := PanelCursorChanged;
+  FLeftPanel.OnStatusView := PanelStatusView;
+  FLeftPanel.OnMouseModePick := PanelMouseModePick;
 
   FRightPanel := TFilePanel.Create(Self);
   FRightPanel.Parent := FWorkArea;
@@ -2789,6 +3404,8 @@ begin
   FRightPanel.OnPathChanged := RightPanelPathChanged;
   FRightPanel.OnQuickView := PanelQuickView;
   FRightPanel.OnCursorChange := PanelCursorChanged;
+  FRightPanel.OnStatusView := PanelStatusView;
+  FRightPanel.OnMouseModePick := PanelMouseModePick;
 
   FCenterCluster := TLayout.Create(Self);
   FCenterCluster.Parent := FWorkArea;
@@ -2811,23 +3428,349 @@ begin
   LayoutWorkArea;
 end;
 
-procedure TMainForm.LayoutFunctionBar;
+procedure TMainForm.BuildCommandLine;
+begin
+  FCmdHist := TStringList.Create;
+  FCmdHistPos := -1;
+
+  FCmdBar := TLayout.Create(Self);
+  FCmdBar.Parent := Self;
+  FCmdBar.Align := TAlignLayout.Bottom;
+  FCmdBar.Height := CMDLINE_HEIGHT;
+  FCmdBar.Margins.Top := 4;
+  FCmdBar.Visible := False;
+  FCmdBar.HitTest := True;
+  FCmdBar.OnResize := CmdBarResize;
+
+  FCmdBack := TRectangle.Create(Self);
+  FCmdBack.Align := TAlignLayout.None;
+  FCmdBack.Parent := FCmdBar;
+  FCmdBack.Stroke.Kind := TBrushKind.None;
+  FCmdBack.Fill.Kind := TBrushKind.Solid;
+  FCmdBack.HitTest := True;
+
+  FCmdTopLine := TRectangle.Create(Self);
+  FCmdTopLine.Align := TAlignLayout.None;
+  FCmdTopLine.Parent := FCmdBar;
+  FCmdTopLine.Stroke.Kind := TBrushKind.None;
+  FCmdTopLine.Fill.Kind := TBrushKind.Solid;
+  FCmdTopLine.HitTest := False;
+
+  FCmdIcon := TText.Create(Self);
+  FCmdIcon.Align := TAlignLayout.None;
+  FCmdIcon.Parent := FCmdBar;
+  FCmdIcon.HitTest := False;
+  FCmdIcon.WordWrap := False;
+  FCmdIcon.Text := CMD_PROMPT_ICON;
+  FCmdIcon.TextSettings.Font.Family := FluentIconFamily;
+  FCmdIcon.Font.Family := FluentIconFamily;
+  FCmdIcon.TextSettings.Font.Size := 16;
+  FCmdIcon.Font.Size := 16;
+  FCmdIcon.TextSettings.HorzAlign := TTextAlign.Center;
+  FCmdIcon.TextSettings.VertAlign := TTextAlign.Center;
+
+  FCmdPath := TText.Create(Self);
+  FCmdPath.Align := TAlignLayout.None;
+  FCmdPath.Parent := FCmdBar;
+  FCmdPath.HitTest := True;
+  FCmdPath.ShowHint := True;
+  FCmdPath.WordWrap := False;
+  FCmdPath.TextSettings.Trimming := TTextTrimming.None;
+  FCmdPath.TextSettings.HorzAlign := TTextAlign.Trailing;
+  FCmdPath.TextSettings.VertAlign := TTextAlign.Center;
+  ApplyFluentText(FCmdPath, 13, False);
+
+  FCmdSplit := TRectangle.Create(Self);
+  FCmdSplit.Align := TAlignLayout.None;
+  FCmdSplit.Parent := FCmdBar;
+  FCmdSplit.Stroke.Kind := TBrushKind.None;
+  FCmdSplit.Fill.Kind := TBrushKind.Solid;
+  FCmdSplit.HitTest := False;
+  FCmdSplit.Visible := False;
+
+  FCmdEdit := TFluentEdit.Create(Self);
+  FCmdEdit.Align := TAlignLayout.None;
+  FCmdEdit.FillMode := fefSubtle;
+  FCmdEdit.OnSubmit := CmdLineSubmit;
+  FCmdEdit.OnCancel := CmdLineCancel;
+  FCmdEdit.Parent := FCmdBar;
+  { Док уже записал свой хук. Обёртка зовёт его, если точка не на строке. }
+  RegisterFileDragDropHook(TryCmdLineDrop);
+end;
+
+procedure TMainForm.CmdBarResize(Sender: TObject);
+begin
+  LayoutCmdBar;
+end;
+
+function FormatCmdPrompt(const APath: string): string;
+begin
+  Result := APath;
+  if Result = '' then
+    Exit;
+  { Корень диска остаётся C:\> . У остальных слэш перед > не нужен. }
+  if not ((Length(Result) = 3) and (Result[2] = ':') and
+          ((Result[3] = '\') or (Result[3] = '/'))) then
+    Result := ExcludeTrailingPathDelimiter(Result);
+  if (Length(Result) = 2) and (Result[2] = ':') then
+    Result := Result + '\';
+  Result := Result + '>';
+end;
+
+function FitCmdPathTail(const AText: string; AMaxW: Single): string;
+var
+  Lo, Hi, Mid: Integer;
+begin
+  Result := AText;
+  if AText = '' then
+    Exit;
+  if (AMaxW <= 0) or (MeasurePillText(AText, 13) <= AMaxW) then
+    Exit;
+  Lo := 1;
+  Hi := Length(AText);
+  while Lo < Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if MeasurePillText(Copy(AText, Mid, MaxInt), 13) <= AMaxW then
+      Hi := Mid
+    else
+      Lo := Mid + 1;
+  end;
+  Result := Copy(AText, Lo, MaxInt);
+end;
+
+function QuoteCmdToken(const AToken: string): string;
 var
   I: Integer;
-  CellW, TopY, CellH: Single;
+  Need: Boolean;
+  C: Char;
+begin
+  Need := False;
+  for I := 1 to Length(AToken) do
+  begin
+    C := AToken[I];
+    if (C <= ' ') or (Pos(C, '&^(),;="''%!<>|') > 0) then
+    begin
+      Need := True;
+      Break;
+    end;
+  end;
+  if not Need then
+    Exit(AToken);
+  Result := '"' + StringReplace(AToken, '"', '""', [rfReplaceAll]) + '"';
+end;
+
+function CmdDropToken(const APath: string; AFull: Boolean): string;
+var
+  P, Name: string;
+begin
+  Result := '';
+  P := APath;
+  if P = '' then
+    Exit;
+  if not ((Length(P) = 3) and (P[2] = ':') and
+          ((P[3] = '\') or (P[3] = '/'))) then
+    P := ExcludeTrailingPathDelimiter(P);
+  Name := ExtractFileName(P);
+  if (Name = '.') or (Name = '..') then
+    Exit;
+  if Name = '' then
+  begin
+    if (Length(P) >= 2) and (P[2] = ':') then
+      Name := P
+    else
+      Exit;
+  end;
+  if AFull then
+    Result := QuoteCmdToken(P)
+  else
+    Result := QuoteCmdToken(Name);
+end;
+
+procedure TMainForm.LayoutCmdBar;
+const
+  PathX = 32;
+  Gap = 2;
+  RightPad = 8;
+  MinEdit = 160;
+var
+  W, H, PathW, EditW, EditX, Avail, MaxPath, TextW: Single;
+  Shown: string;
+begin
+  if not Assigned(FCmdBar) or not Assigned(FCmdIcon) or not Assigned(FCmdPath) or
+     not Assigned(FCmdEdit) then
+    Exit;
+  W := FCmdBar.Width;
+  H := FCmdBar.Height;
+  if (W < 8) or (H < 8) then
+    Exit;
+  Avail := W - PathX - Gap - RightPad;
+  if Avail > MinEdit + 48 then
+    MaxPath := Avail - MinEdit
+  else
+    MaxPath := Max(36, Avail * 0.42);
+  Shown := FitCmdPathTail(FCmdPrompt, MaxPath);
+  if Shown = '' then
+    PathW := 0
+  else
+  begin
+    TextW := MeasurePillText(Shown, 13) + 2;
+    PathW := Min(MaxPath, TextW);
+  end;
+  EditX := PathX + PathW + Gap;
+  EditW := Max(0, W - EditX - RightPad);
+  if Assigned(FCmdBack) then
+    FCmdBack.SetBounds(0, 0, W, H);
+  if Assigned(FCmdTopLine) then
+    FCmdTopLine.SetBounds(0, 0, W, 1);
+  FCmdIcon.SetBounds(8, (H - 18) / 2, 18, 18);
+  if FCmdPath.Text <> Shown then
+    FCmdPath.Text := Shown;
+  FCmdPath.SetBounds(PathX, 0, PathW, H);
+  if Assigned(FCmdSplit) then
+    FCmdSplit.Visible := False;
+  FCmdEdit.SetBounds(EditX, (H - 28) / 2, EditW, 28);
+end;
+
+procedure TMainForm.SyncCmdPath;
+var
+  P: string;
+begin
+  if not Assigned(FCmdPath) or not Assigned(FActivePanel) then
+    Exit;
+  if FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming then
+    Exit;
+  P := FActivePanel.CurrentPath;
+  FCmdPrompt := FormatCmdPrompt(P);
+  FCmdPath.Hint := P;
+  LayoutCmdBar;
+end;
+
+function TMainForm.TryCmdLineDrop(const AScreen: TPointF;
+  const APaths: TArray<string>): Boolean;
+var
+  Local: TPointF;
+begin
+  Result := False;
+  if Assigned(FCmdBar) and FCmdBar.Visible and (FCmdBar.Height >= 8) then
+  begin
+    Local := FCmdBar.ScreenToLocal(AScreen);
+    if (Local.X >= 0) and (Local.Y >= 0) and
+       (Local.X < FCmdBar.Width) and (Local.Y < FCmdBar.Height) then
+    begin
+      { False: выделение панели остаётся, копии нет — строка не панель. }
+      InsertCmdDrop(APaths);
+      Exit;
+    end;
+  end;
+  if Assigned(FDock) then
+    Result := FDock.TryAcceptExternalDrop(AScreen, APaths);
+end;
+
+procedure TMainForm.InsertCmdDrop(const APaths: TArray<string>);
+var
+  Body, Token, Chunk, Lead, Trail: string;
+  S: string;
+  FromI, ToI: Integer;
+  Full: Boolean;
+begin
+  if not Assigned(FCmdEdit) or (Length(APaths) = 0) then
+    Exit;
+  Full := (GetKeyState(VK_SHIFT) and $8000) <> 0;
+  Body := '';
+  for S in APaths do
+  begin
+    Token := CmdDropToken(S, Full);
+    if Token = '' then
+      Continue;
+    if Body <> '' then
+      Body := Body + ' ';
+    Body := Body + Token;
+  end;
+  if Body = '' then
+    Exit;
+  FCmdEdit.QueryInsertPoint(FromI, ToI);
+  Lead := '';
+  Trail := ' ';
+  if (FromI > 0) and (FromI <= Length(FCmdEdit.Text)) and
+     (FCmdEdit.Text[FromI] <> ' ') then
+    Lead := ' ';
+  if (ToI < Length(FCmdEdit.Text)) and (FCmdEdit.Text[ToI + 1] = ' ') then
+    Trail := '';
+  Chunk := Lead + Body + Trail;
+  FCmdEdit.InsertSnippet(Chunk);
+  FCmdHistPos := -1;
+end;
+
+function TMainForm.CmdLineFocused: Boolean;
+begin
+  Result := Assigned(FCmdEdit) and FCmdEdit.IsFocused;
+end;
+
+procedure TMainForm.RememberCmd(const ACmd: string);
+begin
+  if (ACmd = '') or not Assigned(FCmdHist) then
+    Exit;
+  FCmdHist.Add(ACmd);
+  while FCmdHist.Count > CMD_HIST_MAX do
+    FCmdHist.Delete(0);
+  FCmdHistPos := -1;
+  FCmdDraft := '';
+end;
+
+procedure TMainForm.CmdHistStep(ADelta: Integer);
+begin
+  if not Assigned(FCmdEdit) or not Assigned(FCmdHist) or (FCmdHist.Count = 0) then
+    Exit;
+  if FCmdHistPos < 0 then
+  begin
+    if ADelta > 0 then
+      Exit;
+    FCmdDraft := FCmdEdit.Text;
+    FCmdHistPos := FCmdHist.Count - 1;
+  end
+  else
+  begin
+    FCmdHistPos := FCmdHistPos + ADelta;
+    if FCmdHistPos >= FCmdHist.Count then
+    begin
+      FCmdHistPos := -1;
+      FCmdEdit.Text := FCmdDraft;
+      Exit;
+    end;
+    if FCmdHistPos < 0 then
+      FCmdHistPos := 0;
+  end;
+  FCmdEdit.Text := FCmdHist[FCmdHistPos];
+end;
+
+procedure TMainForm.CmdLineCancel(Sender: TObject);
+begin
+  if Assigned(FActivePanel) and FActivePanel.CanFocus then
+    FActivePanel.SetFocus;
+end;
+
+procedure TMainForm.LayoutFunctionBar;
+const
+  KeyGap = 3;
+var
+  I: Integer;
+  CellW, CellH, Origin, Span: Single;
 begin
   if not Assigned(FFnBar) then
     Exit;
-  TopY := 0;
-  if Assigned(FCmdLine) and FCmdLine.Visible then
-    TopY := FCmdLine.Height;
-  CellW := Max(70, (FFnBar.Width - FFnBar.Padding.Left - FFnBar.Padding.Right) / 7);
-  CellH := FFnBar.Height - FFnBar.Padding.Top - FFnBar.Padding.Bottom - TopY;
+  { Край кнопок совпадает с краем файловой панели. Поля кнопок — только зазор между ними. }
+  Origin := WORK_PAD_L - KeyGap;
+  Span := FFnBar.Width - WORK_PAD_L - WORK_PAD_R + KeyGap * 2;
+  if Span < 7 then
+    Span := 7;
+  CellW := Max(70, Span / 7);
+  CellH := FFnBar.Height - FFnBar.Padding.Top - FFnBar.Padding.Bottom;
   if CellH < 24 then
     CellH := 24;
   for I := 0 to 6 do
     if Assigned(FFnCells[I]) then
-      FFnCells[I].SetBounds(I * CellW, TopY, CellW, CellH);
+      FFnCells[I].SetBounds(Origin + I * CellW, FFnBar.Padding.Top, CellW, CellH);
 end;
 
 function TMainForm.CenterBandWidth: Single;
@@ -2989,6 +3932,7 @@ end;
 
 procedure TMainForm.FormResizeHandler(Sender: TObject);
 begin
+  MarkSessionDirty;
   UpdateWindowButtons;
   LayoutQuickSearch;
   LayoutWorkArea;
@@ -2996,15 +3940,18 @@ begin
   CaptureNormalGeometry;
 
   LayoutFunctionBar;
+  LayoutCmdBar;
 end;
 
 procedure TMainForm.LeftPanelPathChanged(Sender: TObject; const APath: string);
 begin
+  MarkSessionDirty;
   UsePanel(FLeftPanel, False);
 end;
 
 procedure TMainForm.RightPanelPathChanged(Sender: TObject; const APath: string);
 begin
+  MarkSessionDirty;
   UsePanel(FRightPanel, False);
 end;
 
@@ -3049,52 +3996,172 @@ begin
   UpdateViewButtons;
 end;
 
+procedure TMainForm.ArmPreviewDebounce;
+begin
+  if FPreviewDebounce = nil then
+  begin
+    FPreviewDebounce := TTimer.Create(Self);
+    FPreviewDebounce.Interval := 300;
+    FPreviewDebounce.OnTimer := PreviewDebounceTick;
+  end;
+  FPreviewDebounce.Enabled := False;
+  FPreviewDebounce.Enabled := True;
+end;
+
+function TMainForm.QuickViewFollows: Boolean;
+begin
+  Result := Assigned(FSettings) and FSettings.FollowCursor and
+    Assigned(FQuickView) and FQuickView.Visible;
+end;
+
+procedure TMainForm.FollowQuickViewWindow(const APath: string);
+begin
+  if (APath = '') or not QuickViewFollows then
+    Exit;
+  FQuickView.FollowFile(APath);
+end;
+
+procedure TMainForm.FollowActivePanelPreview;
+var
+  Entry: TFileEntry;
+  Path: string;
+begin
+  if csDestroying in ComponentState then
+    Exit;
+  if not QuickViewFollows then
+    Exit;
+  if not Assigned(FActivePanel) or FActivePanel.IsOffline then
+  begin
+    FPreviewWindowPending := '';
+    Exit;
+  end;
+  if not FActivePanel.GetFocusedEntry(Entry) then
+  begin
+    FPreviewWindowPending := '';
+    Exit;
+  end;
+  Path := Entry.FullPath;
+  if IsRemotePath(Path) or IsRemotePath(FActivePanel.CurrentPath) then
+  begin
+    FPreviewWindowPending := Path;
+    if not (Assigned(FPreviewDebounce) and FPreviewDebounce.Enabled) then
+    begin
+      FPreviewPending := '';
+      ArmPreviewDebounce;
+    end;
+    Exit;
+  end;
+  FPreviewWindowPending := '';
+  FQuickView.FollowFile(Path);
+end;
+
+procedure TMainForm.CloseColumnQuickView;
+begin
+  if Assigned(FLeftPanel) and FLeftPanel.IsPreviewActive then
+    FLeftPanel.HidePreview;
+  if Assigned(FRightPanel) and FRightPanel.IsPreviewActive then
+    FRightPanel.HidePreview;
+end;
+
+procedure TMainForm.ApplyPanelView(APanel: TFilePanel; AMode: TPanelViewMode);
+begin
+  if not Assigned(APanel) then
+    Exit;
+  CloseColumnQuickView;
+  if APanel.ViewMode <> AMode then
+    APanel.SetViewMode(AMode);
+  if APanel.CanFocus then
+    APanel.SetFocus;
+  UpdateViewButtons;
+end;
+
+procedure TMainForm.PanelStatusView(Sender: TObject; AMode: TPanelViewMode);
+begin
+  if Sender is TFilePanel then
+    ApplyPanelView(TFilePanel(Sender), AMode);
+end;
+
 procedure TMainForm.PanelCursorChanged(Sender: TObject);
 var
   Other: TFilePanel;
   Entry: TFileEntry;
-  Path: string;
+  ColumnPath, WindowPath: string;
+  ColumnOn, HasEntry, Remote: Boolean;
 begin
+  MarkSessionDirty;
   if Sender <> FActivePanel then
     Exit;
+  SyncCmdPath;
+  if not Assigned(FActivePanel) then
+    Exit;
   Other := OtherPanel(FActivePanel);
-  if (Other = nil) or not Other.IsPreviewActive then
-    Exit;
-  if Assigned(FActivePanel) and FActivePanel.IsOffline then
-    Exit;
-  if FActivePanel.GetFocusedEntry(Entry) then
-    Path := Entry.FullPath
-  else
-    Path := FActivePanel.CurrentPath;
-  if IsRemotePath(Path) or (Assigned(FActivePanel) and IsRemotePath(FActivePanel.CurrentPath)) then
+  ColumnOn := (Other <> nil) and Other.IsPreviewActive;
+  HasEntry := FActivePanel.GetFocusedEntry(Entry);
+  if HasEntry then
   begin
-    FPreviewPending := Path;
-    if FPreviewDebounce = nil then
-    begin
-      FPreviewDebounce := TTimer.Create(Self);
-      FPreviewDebounce.Interval := 300;
-      FPreviewDebounce.OnTimer := PreviewDebounceTick;
-    end;
-    FPreviewDebounce.Enabled := False;
-    FPreviewDebounce.Enabled := True;
+    ColumnPath := Entry.FullPath;
+    WindowPath := Entry.FullPath;
+  end
+  else
+  begin
+    ColumnPath := FActivePanel.CurrentPath;
+    WindowPath := '';
+  end;
+  if not QuickViewFollows then
+    WindowPath := '';
+  if FActivePanel.IsOffline then
+  begin
+    FPreviewWindowPending := '';
     Exit;
   end;
-  Other.PreviewFile(Path);
+  if (not ColumnOn) and (WindowPath = '') then
+  begin
+    FPreviewWindowPending := '';
+    Exit;
+  end;
+  Remote := IsRemotePath(ColumnPath) or IsRemotePath(FActivePanel.CurrentPath);
+  if (WindowPath <> '') and IsRemotePath(WindowPath) then
+    Remote := True;
+  if Remote then
+  begin
+    if ColumnOn then
+      FPreviewPending := ColumnPath
+    else
+      FPreviewPending := '';
+    FPreviewWindowPending := WindowPath;
+    ArmPreviewDebounce;
+    Exit;
+  end;
+  if Assigned(FPreviewDebounce) then
+    FPreviewDebounce.Enabled := False;
+  FPreviewPending := '';
+  FPreviewWindowPending := '';
+  if ColumnOn then
+    Other.PreviewFile(ColumnPath);
+  if WindowPath <> '' then
+    FollowQuickViewWindow(WindowPath);
 end;
 
 procedure TMainForm.PreviewDebounceTick(Sender: TObject);
 var
   Other: TFilePanel;
+  ColumnPath, WindowPath: string;
 begin
   if Assigned(FPreviewDebounce) then
     FPreviewDebounce.Enabled := False;
-  if FPreviewPending = '' then
+  ColumnPath := FPreviewPending;
+  WindowPath := FPreviewWindowPending;
+  FPreviewPending := '';
+  FPreviewWindowPending := '';
+  if (ColumnPath = '') and (WindowPath = '') then
     Exit;
   if Assigned(FActivePanel) and FActivePanel.IsOffline then
     Exit;
   Other := OtherPanel(FActivePanel);
-  if (Other <> nil) and Other.IsPreviewActive then
-    Other.PreviewFile(FPreviewPending);
+  if (ColumnPath <> '') and (Other <> nil) and Other.IsPreviewActive then
+    Other.PreviewFile(ColumnPath);
+  if WindowPath <> '' then
+    FollowQuickViewWindow(WindowPath);
 end;
 
 procedure TMainForm.ShowQuickViewWindow(const APath: string);
@@ -3138,11 +4205,26 @@ begin
   Frm := TSettingsForm.Create(Self, FSettings, OnThemeChangedFromSettings);
   try
     Frm.OnOptionsChanged :=
+      procedure(const AApply: TSettingsApplySet)
+      begin
+        if saFileOp in AApply then
+          SetFileOpMode(FSettings.FileOpMode);
+        if saBands in AApply then
+          ApplyBandLayout;
+        if saPanels in AApply then
+          ApplyPanelSettings;
+        if saBehavior in AApply then
+          ApplySessionBehavior;
+      end;
+    Frm.OnTintChanged :=
       procedure
       begin
-        { Без ApplyThemeToAll — полная перерисовка темы на каждый чекбокс вешала UI. }
-        SetFileOpMode(FSettings.FileOpMode);
-        ApplyDriveOptions;
+        ApplyWindowBackground;
+      end;
+    Frm.OnLanguageChanged :=
+      procedure
+      begin
+        ApplyLanguage;
       end;
     Frm.ApplyTheme(FColors);
     Frm.ShowModal;
@@ -3151,24 +4233,285 @@ begin
   end;
 end;
 
+function CmdStartsWithCmd(const ACmd: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(ACmd);
+  Result := False;
+  if S = '' then
+    Exit;
+  if (S <> '') and (S[1] = '"') then
+    Delete(S, 1, 1);
+  if Length(S) < 3 then
+    Exit;
+  if not SameText(Copy(S, 1, 3), 'cmd') then
+    Exit;
+  if Length(S) = 3 then
+    Exit(True);
+  Result := CharInSet(S[4], [' ', #9, '.', '"']);
+end;
+
+function NormalizeCmdPath(const APath: string): string;
+var
+  S, Part: string;
+  Parts: TArray<string>;
+  Stack: TList<string>;
+  Unc: Boolean;
+  I: Integer;
+begin
+  S := StringReplace(Trim(APath), '/', '\', [rfReplaceAll]);
+  Unc := (Length(S) >= 2) and (S[1] = '\') and (S[2] = '\');
+  Parts := S.Split(['\']);
+  Stack := TList<string>.Create;
+  try
+    for I := 0 to High(Parts) do
+    begin
+      Part := Parts[I];
+      if (Part = '') or (Part = '.') then
+        Continue;
+      if Part = '..' then
+      begin
+        if Unc and (Stack.Count <= 2) then
+          Continue;
+        if (not Unc) and (Stack.Count = 1) and (Length(Stack[0]) = 2) and
+           (Stack[0][2] = ':') then
+          Continue;
+        if Stack.Count > 0 then
+          Stack.Delete(Stack.Count - 1);
+        Continue;
+      end;
+      Stack.Add(Part);
+    end;
+    Result := '';
+    for I := 0 to Stack.Count - 1 do
+    begin
+      if Result <> '' then
+        Result := Result + '\';
+      Result := Result + Stack[I];
+    end;
+    if Unc then
+      Result := '\\' + Result;
+    if (not Unc) and (Length(Result) = 2) and (Result[2] = ':') then
+      Result := Result + '\';
+  finally
+    Stack.Free;
+  end;
+end;
+
+function CombineCmdPath(const ABase, ARel: string): string;
+var
+  Rel, Base, Root: string;
+  P, N: Integer;
+begin
+  Rel := Trim(ARel);
+  if Length(Rel) >= 2 then
+    if (Rel[1] = '"') and (Rel[Length(Rel)] = '"') then
+      Rel := Trim(Copy(Rel, 2, Length(Rel) - 2));
+  Rel := StringReplace(Rel, '/', '\', [rfReplaceAll]);
+  if Rel = '' then
+    Exit(ABase);
+  if Length(Rel) >= 2 then
+    if ((Rel[1] = '\') and (Rel[2] = '\')) or (Rel[2] = ':') then
+      Exit(NormalizeCmdPath(Rel));
+  Base := ABase;
+  if Rel[1] = '\' then
+  begin
+    if (Length(Base) >= 2) and (Base[2] = ':') then
+      Exit(NormalizeCmdPath(Copy(Base, 1, 2) + Rel));
+    if (Length(Base) >= 2) and (Base[1] = '\') and (Base[2] = '\') then
+    begin
+      Root := Base;
+      P := 3;
+      N := 0;
+      while P <= Length(Base) do
+      begin
+        if Base[P] = '\' then
+        begin
+          Inc(N);
+          if N = 2 then
+          begin
+            Root := Copy(Base, 1, P - 1);
+            Break;
+          end;
+        end;
+        Inc(P);
+      end;
+      Root := ExcludeTrailingPathDelimiter(Root);
+      Exit(NormalizeCmdPath(Root + Rel));
+    end;
+  end;
+  Result := NormalizeCmdPath(IncludeTrailingPathDelimiter(Base) + Rel);
+end;
+
+function ParseCmdCd(const ACmd, ABase: string; out ATarget: string): Integer;
+var
+  S, Rest: string;
+begin
+  { 0 — не cd, 1 — cd без пути, 2 — есть путь. }
+  Result := 0;
+  ATarget := '';
+  S := Trim(ACmd);
+  if Length(S) < 2 then
+    Exit;
+  if (UpCase(S[1]) <> 'C') or (UpCase(S[2]) <> 'D') then
+    Exit;
+  if Length(S) > 2 then
+  begin
+    if not CharInSet(S[3], [' ', #9, '.', '\', '/']) then
+      Exit;
+    Rest := Trim(Copy(S, 3, MaxInt));
+  end
+  else
+    Rest := '';
+  if Length(Rest) >= 2 then
+    if (Rest[1] = '/') and (UpCase(Rest[2]) = 'D') then
+      if Length(Rest) = 2 then
+        Rest := ''
+      else if Rest[3] <= ' ' then
+        Rest := Trim(Copy(Rest, 3, MaxInt));
+  if Rest <> '' then
+    if Rest[1] = '"' then
+  begin
+    if Rest[Length(Rest)] = '"' then
+      Rest := Copy(Rest, 2, Length(Rest) - 2)
+    else
+      Rest := Copy(Rest, 2, MaxInt);
+    Rest := Trim(Rest);
+  end;
+  if Rest = '' then
+    Exit(1);
+  ATarget := CombineCmdPath(ABase, Rest);
+  Result := 2;
+end;
+
+function LaunchCmdLine(const ACmd, AWorkDir: string): Boolean;
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  Line, Work: string;
+  Dir: PChar;
+  Flags: DWORD;
+begin
+  Result := False;
+  { Окно консоли только у cmd. Остальное запускает скрытый cmd /c. }
+  if CmdStartsWithCmd(ACmd) then
+  begin
+    Line := ACmd;
+    Flags := CREATE_NEW_CONSOLE;
+  end
+  else
+  begin
+    Line := 'cmd.exe /c ' + ACmd;
+    Flags := CREATE_NO_WINDOW;
+  end;
+  UniqueString(Line);
+  Work := AWorkDir;
+  if (Work = '') or IsThisPCPath(Work) or IsVirtualShellPath(Work) then
+    Dir := nil
+  else
+  begin
+    if Length(Work) >= 2 then
+    begin
+      if (Work[2] = ':') and (Length(ExcludeTrailingPathDelimiter(Work)) = 2) then
+        Work := Copy(Work, 1, 2) + '\'
+      else
+        Work := ExcludeTrailingPathDelimiter(Work);
+    end
+    else
+      Work := ExcludeTrailingPathDelimiter(Work);
+    Dir := PChar(Work);
+  end;
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  FillChar(PI, SizeOf(PI), 0);
+  if not CreateProcess(nil, PChar(Line), nil, nil, False, Flags,
+    nil, Dir, SI, PI) then
+    Exit;
+  CloseHandle(PI.hThread);
+  CloseHandle(PI.hProcess);
+  Result := True;
+end;
+
 procedure TMainForm.CmdLineSubmit(Sender: TObject);
 var
-  Cmd: string;
+  Cmd, Target, Base: string;
+  CdKind: Integer;
 begin
   if not Assigned(FCmdEdit) then
     Exit;
   Cmd := Trim(FCmdEdit.Text);
   if Cmd = '' then
     Exit;
-  OpenFileWithDefaultApp(Cmd);
+  RememberCmd(Cmd);
+  Base := '';
+  if Assigned(FActivePanel) then
+    Base := FActivePanel.CurrentPath;
+  CdKind := ParseCmdCd(Cmd, Base, Target);
+  if CdKind = 1 then
+    Exit;
+  if CdKind = 2 then
+  begin
+    if not Assigned(FActivePanel) then
+      Exit;
+    if not IsListablePath(Target) then
+    begin
+      FActivePanel.ShowNotice(L('main.notice.nofolder'));
+      Exit;
+    end;
+    FActivePanel.Navigate(Target);
+    FCmdEdit.Text := '';
+    FCmdHistPos := -1;
+    Exit;
+  end;
+  if not LaunchCmdLine(Cmd, Base) then
+  begin
+    if Assigned(FActivePanel) then
+      FActivePanel.ShowNotice(L('main.notice.nolaunch'));
+    Exit;
+  end;
+  FCmdEdit.Text := '';
+  FCmdHistPos := -1;
 end;
 
-procedure TMainForm.ApplyDriveOptions;
+procedure TMainForm.ApplyWindowBackground;
+var
+  Chrome: TThemeColors;
+{$IFDEF MSWINDOWS}
+  CapColor: COLORREF;
+  Wnd: HWND;
+{$ENDIF}
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  FColors := GetThemeColors(FSettings.Theme);
+  Chrome := FColors;
+  TintChromeForMaterial(Chrome, FSettings.WindowMaterial);
+  Fill.Kind := TBrushKind.Solid;
+  Fill.Color := Chrome.Background;
+  if Assigned(FTitleBar) then
+    FTitleBar.Fill.Color := Chrome.TitleBarBackground;
+  {$IFDEF MSWINDOWS}
+  if (FSettings.WindowMaterial = wmNormal) and (FFrameHooked or FStartupDone) then
+  begin
+    Wnd := FormToHWND(Self);
+    if Wnd <> 0 then
+    begin
+      CapColor := AlphaToColorRef(Chrome.TitleBarBackground);
+      DwmSetWindowAttribute(Wnd, 35, @CapColor, SizeOf(CapColor));
+      DwmSetWindowAttribute(Wnd, 34, @CapColor, SizeOf(CapColor));
+    end;
+  end;
+  {$ENDIF}
+end;
+
+procedure TMainForm.ApplyBandLayout;
 var
   I: Integer;
   FnH: Single;
 begin
-  SetFileOpMode(FSettings.FileOpMode);
+  if not Assigned(FSettings) then
+    Exit;
   if Assigned(FDock) then
   begin
     FDock.Visible := FSettings.ShowDock;
@@ -3181,35 +4524,122 @@ begin
   end;
   ApplyCenterBandLayout;
 
-  if Assigned(FCmdLine) then
-    FCmdLine.Visible := FSettings.ShowCommandLine;
+  if Assigned(FCmdBar) then
+  begin
+    FCmdBar.Visible := FSettings.ShowCommandLine;
+    if FSettings.ShowCommandLine then
+    begin
+      FCmdBar.Height := CMDLINE_HEIGHT;
+      FCmdBar.Margins.Top := 4;
+    end
+    else
+    begin
+      FCmdBar.Height := 0;
+      FCmdBar.Margins.Top := 0;
+    end;
+  end;
   FnH := 0;
   if FSettings.ShowFnBar then
-    FnH := FnH + FNBAR_HEIGHT;
-  if FSettings.ShowCommandLine then
-    FnH := FnH + 30;
+    FnH := FNBAR_HEIGHT;
   if Assigned(FFnBar) then
   begin
-    FFnBar.Visible := FSettings.ShowFnBar or FSettings.ShowCommandLine;
-    FFnBar.Height := FnH;
+    FFnBar.Visible := FSettings.ShowFnBar;
+    if FSettings.ShowFnBar then
+      FFnBar.Height := FnH;
   end;
   for I := 0 to 6 do
     if Assigned(FFnCells[I]) then
       FFnCells[I].Visible := FSettings.ShowFnBar;
 
+  LayoutWorkArea;
+  LayoutFunctionBar;
+  LayoutCmdBar;
+  SyncCmdPath;
+  ApplyMinWindowHeight;
+end;
+
+procedure TMainForm.ApplyPanelSettings;
+begin
+  if not Assigned(FSettings) then
+    Exit;
   if Assigned(FLeftPanel) then
     FLeftPanel.ApplyUiSettings(FSettings);
   if Assigned(FRightPanel) then
     FRightPanel.ApplyUiSettings(FSettings);
+end;
+
+procedure TMainForm.ApplyDriveOptions;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  SetFileOpMode(FSettings.FileOpMode);
+  ApplyBandLayout;
+  ApplyPanelSettings;
   if Assigned(GlobalThumbCache) then
     GlobalThumbCache.Configure(FSettings.ThumbCacheEnabled, FSettings.ThumbCacheMaxItems);
-  LayoutWorkArea;
-  LayoutFunctionBar;
+  ApplySessionBehavior;
+end;
+
+procedure TMainForm.ApplySessionBehavior;
+{$IFDEF MSWINDOWS}
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  RunValue = 'VibeCmd';
+var
+  Reg: TRegistry;
+  Want, Have: string;
+  H: THandle;
+{$ENDIF}
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  FSettings.SaveBehavior;
+  {$IFDEF MSWINDOWS}
+  if FSettings.SingleInstance then
+  begin
+    if GAppMutex = 0 then
+    begin
+      H := CreateMutex(nil, True, APP_MUTEX_NAME);
+      if H <> 0 then
+        GAppMutex := H;
+    end;
+  end
+  else if GAppMutex <> 0 then
+  begin
+    CloseHandle(GAppMutex);
+    GAppMutex := 0;
+  end;
+
+  Want := '"' + ParamStr(0) + '"';
+  Reg := TRegistry.Create(KEY_READ or KEY_WRITE);
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    if not Reg.OpenKey(RunKey, FSettings.AutoStart) then
+      Exit;
+    try
+      Have := '';
+      if Reg.ValueExists(RunValue) then
+        Have := Reg.ReadString(RunValue);
+      if FSettings.AutoStart then
+      begin
+        if not SameText(Have, Want) then
+          Reg.WriteString(RunValue, Want);
+      end
+      else if Have <> '' then
+        Reg.DeleteValue(RunValue);
+    finally
+      Reg.CloseKey;
+    end;
+  finally
+    Reg.Free;
+  end;
+  {$ENDIF}
 end;
 
 procedure TMainForm.OnThemeChangedFromSettings(NewTheme: TAppTheme);
 begin
   FSettings.Theme := NewTheme;
+  ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
   FColors := GetThemeColors(NewTheme);
   ApplyThemeToAll(FColors);
 end;
@@ -3235,15 +4665,80 @@ begin
       (FLeftPanel.IsPreviewActive or FRightPanel.IsPreviewActive));
 end;
 
+procedure TMainForm.ApplyLanguage;
+begin
+  if Assigned(FCmdCopy) then
+    FCmdCopy.Hint := L('cmd.copy');
+  if Assigned(FCmdMove) then
+    FCmdMove.Hint := L('cmd.move');
+  if Assigned(FCmdRename) then
+    FCmdRename.Hint := L('cmd.rename');
+  if Assigned(FCmdArchive) then
+    FCmdArchive.Hint := L('cmd.archive');
+  if Assigned(FCmdDelete) then
+    FCmdDelete.Hint := L('cmd.delete');
+  if Assigned(FCmdNewFolder) then
+    FCmdNewFolder.Hint := L('cmd.newfolder');
+  if Assigned(FCmdSearch) then
+    FCmdSearch.Hint := L('cmd.search');
+  if Assigned(FCmdSelect) then
+    FCmdSelect.Hint := L('cmd.select');
+  if Assigned(FCmdRefresh) then
+    FCmdRefresh.Hint := L('cmd.refresh');
+  if Assigned(FCmdQuickView) then
+    FCmdQuickView.Hint := L('cmd.quickview');
+  if Assigned(FCmdDetails) then
+    FCmdDetails.Hint := L('cmd.details');
+  if Assigned(FCmdTiles) then
+    FCmdTiles.Hint := L('cmd.tiles');
+  if Assigned(FFnButtons[0]) then
+    FFnButtons[0].SetCaption(L('fn.rename'));
+  if Assigned(FFnButtons[1]) then
+    FFnButtons[1].SetCaption(L('fn.view'));
+  if Assigned(FFnButtons[2]) then
+    FFnButtons[2].SetCaption(L('fn.search'));
+  if Assigned(FFnButtons[3]) then
+    FFnButtons[3].SetCaption(L('fn.copy'));
+  if Assigned(FFnButtons[4]) then
+    FFnButtons[4].SetCaption(L('fn.move'));
+  if Assigned(FFnButtons[5]) then
+    FFnButtons[5].SetCaption(L('fn.newfolder'));
+  if Assigned(FFnButtons[6]) then
+    FFnButtons[6].SetCaption(L('fn.delete'));
+  BuildSelMenu;
+  if Assigned(FOpPill) then
+    FOpPill.Hint := L('main.ops.hint');
+  if Assigned(FQuickSearch) then
+  begin
+    FQuickSearch.TextPrompt := L('main.search.prompt');
+    FQuickSearch.FooterCaption := L('main.search.clear');
+  end;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.ApplyLanguage;
+  if Assigned(FRightPanel) then
+    FRightPanel.ApplyLanguage;
+  if Assigned(FDock) then
+    FDock.ApplyLanguage;
+  if Assigned(FQuickView) then
+    FQuickView.ApplyLanguage;
+end;
+
 procedure TMainForm.ApplyThemeToAll(const AColors: TThemeColors);
 var
   I: Integer;
-  Chrome: TThemeColors;
+  Chrome, PanelColors: TThemeColors;
 begin
   FColors := AColors;
   SetActiveAppTheme(FSettings.Theme);
   Chrome := AColors;
   TintChromeForMaterial(Chrome, FSettings.WindowMaterial);
+  PanelColors := AColors;
+  PanelColors.PanelBackground := Chrome.PanelBackground;
+  PanelColors.HeaderBackground := Chrome.HeaderBackground;
+  { Смешение вкладок читает Background. Та же альфа, что у шапки,
+    иначе полупрозрачный заголовок и плотный фон дают более густую вкладку. }
+  PanelColors.Background := ThemeAdjustAlpha(AColors.Background,
+    TAlphaColorRec(Chrome.HeaderBackground).A);
   Fill.Kind := TBrushKind.Solid;
   Fill.Color := Chrome.Background;
   {$IFDEF MSWINDOWS}
@@ -3314,14 +4809,30 @@ begin
         TRectangle(FMidGroup.Controls[I]).Fill.Color := AColors.DividerColor;
 
   FFnBar.Fill.Color := Chrome.FooterBackground;
+  if Assigned(FCmdBack) then
+    FCmdBack.Fill.Color := AColors.PanelBackground;
+  if Assigned(FCmdTopLine) then
+    FCmdTopLine.Fill.Color := AColors.DividerColor;
+  if Assigned(FCmdSplit) then
+    FCmdSplit.Fill.Color := AColors.DividerColor;
+  if Assigned(FCmdIcon) then
+  begin
+    FCmdIcon.TextSettings.FontColor := AColors.SubTextColor;
+    FCmdIcon.Color := AColors.SubTextColor;
+  end;
+  if Assigned(FCmdPath) then
+  begin
+    FCmdPath.TextSettings.FontColor := AColors.SubTextColor;
+    FCmdPath.Color := AColors.SubTextColor;
+  end;
   if Assigned(FCmdEdit) then
     FCmdEdit.ApplyTheme(AColors);
   for I := 0 to 6 do
     if Assigned(FFnButtons[I]) then
       FFnButtons[I].ApplyTheme(AColors);
 
-  FLeftPanel.ApplyTheme(AColors);
-  FRightPanel.ApplyTheme(AColors);
+  FLeftPanel.ApplyTheme(PanelColors);
+  FRightPanel.ApplyTheme(PanelColors);
   if Assigned(FSearchForm) then
     FSearchForm.ApplyTheme(AColors);
   UpdateViewButtons;
@@ -3363,12 +4874,12 @@ begin
   Dest := ADestPanel;
   if Assigned(Src) and Src.IsOffline then
   begin
-    Src.ShowNotice('Нет связи');
+    Src.ShowNotice(L('main.notice.nolink'));
     Exit;
   end;
   if Assigned(Dest) and Dest.IsOffline then
   begin
-    Dest.ShowNotice('Нет связи');
+    Dest.ShowNotice(L('main.notice.nolink'));
     Exit;
   end;
 
@@ -3384,7 +4895,7 @@ begin
           Dest.Refresh;
         if Assigned(Src) then
           Src.Refresh(FocusPath);
-        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         begin
           if Assigned(Src) then
             Src.ShowNotice(ErrorMsg)
@@ -3405,7 +4916,7 @@ begin
           Dest.Refresh;
         if Assigned(Src) then
           Src.InvalidateView;
-        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         begin
           if Assigned(Src) then
             Src.ShowNotice(ErrorMsg)
@@ -3502,6 +5013,8 @@ var
   FocusPath: string;
   I: Integer;
 begin
+  if Assigned(FActivePanel) and FActivePanel.TryForgetNetworkRecent then
+    Exit;
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
   begin
     OpenBackgroundKind(okDelete);
@@ -3524,7 +5037,7 @@ begin
     procedure(Success: Boolean; const ErrorMsg: string)
     begin
       Panel.Refresh(FocusPath);
-      if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+      if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         Panel.ShowNotice(ErrorMsg);
     end, Permanent);
 end;
@@ -3537,20 +5050,22 @@ end;
 
 procedure TMainForm.OnBtnRefreshClick(Sender: TObject);
 begin
+  if Assigned(FLeftPanel) then
+    FLeftPanel.InvalidateFolderSizes;
+  if Assigned(FRightPanel) then
+    FRightPanel.InvalidateFolderSizes;
   FLeftPanel.Refresh;
   FRightPanel.Refresh;
 end;
 
 procedure TMainForm.OnBtnViewDetailsClick(Sender: TObject);
 begin
-  FActivePanel.SetViewMode(vmDetails);
-  UpdateViewButtons;
+  ApplyPanelView(FActivePanel, vmDetails);
 end;
 
 procedure TMainForm.OnBtnViewTilesClick(Sender: TObject);
 begin
-  FActivePanel.SetViewMode(vmTiles);
-  UpdateViewButtons;
+  ApplyPanelView(FActivePanel, vmTiles);
 end;
 
 procedure TMainForm.OnBtnViewClick(Sender: TObject);
@@ -3701,6 +5216,7 @@ procedure TMainForm.OnBtnSelectClick(Sender: TObject);
 begin
   if Assigned(FSelMenu) and Assigned(FCmdSelect) then
   begin
+    BuildSelMenu;
     FSelMenu.ApplyTheme(FColors);
     { Меню на стороне неактивной панели: активна левая — открыть вправо. }
     FSelMenu.PopupNear(FCmdSelect, Assigned(FActivePanel) and
@@ -3737,10 +5253,10 @@ begin
   if Mask = '' then
     Mask := '*.*';
   if ASelect then
-    Title := 'Выделить по маске'
+    Title := L('main.sel.mask')
   else
-    Title := 'Снять по маске';
-  if not FluentInputQuery(Title, 'Маска файлов (* ? ;):', Mask, FColors, Self) then
+    Title := L('main.sel.unmask');
+  if not FluentInputQuery(Title, L('main.mask.prompt'), Mask, FColors, Self) then
     Exit;
   Mask := Trim(Mask);
   if Mask = '' then
@@ -3826,9 +5342,50 @@ end;
 
 procedure TMainForm.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
 begin
-  if (Key = vkEscape) and Assigned(FOpPop) and FOpPop.IsOpen then
+  if Key = vkEscape then
   begin
-    FOpPop.IsOpen := False;
+    if Assigned(FOpPop) and FOpPop.IsOpen then
+    begin
+      FOpPop.IsOpen := False;
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    if (Assigned(FLeftPanel) and FLeftPanel.DriveHomeIsOpen) or
+       (Assigned(FRightPanel) and FRightPanel.DriveHomeIsOpen) then
+    begin
+      CloseDriveHomes;
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+  end;
+  if CmdLineFocused then
+  begin
+    if ((Key = vkUp) or (Key = vkDown)) and
+       not (ssAlt in Shift) and not (ssCtrl in Shift) then
+    begin
+      if Key = vkUp then
+        CmdHistStep(-1)
+      else
+        CmdHistStep(1);
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    if (Key = vkF5) and not (ssAlt in Shift) then
+    begin
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    if Key = vkTab then
+    begin
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    inherited;
     Key := 0;
     KeyChar := #0;
     Exit;
@@ -3857,6 +5414,24 @@ begin
     OnBtnSearchClick(nil);
     Key := 0;
     Exit;
+  end;
+  if (Key = vkF1) and (ssAlt in Shift) and not (ssCtrl in Shift) then
+  begin
+    if Assigned(FLeftPanel) and FLeftPanel.ToggleDriveHome then
+    begin
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+  end;
+  if (Key = vkF2) and (ssAlt in Shift) and not (ssCtrl in Shift) then
+  begin
+    if Assigned(FRightPanel) and FRightPanel.ToggleDriveHome then
+    begin
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
   end;
   if (Key = vkF5) and not (ssAlt in Shift) and
      not (Assigned(FActivePanel) and
@@ -4091,6 +5666,13 @@ begin
       FActivePanel.MoveSelectionGrid(1, 0, Shift);
     Key := 0;
   end
+  else if (Key = vkReturn) and (ssAlt in Shift) then
+  begin
+    if Assigned(FActivePanel) and not (ssCtrl in Shift) then
+      FActivePanel.CountCursorFolder;
+    Key := 0;
+    KeyChar := #0;
+  end
   else if Key = vkReturn then
   begin
     FActivePanel.OpenSelected;
@@ -4138,8 +5720,17 @@ begin
   end;
 end;
 
+procedure TMainForm.CloseDriveHomes;
+begin
+  if Assigned(FLeftPanel) then
+    FLeftPanel.CloseDriveHome;
+  if Assigned(FRightPanel) then
+    FRightPanel.CloseDriveHome;
+end;
+
 procedure TMainForm.PanelActivate(Sender: TObject);
 begin
+  CloseDriveHomes;
   if Assigned(FLeftPanel) then
     FLeftPanel.CancelPathEdit;
   if Assigned(FRightPanel) then

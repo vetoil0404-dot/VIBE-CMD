@@ -7,7 +7,7 @@ uses
   System.ZLib ,
  Winapi.Windows, Winapi.ShlObj, Winapi.ActiveX,
   System.SysUtils, System.Classes, System.IOUtils, System.Generics.Collections,
-  System.SyncObjs, System.Diagnostics, System.DateUtils, System.StrUtils,
+  System.SyncObjs, System.DateUtils, System.StrUtils,
   System.Math, System.UITypes, System.Types,
   FMX.Graphics, FMX.Types, FMX.Skia, System.Skia,
   UCoreEngine, uFileModel, uSpreadsheetData, uDocumentData, uPdfium,
@@ -15,10 +15,17 @@ uses
 
 function TryLoadSvgDom(const APath: string; out ADom: ISkSVGDOM): Boolean;
 function ReadSvgText(const APath: string): string;
+function ReadSvgSourceBytes(const APath: string; AMax: Integer): TBytes;
 function RenderSvgThumbRaw(const APath: string; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 function IsThumbCandidate(const APath: string; AIsDir: Boolean = False;
   const ANameHint: string = ''): Boolean;
+function LooksLikeLottieFile(const APath: string): Boolean;
+function ReadLottieJsonBytes(const APath: string; AMax: Integer;
+  AAllowPartial: Boolean = False): TBytes;
+function RenderLottieStill(const APath: string; AProgress: Double): FMX.Graphics.TBitmap;
+function TrySvgImageSize(const APath: string; out W, H: Integer): Boolean;
+function TryLottieImageSize(const APath: string; out W, H: Integer): Boolean;
 
 type
   TThumbReadyProc = reference to procedure(const APath: string; ABitmap: TBitmap);
@@ -41,6 +48,12 @@ type
     OnReady: TThumbReadyProc;
   end;
 
+  TThumbFocusSlot = record
+    Paths: TArray<string>;
+    Hints: TArray<string>;
+    Size: Integer;
+  end;
+
   TThumbCache = class
   private
     FCache: TDictionary<string, TCachedThumb>;
@@ -56,7 +69,8 @@ type
     FMaxItems: Integer;
     FGeneration: Integer;
     FOrder: TStringList;
-    procedure WaitIdle;
+    FSlots: TDictionary<TObject, TThumbFocusSlot>;
+    FSlotOrder: TList<TObject>;
     procedure TouchLocked(const APath: string);
     procedure EvictLocked;
     function CanCacheFile(const APath: string; const ANameHint: string = ''): Boolean;
@@ -65,11 +79,19 @@ type
     procedure RemoveCachedLocked(const APath: string);
     procedure PumpJobs;
     procedure StartJob(const AJob: TThumbJob);
+    procedure RememberSlot(AOwner: TObject; const APaths, ANameHints: TArray<string>;
+      ASize: Integer);
+    procedure RebuildFromSlots(AFirst: TObject);
   public
     constructor Create;
     destructor Destroy; override;
 
     function TryGet(const APath: string; out ABitmap: FMX.Graphics.TBitmap): Boolean;
+    { Слот панели: видимые плитки сверху вниз. Общая очередь — объединение слотов.
+      Хвост, которого нет ни в одном слоте, снимается. Уже запущенный поток не останавливается. }
+    procedure Focus(AOwner: TObject; const APaths, ANameHints: TArray<string>;
+      ASize: Integer);
+    procedure ReleaseFocus(AOwner: TObject);
     procedure RequestAsync(const APath: string; ASize: Integer; AOnReady: TThumbReadyProc;
       const ANameHint: string = '');
     function HasWork: Boolean;
@@ -78,6 +100,7 @@ type
     procedure Invalidate(const APath: string);
     procedure InvalidateFolder(const AFolder: string);
     procedure Shutdown;
+    function Quiescent: Boolean;
     procedure Clear;
     procedure Configure(AEnabled: Boolean; AMaxItems: Integer);
     procedure EnableWorkers;
@@ -93,7 +116,8 @@ var
 
 implementation
 
-
+uses
+  System.Zip, uVecPreview, uHtmlThumb, uArchiveEngine, uImageSniff;
 
 function IsSvgThumbExt(const APath: string): Boolean;
 var
@@ -116,6 +140,16 @@ begin
     Exit;
   Name := ExtractFileName(StringReplace(APath, '/', '\', [rfReplaceAll]));
   Result := LowerCase(ExtractFileExt(Name));
+end;
+
+function IsMetaThumbExt(const AExt: string): Boolean;
+begin
+  Result := (AExt = '.emf') or (AExt = '.wmf');
+end;
+
+function IsCdrThumbExt(const AExt: string): Boolean;
+begin
+  Result := (AExt = '.cdr') or (AExt = '.cdt');
 end;
 
 function IsRasterThumbExt(const AExt: string): Boolean;
@@ -246,7 +280,22 @@ begin
   if APath = '' then
     Exit;
   if SplitArchivePath(APath, Arc, Inner) and (Inner <> '') then
+  begin
+    if AIsDir then
+      Exit;
+    Ext := ThumbExtOf(APath, ANameHint);
+    Result := IsRasterThumbExt(Ext) or IsMetaThumbExt(Ext) or IsCdrThumbExt(Ext) or
+      (Ext = '.cur') or
+      (Ext = '.pdf') or (Ext = '.svg') or (Ext = '.svgz') or (Ext = '.ai') or
+      (Ext = '.psd') or (Ext = '.psb') or
+      (Ext = '.xlsx') or (Ext = '.xls') or (Ext = '.xlsm') or
+      (Ext = '.csv') or (Ext = '.tsv') or
+      (Ext = '.docx') or (Ext = '.doc') or (Ext = '.pptx') or (Ext = '.ppt') or
+      (Ext = '.htm') or (Ext = '.html') or (Ext = '.xhtml') or
+      (Ext = '.tgs') or (Ext = '.lottie') or (Ext = '.json') or
+      IsListedTextExt(Ext);
     Exit;
+  end;
   if IsThisPCPath(APath) then
     Exit;
   if AIsDir then
@@ -267,20 +316,24 @@ begin
     (Ext = '.webp') or (Ext = '.tif') or (Ext = '.tiff') or (Ext = '.tga') or
     (Ext = '.heic') or (Ext = '.heif') or (Ext = '.avif') or
     (Ext = '.jxl') or (Ext = '.dds') or (Ext = '.wmf') or (Ext = '.emf') or
+    (Ext = '.cur') or
+    (Ext = '.cdr') or (Ext = '.cdt') or
     (Ext = '.pdf') or (Ext = '.svg') or (Ext = '.svgz') or (Ext = '.ai') or
     (Ext = '.psd') or (Ext = '.psb') or
     (Ext = '.xlsx') or (Ext = '.xls') or (Ext = '.xlsm') or
     (Ext = '.csv') or (Ext = '.tsv') or
-    (Ext = '.tgs') or
+    (Ext = '.tgs') or (Ext = '.lottie') or (Ext = '.json') or
+    (Ext = '.htm') or (Ext = '.html') or (Ext = '.xhtml') or
     (Ext = '.docx') or (Ext = '.doc') or (Ext = '.pptx') or (Ext = '.ppt') or
     (Ext = '.mp4') or (Ext = '.mkv') or (Ext = '.avi') or (Ext = '.mov') or
     (Ext = '.wmv') or (Ext = '.webm') or
     (IsListedTextExt(Ext) and not IsRemotePath(APath));
   if Result then
     Exit;
-  { exe/lnk/ico остаются jumbo-иконками, не системным превью. }
+  { exe/lnk/ico остаются jumbo-иконками, не системным превью.
+    .cur — кадр курсора через BestCursorFrame, не значок типа. }
   if (Ext = '.exe') or (Ext = '.dll') or (Ext = '.ocx') or (Ext = '.scr') or
-     (Ext = '.lnk') or (Ext = '.ico') or (Ext = '.cur') or (Ext = '.sys') or
+     (Ext = '.lnk') or (Ext = '.ico') or (Ext = '.sys') or
      (Ext = '.url') then
     Exit;
   {$IFDEF MSWINDOWS}
@@ -474,6 +527,58 @@ begin
     Result := BytesToSvgString(Bytes);
   except
     Result := '';
+  end;
+end;
+
+function ReadSvgSourceBytes(const APath: string; AMax: Integer): TBytes;
+var
+  FS: TFileStream;
+  N, Got: Integer;
+  Head: TBytes;
+  Z: TDecompressionStream;
+begin
+  Result := nil;
+  if (APath = '') or (AMax < 64) or not TFile.Exists(APath) then
+    Exit;
+  try
+    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      if FS.Size < 1 then
+        Exit;
+      SetLength(Head, 2);
+      if FS.Size >= 2 then
+        FS.ReadBuffer(Head[0], 2);
+      FS.Position := 0;
+      if (FS.Size >= 2) and (Head[0] = $1F) and (Head[1] = $8B) then
+      begin
+        Z := TDecompressionStream.Create(FS, 31);
+        try
+          SetLength(Result, AMax);
+          Got := 0;
+          while Got < AMax do
+          begin
+            N := Z.Read(Result[Got], AMax - Got);
+            if N <= 0 then
+              Break;
+            Inc(Got, N);
+          end;
+          SetLength(Result, Got);
+        finally
+          Z.Free;
+        end;
+      end
+      else
+      begin
+        N := Integer(Min(FS.Size, Int64(AMax)));
+        SetLength(Result, N);
+        if N > 0 then
+          FS.ReadBuffer(Result[0], N);
+      end;
+    finally
+      FS.Free;
+    end;
+  except
+    Result := nil;
   end;
 end;
 
@@ -1144,6 +1249,115 @@ begin
   end;
 end;
 
+function BitmapHasInk(ABmp: TBitmap): Boolean;
+var
+  Data: TBitmapData;
+  X, Y: Integer;
+  P: PByte;
+begin
+  Result := False;
+  if (ABmp = nil) or (ABmp.Width < 1) or (ABmp.Height < 1) then
+    Exit;
+  if not ABmp.Map(TMapAccess.Read, Data) then
+    Exit(True);
+  try
+    for Y := 0 to ABmp.Height - 1 do
+    begin
+      P := PByte(Data.GetScanline(Y));
+      for X := 0 to ABmp.Width - 1 do
+      begin
+        { BGRA и RGBA: альфа в последнем байте. }
+        if P[3] > 12 then
+          Exit(True);
+        Inc(P, 4);
+      end;
+    end;
+  finally
+    ABmp.Unmap(Data);
+  end;
+end;
+
+function FitThumbDown(ASrc: TBitmap; AMax: Integer): TBitmap;
+var
+  S: Single;
+  DW, DH: Integer;
+  Scaled: TBitmap;
+begin
+  if (ASrc = nil) or (AMax < 8) or
+     ((ASrc.Width <= AMax) and (ASrc.Height <= AMax)) then
+    Exit(ASrc);
+  S := AMax / Max(ASrc.Width, ASrc.Height);
+  DW := Max(1, Round(ASrc.Width * S));
+  DH := Max(1, Round(ASrc.Height * S));
+  Scaled := TBitmap.Create(DW, DH);
+  try
+    Scaled.SkiaDraw(
+      procedure(const C: ISkCanvas)
+      begin
+        C.Clear(TAlphaColors.Null);
+        C.Scale(S, S);
+        C.DrawImage(ASrc.ToSkImage, 0, 0);
+      end);
+  except
+    Scaled.Free;
+    raise;
+  end;
+  ASrc.Free;
+  Result := Scaled;
+end;
+
+{ Крупнейший кадр .cur. Точка прицела не рисуется.
+  Полностью прозрачный кадр не кэшируем — остаётся значок типа. }
+function BestCursorFrame(const APath: string; AMax: Integer): TBitmap;
+var
+  Frames: TArray<TBitmap>;
+  Labels: TArray<string>;
+  I, Best, Area, BestArea: Integer;
+  Picked: TBitmap;
+begin
+  Result := nil;
+  if (APath = '') or not TFile.Exists(APath) then
+    Exit;
+  SetLength(Frames, 0);
+  Picked := nil;
+  try
+    if not LoadIcoFrames(APath, Frames, Labels) then
+      Exit;
+    Best := -1;
+    BestArea := 0;
+    for I := 0 to High(Frames) do
+    begin
+      if Frames[I] = nil then
+        Continue;
+      Area := Frames[I].Width * Frames[I].Height;
+      if Area > BestArea then
+      begin
+        BestArea := Area;
+        Best := I;
+      end;
+    end;
+    if Best >= 0 then
+    begin
+      Picked := Frames[Best];
+      Frames[Best] := nil;
+    end;
+  finally
+    for I := 0 to High(Frames) do
+      Frames[I].Free;
+  end;
+  if Picked = nil then
+    Exit;
+  try
+    Picked := FitThumbDown(Picked, AMax);
+    if (Picked <> nil) and not BitmapHasInk(Picked) then
+      FreeAndNil(Picked);
+    Result := Picked;
+  except
+    FreeAndNil(Picked);
+    Result := nil;
+  end;
+end;
+
 { TThumbCache }
 
 constructor TThumbCache.Create;
@@ -1154,6 +1368,8 @@ begin
   FPending := TDictionary<string, Boolean>.Create;
   FWait := TQueue<TThumbJob>.Create;
   FOrder := TStringList.Create;
+  FSlots := TDictionary<TObject, TThumbFocusSlot>.Create;
+  FSlotOrder := TList<TObject>.Create;
   FLock := TCriticalSection.Create;
   FShuttingDown := False;
   FBusy := 0;
@@ -1181,12 +1397,26 @@ begin
 end;
 
 function TThumbCache.ReadStamp(const APath: string; out AStamp: TThumbStamp): Boolean;
+var
+  Arc, Inner: string;
+  Sz: Int64;
+  When: TDateTime;
+  Enc: Boolean;
 begin
   Result := False;
   AStamp.Age := 0;
   AStamp.Bytes := 0;
   if not CanCacheFile(APath) then
     Exit;
+  if SplitArchivePath(APath, Arc, Inner) and (Inner <> '') then
+  begin
+    if not SafeGetFileAge(Arc, AStamp.Age) then
+      Exit;
+    if ArchiveEntryInfo(APath, Sz, When, Enc) then
+      AStamp.Bytes := Sz;
+    Result := True;
+    Exit;
+  end;
   if not SafeGetFileAge(APath, AStamp.Age) then
     Exit;
   try
@@ -1286,24 +1516,15 @@ begin
   end;
 end;
 
-procedure TThumbCache.WaitIdle;
-var
-  Sw: TStopwatch;
+function TThumbCache.Quiescent: Boolean;
 begin
-  Sw := TStopwatch.StartNew;
-  { При выходе не ждём до 3с — процесс и так убьёт воркеры. }
-  while ((FBusy > 0) or (FQueued > 0)) and (Sw.ElapsedMilliseconds < 250) do
-  begin
-    if TThread.CurrentThread.ThreadID = MainThreadID then
-      CheckSynchronize(15)
-    else
-      Sleep(15);
-  end;
+  Result := (FBusy = 0) and (FQueued = 0);
 end;
 
 procedure TThumbCache.Shutdown;
 begin
   FShuttingDown := True;
+  ShutdownHtmlThumbs;
   FLock.Enter;
   try
     FWait.Clear;
@@ -1311,7 +1532,6 @@ begin
   finally
     FLock.Leave;
   end;
-  WaitIdle;
 end;
 
 destructor TThumbCache.Destroy;
@@ -1323,6 +1543,8 @@ begin
   FPending.Free;
   FWait.Free;
   FOrder.Free;
+  FSlots.Free;
+  FSlotOrder.Free;
   FLock.Free;
   inherited;
 end;
@@ -1352,6 +1574,8 @@ begin
   FLock.Enter;
   try
     RemoveCachedLocked(APath);
+    FPending.Remove(APath);
+    Inc(FGeneration);
   finally
     FLock.Leave;
   end;
@@ -1454,48 +1678,769 @@ begin
   end;
 end;
 
-function RenderTgsThumb(const APath: string; AWidth, AHeight: Integer;
-  ABitmap: TBitmap): Boolean;
+function LooksLikeLottieBytes(const ABuf: TBytes): Boolean;
 var
-  FS: TFileStream;
-  Z: TDecompressionStream;
-  Anim: ISkottieAnimation;
-  Sz: TSizeF;
-  S: Single;
-  R: TRectF;
+  I, N: Integer;
+  Head: string;
+  C: Byte;
 begin
   Result := False;
-  if (ABitmap = nil) or (AWidth < 8) or (AHeight < 8) or (APath = '') then
+  N := Min(Length(ABuf), 4096);
+  if N < 8 then
+    Exit;
+  I := 0;
+  if (ABuf[0] = $EF) and (ABuf[1] = $BB) and (ABuf[2] = $BF) then
+    I := 3;
+  while (I < N) and (ABuf[I] in [9, 10, 13, 32]) do
+    Inc(I);
+  if (I >= N) or (ABuf[I] <> Ord('{')) then
+    Exit;
+  SetLength(Head, N);
+  for I := 0 to N - 1 do
+  begin
+    C := ABuf[I];
+    if C < 128 then
+      Head[I + 1] := Char(C)
+    else
+      Head[I + 1] := ' ';
+  end;
+  Head := LowerCase(Head);
+  Result := (Pos('"layers"', Head) > 0) or (Pos('"assets"', Head) > 0);
+end;
+
+function LooksLikeLottieFile(const APath: string): Boolean;
+var
+  FS: TFileStream;
+  Buf: TBytes;
+  N: Integer;
+begin
+  Result := False;
+  if APath = '' then
+    Exit;
+  try
+    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      N := Integer(Min(Int64(4096), FS.Size));
+      if N < 8 then
+        Exit;
+      SetLength(Buf, N);
+      FS.ReadBuffer(Buf[0], N);
+    finally
+      FS.Free;
+    end;
+    Result := LooksLikeLottieBytes(Buf);
+  except
+    Result := False;
+  end;
+end;
+
+function ReadStreamCap(AStream: TStream; AMax: Integer;
+  AAllowPartial: Boolean): TBytes;
+var
+  Buf: TBytes;
+  N, Total: Integer;
+begin
+  Result := nil;
+  if (AStream = nil) or (AMax < 8) then
+    Exit;
+  SetLength(Buf, 65536);
+  Total := 0;
+  while Total < AMax do
+  begin
+    N := AStream.Read(Buf[0], Min(Length(Buf), AMax - Total));
+    if N <= 0 then
+      Break;
+    SetLength(Result, Total + N);
+    Move(Buf[0], Result[Total], N);
+    Inc(Total, N);
+  end;
+  if (Total >= AMax) and not AAllowPartial then
+  begin
+    N := AStream.Read(Buf[0], 1);
+    if N > 0 then
+      Result := nil;
+  end;
+end;
+
+function LottieExt(const APath: string): string;
+begin
+  Result := LowerCase(ExtractFileExt(APath));
+end;
+
+function ReadLottieJsonBytes(const APath: string; AMax: Integer;
+  AAllowPartial: Boolean): TBytes;
+var
+  Ext: string;
+  FS: TFileStream;
+  Z: TDecompressionStream;
+  Zip: TZipFile;
+  I, Best, Score, ThisScore: Integer;
+  Name: string;
+  Info: TZipHeader;
+  Bytes, BestBytes: TBytes;
+begin
+  Result := nil;
+  if (APath = '') or (AMax < 8) then
+    Exit;
+  Ext := LottieExt(APath);
+  try
+    if Ext = '.tgs' then
+    begin
+      FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+      try
+        Z := TDecompressionStream.Create(FS, 31);
+        try
+          Result := ReadStreamCap(Z, AMax, AAllowPartial);
+        finally
+          Z.Free;
+        end;
+      finally
+        FS.Free;
+      end;
+      Exit;
+    end;
+    if Ext = '.lottie' then
+    begin
+      Best := -1;
+      BestBytes := nil;
+      Zip := TZipFile.Create;
+      try
+        Zip.Open(APath, zmRead);
+        for I := 0 to Zip.FileCount - 1 do
+        begin
+          Name := LowerCase(StringReplace(Zip.FileName[I], '/', '\', [rfReplaceAll]));
+          if (Name = '') or (Name[Length(Name)] = '\') then
+            Continue;
+          if ExtractFileExt(Name) <> '.json' then
+            Continue;
+          Info := Zip.FileInfo[I];
+          if (not AAllowPartial) and (Info.UncompressedSize64 > UInt64(AMax)) then
+            Continue;
+          Zip.Read(I, Bytes);
+          if Length(Bytes) = 0 then
+            Continue;
+          if Length(Bytes) > AMax then
+          begin
+            if not AAllowPartial then
+              Continue;
+            SetLength(Bytes, AMax);
+          end;
+          ThisScore := 1;
+          if Pos('manifest', Name) > 0 then
+            ThisScore := 0;
+          if LooksLikeLottieBytes(Bytes) then
+            Inc(ThisScore, 2);
+          if Pos('anim', Name) > 0 then
+            Inc(ThisScore);
+          Score := ThisScore;
+          if Score > Best then
+          begin
+            Best := Score;
+            BestBytes := Bytes;
+          end;
+        end;
+      finally
+        Zip.Free;
+      end;
+      Result := BestBytes;
+      Exit;
+    end;
+    if Ext = '.json' then
+    begin
+      FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+      try
+        Result := ReadStreamCap(FS, AMax, AAllowPartial);
+      finally
+        FS.Free;
+      end;
+    end;
+  except
+    Result := nil;
+  end;
+end;
+
+function SvgSideOk(W, H: Integer): Boolean;
+begin
+  Result := (W >= 1) and (H >= 1) and (W <= 1000000) and (H <= 1000000);
+end;
+
+function ReadSvgHead(const APath: string; AMax: Integer): string;
+var
+  FS: TFileStream;
+  N, Got: Integer;
+  Bytes: TBytes;
+  Z: TDecompressionStream;
+begin
+  Result := '';
+  if (APath = '') or (AMax < 64) then
     Exit;
   FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    Z := TDecompressionStream.Create(FS, 31);
-    try
-      Anim := TSkottieAnimation.MakeFromStream(Z);
-    finally
-      Z.Free;
+    if FS.Size < 8 then
+      Exit;
+    SetLength(Bytes, 2);
+    FS.ReadBuffer(Bytes[0], 2);
+    FS.Position := 0;
+    if (Bytes[0] = $1F) and (Bytes[1] = $8B) then
+    begin
+      Z := TDecompressionStream.Create(FS, 31);
+      try
+        SetLength(Bytes, AMax);
+        Got := 0;
+        while Got < AMax do
+        begin
+          N := Z.Read(Bytes[Got], AMax - Got);
+          if N <= 0 then
+            Break;
+          Inc(Got, N);
+        end;
+        SetLength(Bytes, Got);
+      finally
+        Z.Free;
+      end;
+    end
+    else
+    begin
+      N := Integer(Min(FS.Size, Int64(AMax)));
+      SetLength(Bytes, N);
+      if N > 0 then
+        FS.ReadBuffer(Bytes[0], N);
     end;
   finally
     FS.Free;
   end;
-  if Anim = nil then
+  Result := BytesToSvgString(Bytes);
+end;
+
+function SvgOpenAt(const S: string; I: Integer): Boolean;
+var
+  J: Integer;
+  Name: string;
+begin
+  Result := False;
+  if (I < 1) or (I > Length(S)) or (S[I] <> '<') then
     Exit;
-  Anim.SeekFrameTime(0);
-  Sz := Anim.Size;
+  J := I + 1;
+  if (J + 3 <= Length(S)) and (LowerCase(Copy(S, J, 4)) = 'svg:') then
+    Inc(J, 4);
+  if J + 2 > Length(S) then
+    Exit;
+  Name := LowerCase(Copy(S, J, 3));
+  if Name <> 'svg' then
+    Exit;
+  Inc(J, 3);
+  if J > Length(S) then
+    Exit;
+  Result := CharInSet(S[J], [' ', #9, #10, #13, '>', '/']);
+end;
+
+function SvgOpenTag(const S: string; I: Integer): string;
+var
+  J: Integer;
+  Q: Char;
+begin
+  Result := '';
+  J := I;
+  Q := #0;
+  while J <= Length(S) do
+  begin
+    if Q <> #0 then
+    begin
+      if S[J] = Q then
+        Q := #0;
+    end
+    else if (S[J] = '"') or (S[J] = '''') then
+      Q := S[J]
+    else if S[J] = '>' then
+      Exit(Copy(S, I, J - I + 1));
+    Inc(J);
+  end;
+end;
+
+function FindSvgOpen(const S: string): string;
+var
+  I, J: Integer;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if (S[I] = '<') and (I + 3 <= Length(S)) and (Copy(S, I, 4) = '<!--') then
+    begin
+      J := Pos('-->', S, I + 4);
+      if J < 1 then
+        Exit;
+      I := J + 3;
+      Continue;
+    end;
+    if SvgOpenAt(S, I) then
+      Exit(SvgOpenTag(S, I));
+    Inc(I);
+  end;
+end;
+
+procedure SvgRootAttrs(const Tag: string; out AWidth, AHeight, AViewBox, AStyle: string);
+var
+  I, N, Start: Integer;
+  Name, Value: string;
+  Q: Char;
+begin
+  AWidth := '';
+  AHeight := '';
+  AViewBox := '';
+  AStyle := '';
+  I := 1;
+  N := Length(Tag);
+  while (I <= N) and (Tag[I] <> ' ') and (Tag[I] <> #9) and (Tag[I] <> #10) and
+        (Tag[I] <> #13) and (Tag[I] <> '>') do
+    Inc(I);
+  while I <= N do
+  begin
+    while (I <= N) and (Tag[I] <= ' ') do
+      Inc(I);
+    if (I > N) or (Tag[I] = '>') or (Tag[I] = '/') then
+      Break;
+    Start := I;
+    while (I <= N) and (Tag[I] <> '=') and (Tag[I] > ' ') and (Tag[I] <> '>') and
+          (Tag[I] <> '/') do
+      Inc(I);
+    Name := LowerCase(Copy(Tag, Start, I - Start));
+    while (I <= N) and (Tag[I] <= ' ') do
+      Inc(I);
+    Value := '';
+    if (I <= N) and (Tag[I] = '=') then
+    begin
+      Inc(I);
+      while (I <= N) and (Tag[I] <= ' ') do
+        Inc(I);
+      if (I <= N) and ((Tag[I] = '"') or (Tag[I] = '''')) then
+      begin
+        Q := Tag[I];
+        Inc(I);
+        Start := I;
+        while (I <= N) and (Tag[I] <> Q) do
+          Inc(I);
+        Value := Copy(Tag, Start, I - Start);
+        if I <= N then
+          Inc(I);
+      end
+      else
+      begin
+        Start := I;
+        while (I <= N) and (Tag[I] > ' ') and (Tag[I] <> '>') and (Tag[I] <> '/') do
+          Inc(I);
+        Value := Copy(Tag, Start, I - Start);
+      end;
+    end;
+    if Name = 'width' then
+      AWidth := Value
+    else if Name = 'height' then
+      AHeight := Value
+    else if Name = 'viewbox' then
+      AViewBox := Value
+    else if Name = 'style' then
+      AStyle := Value;
+  end;
+end;
+
+function StyleProp(const AStyle, AName: string): string;
+var
+  I, N, Start: Integer;
+  Key: string;
+begin
+  Result := '';
+  I := 1;
+  N := Length(AStyle);
+  while I <= N do
+  begin
+    while (I <= N) and ((AStyle[I] <= ' ') or (AStyle[I] = ';')) do
+      Inc(I);
+    Start := I;
+    while (I <= N) and (AStyle[I] <> ':') and (AStyle[I] <> ';') do
+      Inc(I);
+    Key := LowerCase(Trim(Copy(AStyle, Start, I - Start)));
+    if (I <= N) and (AStyle[I] = ':') then
+      Inc(I);
+    while (I <= N) and (AStyle[I] <= ' ') do
+      Inc(I);
+    Start := I;
+    while (I <= N) and (AStyle[I] <> ';') do
+      Inc(I);
+    if Key = AName then
+      Exit(Trim(Copy(AStyle, Start, I - Start)));
+    if (I <= N) and (AStyle[I] = ';') then
+      Inc(I);
+  end;
+end;
+
+function SvgLenPx(const S: string; out Px: Double): Boolean;
+var
+  I: Integer;
+  Num, Suffix: string;
+  V: Double;
+  FS: TFormatSettings;
+begin
+  Result := False;
+  Px := 0;
+  FS := TFormatSettings.Invariant;
+  I := 1;
+  while (I <= Length(S)) and (S[I] <= ' ') do
+    Inc(I);
+  Num := '';
+  if (I <= Length(S)) and ((S[I] = '+') or (S[I] = '-')) then
+  begin
+    Num := S[I];
+    Inc(I);
+  end;
+  while (I <= Length(S)) and CharInSet(S[I], ['0'..'9', '.', 'e', 'E', '+', '-']) do
+  begin
+    Num := Num + S[I];
+    Inc(I);
+  end;
+  if (Num = '') or (Num = '+') or (Num = '-') or (Num = '.') then
+    Exit;
+  if not TryStrToFloat(Num, V, FS) then
+    Exit;
+  if V < 0 then
+    V := -V;
+  Suffix := LowerCase(Trim(Copy(S, I, MaxInt)));
+  if (Suffix = '') or (Suffix = 'px') then
+    Px := V
+  else if Suffix = 'pt' then
+    Px := V * 96 / 72
+  else if Suffix = 'pc' then
+    Px := V * 16
+  else if Suffix = 'in' then
+    Px := V * 96
+  else if Suffix = 'cm' then
+    Px := V * 96 / 2.54
+  else if Suffix = 'mm' then
+    Px := V * 96 / 25.4
+  else
+    Exit;
+  Result := Px >= 1;
+end;
+
+function ViewBoxSize(const S: string; out VW, VH: Double): Boolean;
+var
+  I, N: Integer;
+  Num: string;
+  V: array[0..3] of Double;
+  FS: TFormatSettings;
+  C: Char;
+begin
+  Result := False;
+  VW := 0;
+  VH := 0;
+  FS := TFormatSettings.Invariant;
+  N := 0;
+  Num := '';
+  I := 1;
+  while I <= Length(S) + 1 do
+  begin
+    if I <= Length(S) then
+      C := S[I]
+    else
+      C := ' ';
+    if (C = ',') or (C <= ' ') then
+    begin
+      if Num <> '' then
+      begin
+        if (N >= 4) or not TryStrToFloat(Num, V[N], FS) then
+          Exit;
+        Inc(N);
+        Num := '';
+      end;
+    end
+    else
+      Num := Num + C;
+    Inc(I);
+  end;
+  if N <> 4 then
+    Exit;
+  VW := Abs(V[2]);
+  VH := Abs(V[3]);
+  Result := (VW >= 1) and (VH >= 1);
+end;
+
+function TrySvgImageSize(const APath: string; out W, H: Integer): Boolean;
+var
+  Ext, Text, Tag, Aw, Ah, Vb, Style: string;
+  HasW, HasH, HasV: Boolean;
+  PxW, PxH, VbW, VbH: Double;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  Ext := LowerCase(ExtractFileExt(APath));
+  if (Ext <> '.svg') and (Ext <> '.svgz') and (Ext <> '.ai') then
+    Exit;
+  try
+    Text := ReadSvgHead(APath, 256 * 1024);
+    Tag := FindSvgOpen(Text);
+    if Tag = '' then
+      Exit;
+    SvgRootAttrs(Tag, Aw, Ah, Vb, Style);
+    if Aw = '' then
+      Aw := StyleProp(Style, 'width');
+    if Ah = '' then
+      Ah := StyleProp(Style, 'height');
+    HasW := SvgLenPx(Aw, PxW);
+    HasH := SvgLenPx(Ah, PxH);
+    HasV := ViewBoxSize(Vb, VbW, VbH);
+    if HasW and HasH then
+    begin
+      W := Max(1, Round(PxW));
+      H := Max(1, Round(PxH));
+    end
+    else if HasW and HasV then
+    begin
+      W := Max(1, Round(PxW));
+      H := Max(1, Round(PxW * VbH / VbW));
+    end
+    else if HasH and HasV then
+    begin
+      H := Max(1, Round(PxH));
+      W := Max(1, Round(PxH * VbW / VbH));
+    end
+    else if HasV then
+    begin
+      W := Max(1, Round(VbW));
+      H := Max(1, Round(VbH));
+    end
+    else
+      Exit;
+    Result := SvgSideOk(W, H);
+    if not Result then
+    begin
+      W := 0;
+      H := 0;
+    end;
+  except
+    Result := False;
+    W := 0;
+    H := 0;
+  end;
+end;
+
+function JsonKeyNumber(const Head, Key: string; out V: Double): Boolean;
+var
+  P, I: Integer;
+  Num: string;
+  FS: TFormatSettings;
+  C: Char;
+begin
+  Result := False;
+  V := 0;
+  FS := TFormatSettings.Invariant;
+  P := 1;
+  while P > 0 do
+  begin
+    P := Pos(Key, Head, P);
+    if P < 1 then
+      Exit;
+    I := P + Length(Key);
+    while (I <= Length(Head)) and (Head[I] <= ' ') do
+      Inc(I);
+    if (I > Length(Head)) or (Head[I] <> ':') then
+    begin
+      Inc(P, Length(Key));
+      Continue;
+    end;
+    Inc(I);
+    while (I <= Length(Head)) and (Head[I] <= ' ') do
+      Inc(I);
+    Num := '';
+    while I <= Length(Head) do
+    begin
+      C := Head[I];
+      if CharInSet(C, ['0'..'9', '.', '+', '-', 'e', 'E']) then
+      begin
+        Num := Num + C;
+        Inc(I);
+      end
+      else
+        Break;
+    end;
+    if (Num <> '') and (Num <> '+') and (Num <> '-') and (Num <> '.') and
+       TryStrToFloat(Num, V, FS) and (V >= 1) and (V <= 1000000) then
+      Exit(True);
+    Inc(P, Length(Key));
+  end;
+end;
+
+function LottieHeadText(const ABuf: TBytes): string;
+var
+  I, N: Integer;
+  C: Byte;
+begin
+  N := Min(Length(ABuf), 65536);
+  SetLength(Result, N);
+  for I := 0 to N - 1 do
+  begin
+    C := ABuf[I];
+    if (C >= 32) and (C < 128) then
+      Result[I + 1] := Char(C)
+    else if (C = 9) or (C = 10) or (C = 13) then
+      Result[I + 1] := ' '
+    else
+      Result[I + 1] := ' ';
+  end;
+end;
+
+function TryLottieImageSize(const APath: string; out W, H: Integer): Boolean;
+var
+  Ext: string;
+  Bytes: TBytes;
+  Head: string;
+  Fw, Fh: Double;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  Ext := LowerCase(ExtractFileExt(APath));
+  if (Ext <> '.json') and (Ext <> '.lottie') and (Ext <> '.tgs') then
+    Exit;
+  try
+    Bytes := ReadLottieJsonBytes(APath, 65536, True);
+    { Чужой JSON не помечаем. У .tgs и .lottie размер композиции — это w и h,
+      даже если layers лежат дальше первых 4 КБ. }
+    if (Ext = '.json') and not LooksLikeLottieBytes(Bytes) then
+      Exit;
+    Head := LottieHeadText(Bytes);
+    if not JsonKeyNumber(Head, '"w"', Fw) or not JsonKeyNumber(Head, '"h"', Fh) then
+      Exit;
+    W := Max(1, Round(Fw));
+    H := Max(1, Round(Fh));
+    Result := SvgSideOk(W, H);
+    if not Result then
+    begin
+      W := 0;
+      H := 0;
+    end;
+  except
+    Result := False;
+    W := 0;
+    H := 0;
+  end;
+end;
+
+function OpenLottieAnim(const APath: string): ISkottieAnimation;
+var
+  Bytes: TBytes;
+  MS: TBytesStream;
+begin
+  Result := nil;
+  if APath = '' then
+    Exit;
+  try
+    if LottieExt(APath) = '.json' then
+    begin
+      Result := TSkottieAnimation.MakeFromFile(APath);
+      if Result <> nil then
+        Exit;
+    end;
+    Bytes := ReadLottieJsonBytes(APath, 32 * 1024 * 1024, False);
+    if Length(Bytes) < 8 then
+      Exit;
+    MS := TBytesStream.Create(Bytes);
+    try
+      Result := TSkottieAnimation.MakeFromStream(MS);
+    finally
+      MS.Free;
+    end;
+  except
+    Result := nil;
+  end;
+end;
+
+procedure PaintLottie(const AAnim: ISkottieAnimation; ABitmap: TBitmap;
+  AWidth, AHeight: Integer; AProgress: Double; AWhite: Boolean);
+var
+  Sz: TSizeF;
+  S: Single;
+  R: TRectF;
+  W, H: Integer;
+begin
+  if (AAnim = nil) or (ABitmap = nil) or (AWidth < 1) or (AHeight < 1) then
+    Exit;
+  if (AProgress > 0) and (AAnim.Duration > 0) then
+    AAnim.SeekFrameTime(AProgress * AAnim.Duration)
+  else
+    AAnim.SeekFrameTime(0);
+  Sz := AAnim.Size;
   if (Sz.Width < 1) or (Sz.Height < 1) then
     Exit;
-  ABitmap.SetSize(AWidth, AHeight);
-  S := Min((AWidth - 8) / Sz.Width, (AHeight - 8) / Sz.Height);
-  R := RectF((AWidth - Sz.Width * S) / 2, (AHeight - Sz.Height * S) / 2, 0, 0);
+  if (AWidth = Round(Sz.Width)) and (AHeight = Round(Sz.Height)) then
+  begin
+    W := AWidth;
+    H := AHeight;
+    S := 1;
+  end
+  else
+  begin
+    W := AWidth;
+    H := AHeight;
+    S := Min((AWidth - 8) / Sz.Width, (AHeight - 8) / Sz.Height);
+    if S <= 0 then
+      S := Min(AWidth / Sz.Width, AHeight / Sz.Height);
+  end;
+  ABitmap.SetSize(W, H);
+  R := RectF((W - Sz.Width * S) / 2, (H - Sz.Height * S) / 2, 0, 0);
   R.Right := R.Left + Sz.Width * S;
   R.Bottom := R.Top + Sz.Height * S;
   ABitmap.SkiaDraw(
     procedure(const ACanvas: ISkCanvas)
     begin
-      ACanvas.Clear($FFFFFFFF);
-      Anim.Render(ACanvas, R, []);
+      if AWhite then
+        ACanvas.Clear($FFFFFFFF)
+      else
+        ACanvas.Clear($00000000);
+      AAnim.Render(ACanvas, R, []);
     end, True);
-  Result := True;
+end;
+
+function RenderLottieThumb(const APath: string; AWidth, AHeight: Integer;
+  ABitmap: TBitmap): Boolean;
+var
+  Anim: ISkottieAnimation;
+begin
+  Result := False;
+  if (ABitmap = nil) or (AWidth < 8) or (AHeight < 8) or (APath = '') then
+    Exit;
+  Anim := OpenLottieAnim(APath);
+  if (Anim = nil) or (Anim.Size.Width < 1) or (Anim.Size.Height < 1) then
+    Exit;
+  PaintLottie(Anim, ABitmap, AWidth, AHeight, 0, True);
+  Result := (ABitmap.Width > 0) and (ABitmap.Height > 0);
+end;
+
+function RenderLottieStill(const APath: string; AProgress: Double): TBitmap;
+var
+  Anim: ISkottieAnimation;
+  W, H: Integer;
+  S: Single;
+begin
+  Result := nil;
+  Anim := OpenLottieAnim(APath);
+  if (Anim = nil) or (Anim.Size.Width < 1) or (Anim.Size.Height < 1) then
+    Exit;
+  W := Max(1, Round(Anim.Size.Width));
+  H := Max(1, Round(Anim.Size.Height));
+  if (W > 8192) or (H > 8192) then
+  begin
+    S := Min(8192 / W, 8192 / H);
+    W := Max(1, Round(W * S));
+    H := Max(1, Round(H * S));
+  end;
+  Result := TBitmap.Create;
+  try
+    PaintLottie(Anim, Result, W, H, AProgress, False);
+    if Result.Width < 1 then
+      FreeAndNil(Result);
+  except
+    FreeAndNil(Result);
+  end;
 end;
 
 procedure TThumbCache.StartJob(const AJob: TThumbJob);
@@ -1520,7 +2465,10 @@ begin
       RawW, RawH, RenderSize: Integer;
       NeedCom: Boolean;
       Unk: IUnknown;
-      Local, Ext: string;
+      Local, Ext, ReadPath, OwnTemp, ArcName, InnerName: string;
+      SkipFallback, ArcEnc: Boolean;
+      ArcBytes: Int64;
+      ArcWhen: TDateTime;
     begin
       Bmp := nil;
       Success := False;
@@ -1545,14 +2493,50 @@ begin
               RenderSize := 256;
 
             Ext := ThumbExtOf(Path, NameHint);
+            SkipFallback := False;
+            ReadPath := Path;
+            OwnTemp := '';
+            if SplitArchivePath(Path, ArcName, InnerName) and (InnerName <> '') then
+            begin
+              SkipFallback := True;
+              ReadPath := '';
+              ArcBytes := 0;
+              ArcEnc := False;
+              if ArchiveEntryInfo(Path, ArcBytes, ArcWhen, ArcEnc) and
+                 (not ArcEnc) and (ArcBytes <= 48 * 1024 * 1024) then
+              begin
+                Local := '';
+                if MaterializeFile(Path, Local) and (Local <> '') and
+                   TFile.Exists(Local) and not SameText(Local, Path) then
+                begin
+                  ReadPath := Local;
+                  OwnTemp := Local;
+                end;
+              end;
+            end;
             if IsRasterThumbExt(Ext) then
-              Success := RenderRasterThumbRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
+              Success := RenderRasterThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            if not Success and (Bmp = nil) and (Ext = '.cur') then
+            begin
+              { Не shell: иначе в кэш попадёт значок типа, а не рисунок курсора. }
+              SkipFallback := True;
+              if ReadPath <> '' then
+              try
+                Bmp := BestCursorFrame(ReadPath, RenderSize);
+                Success := Assigned(Bmp) and (Bmp.Width > 0);
+                if not Success then
+                  FreeAndNil(Bmp);
+              except
+                Success := False;
+                FreeAndNil(Bmp);
+              end;
+            end;
             if not Success and IsPdfThumbExt(Path) then
-              Success := RenderPdfThumbRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
+              Success := RenderPdfThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
             if not Success and IsSvgThumbExt(Path) then
-              Success := RenderSvgThumbRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
+              Success := RenderSvgThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
             if not Success and IsPsdThumbExt(Path) then
-              Success := RenderPsdThumbRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
+              Success := RenderPsdThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
 
             if not Success and (Length(Raw) = 0) then
             begin
@@ -1561,9 +2545,9 @@ begin
                 Bmp := TBitmap.Create;
                 try
                   if IsSpreadsheetThumbExt(Path) then
-                    Success := RenderSpreadsheetThumb(Path, RenderSize, RenderSize, Bmp);
+                    Success := RenderSpreadsheetThumb(ReadPath, RenderSize, RenderSize, Bmp);
                   if not Success and IsDocumentThumbExt(Path) then
-                    Success := RenderDocumentThumb(Path, RenderSize, RenderSize, Bmp);
+                    Success := RenderDocumentThumb(ReadPath, RenderSize, RenderSize, Bmp);
                   if not Success or (Bmp.Width <= 0) then
                   begin
                     Success := False;
@@ -1576,11 +2560,11 @@ begin
               end;
             end;
 
-            if not Success and (Bmp = nil) and (Ext = '.tgs') then
+            if not Success and (Bmp = nil) and IsMetaThumbExt(Ext) then
             begin
               Bmp := TBitmap.Create;
               try
-                Success := RenderTgsThumb(Path, RenderSize, RenderSize, Bmp);
+                Success := RenderMetaTile(ReadPath, RenderSize, Bmp);
                 if not Success or (Bmp.Width <= 0) then
                 begin
                   Success := False;
@@ -1592,12 +2576,70 @@ begin
               end;
             end;
 
-            if not Success and (Bmp = nil) and IsListedTextExt(Ext) and
-               not IsRemotePath(Path) then
+            if not Success and (Bmp = nil) and IsCdrThumbExt(Ext) then
             begin
               Bmp := TBitmap.Create;
               try
-                Success := RenderTextA4Thumb(Path, RenderSize, RenderSize, Bmp);
+                { Сетевой файл: только маленькое превью из ZIP, без чтения десятков МБ. }
+                Success := RenderCdrTile(ReadPath, RenderSize, Bmp, not IsRemotePath(Path));
+                if not Success or (Bmp.Width <= 0) then
+                begin
+                  Success := False;
+                  FreeAndNil(Bmp);
+                end;
+              except
+                Success := False;
+                FreeAndNil(Bmp);
+              end;
+            end;
+
+            if not Success and (Bmp = nil) and
+               ((Ext = '.tgs') or (Ext = '.lottie') or (Ext = '.json')) then
+            begin
+              if (Ext <> '.json') or LooksLikeLottieFile(ReadPath) then
+              begin
+                SkipFallback := True;
+                Bmp := TBitmap.Create;
+                try
+                  Success := RenderLottieThumb(ReadPath, RenderSize, RenderSize, Bmp);
+                  if not Success or (Bmp.Width <= 0) then
+                  begin
+                    Success := False;
+                    FreeAndNil(Bmp);
+                  end;
+                except
+                  Success := False;
+                  FreeAndNil(Bmp);
+                end;
+              end
+              else if IsRemotePath(Path) then
+                SkipFallback := True;
+            end;
+
+            if not SkipFallback and not Success and (Bmp = nil) and
+               IsHtmlPageThumbExt(Ext) then
+            begin
+              SkipFallback := True;
+              Bmp := TBitmap.Create;
+              try
+                Success := RenderHtmlPageThumb(ReadPath, RenderSize, RenderSize, Bmp);
+                if not Success or (Bmp.Width <= 0) then
+                begin
+                  Success := False;
+                  FreeAndNil(Bmp);
+                end;
+              except
+                Success := False;
+                FreeAndNil(Bmp);
+              end;
+            end;
+
+            if not SkipFallback and not Success and (Bmp = nil) and
+               IsListedTextExt(Ext) and not IsRemotePath(Path) then
+            begin
+              Bmp := TBitmap.Create;
+              try
+                Success := RenderTextA4Thumb(ReadPath, RenderSize, RenderSize, Bmp);
                 if not Success or (Bmp.Width <= 0) then
                 begin
                   Success := False;
@@ -1610,14 +2652,14 @@ begin
             end;
 
 {$IFDEF MSWINDOWS}
-            if not Success then
+            if not SkipFallback and not Success then
             begin
               Unk := nil;
               if TryBindShellItem(Path, Unk) then
                 Success := GetShellItemThumbnailRaw(Unk, RenderSize, RenderSize, Raw, RawW, RawH);
             end;
 {$ENDIF}
-            if not Success then
+            if not SkipFallback and not Success then
               Success := GetFileThumbnailRaw(Path, RenderSize, RenderSize, Raw, RawW, RawH);
             if Success and (Length(Raw) > 0) and (RawW > 0) and (RawH > 0) and
                TDirectory.Exists(Path) then
@@ -1648,6 +2690,12 @@ begin
           FreeAndNil(Bmp);
           SetLength(Raw, 0);
         end;
+
+        if OwnTemp <> '' then
+          try
+            TFile.Delete(OwnTemp);
+          except
+          end;
 
         if FShuttingDown then
         begin
@@ -1743,6 +2791,197 @@ begin
     end).Start;
 end;
 
+procedure TThumbCache.RememberSlot(AOwner: TObject;
+  const APaths, ANameHints: TArray<string>; ASize: Integer);
+var
+  Slot: TThumbFocusSlot;
+  I, N: Integer;
+begin
+  N := Length(APaths);
+  SetLength(Slot.Paths, N);
+  SetLength(Slot.Hints, N);
+  for I := 0 to N - 1 do
+  begin
+    Slot.Paths[I] := APaths[I];
+    if I <= High(ANameHints) then
+      Slot.Hints[I] := ANameHints[I]
+    else
+      Slot.Hints[I] := '';
+  end;
+  Slot.Size := ASize;
+  FSlots.AddOrSetValue(AOwner, Slot);
+  if FSlotOrder.IndexOf(AOwner) < 0 then
+    FSlotOrder.Add(AOwner);
+end;
+
+procedure TThumbCache.RebuildFromSlots(AFirst: TObject);
+var
+  Slots: TList<TThumbFocusSlot>;
+  Have: TDictionary<string, TThumbStamp>;
+  Remote: TDictionary<string, Boolean>;
+  Emitted: TDictionary<string, Boolean>;
+  Foreign: TList<TThumbJob>;
+  Slot: TThumbFocusSlot;
+  Job: TThumbJob;
+  Item: TCachedThumb;
+  St, Cached: TThumbStamp;
+  Owner: TObject;
+  Path: string;
+  S, I: Integer;
+  Got: Boolean;
+begin
+  if FShuttingDown or not FEnabled or not FWorkersEnabled then
+    Exit;
+
+  Slots := TList<TThumbFocusSlot>.Create;
+  Have := TDictionary<string, TThumbStamp>.Create;
+  Remote := TDictionary<string, Boolean>.Create;
+  try
+    FLock.Enter;
+    try
+      if (AFirst <> nil) and FSlots.TryGetValue(AFirst, Slot) then
+        Slots.Add(Slot);
+      for I := 0 to FSlotOrder.Count - 1 do
+      begin
+        Owner := FSlotOrder[I];
+        if Owner = AFirst then
+          Continue;
+        if FSlots.TryGetValue(Owner, Slot) then
+          Slots.Add(Slot);
+      end;
+    finally
+      FLock.Leave;
+    end;
+
+    { Метку читаем только у локальных путей слотов. Сеть на UI не трогаем:
+      уже готовый кадр и FNoThumb для неё не декодируются повторно. }
+    for S := 0 to Slots.Count - 1 do
+    begin
+      Slot := Slots[S];
+      for I := 0 to High(Slot.Paths) do
+      begin
+        Path := Slot.Paths[I];
+        if (Path = '') or Have.ContainsKey(Path) or Remote.ContainsKey(Path) then
+          Continue;
+        if IsRemotePath(Path) then
+          Remote.Add(Path, True)
+        else if ReadStamp(Path, St) then
+          Have.Add(Path, St);
+      end;
+    end;
+
+    Emitted := TDictionary<string, Boolean>.Create;
+    Foreign := TList<TThumbJob>.Create;
+    try
+      FLock.Enter;
+      try
+        while FWait.Count > 0 do
+        begin
+          Job := FWait.Dequeue;
+          if Assigned(Job.OnReady) then
+            { Диалоги конфликта и прогресса. Это не плитка панели. }
+            Foreign.Add(Job)
+          else
+            FPending.Remove(Job.Path);
+        end;
+
+        for S := 0 to Slots.Count - 1 do
+        begin
+          Slot := Slots[S];
+          for I := 0 to High(Slot.Paths) do
+          begin
+            Path := Slot.Paths[I];
+            if (Path = '') or Emitted.ContainsKey(Path) then
+              Continue;
+            Emitted.Add(Path, True);
+            if FPending.ContainsKey(Path) then
+              Continue;
+
+            if Remote.ContainsKey(Path) then
+            begin
+              if FCache.ContainsKey(Path) or FNoThumb.ContainsKey(Path) then
+                Continue;
+            end
+            else
+            begin
+              Got := Have.TryGetValue(Path, St);
+              if FCache.TryGetValue(Path, Item) then
+              begin
+                if (not Got) or SameStamp(Item.Stamp, St) then
+                  Continue;
+              end
+              else if FNoThumb.TryGetValue(Path, Cached) then
+              begin
+                if (not Got) or SameStamp(Cached, St) then
+                  Continue;
+                FNoThumb.Remove(Path);
+              end;
+            end;
+
+            Job := Default(TThumbJob);
+            Job.Path := Path;
+            Job.Size := Slot.Size;
+            if Job.Size < 1 then
+              Job.Size := 256;
+            if I <= High(Slot.Hints) then
+              Job.NameHint := Slot.Hints[I];
+            if Have.TryGetValue(Path, St) then
+              Job.Stamp := St;
+            FPending.Add(Path, True);
+            FWait.Enqueue(Job);
+          end;
+        end;
+
+        for I := 0 to Foreign.Count - 1 do
+          FWait.Enqueue(Foreign[I]);
+      finally
+        FLock.Leave;
+      end;
+    finally
+      Emitted.Free;
+      Foreign.Free;
+    end;
+  finally
+    Slots.Free;
+    Have.Free;
+    Remote.Free;
+  end;
+
+  PumpJobs;
+end;
+
+procedure TThumbCache.Focus(AOwner: TObject; const APaths, ANameHints: TArray<string>;
+  ASize: Integer);
+begin
+  if (AOwner = nil) or FShuttingDown or not FEnabled or not FWorkersEnabled then
+    Exit;
+  FLock.Enter;
+  try
+    RememberSlot(AOwner, APaths, ANameHints, ASize);
+  finally
+    FLock.Leave;
+  end;
+  RebuildFromSlots(AOwner);
+end;
+
+procedure TThumbCache.ReleaseFocus(AOwner: TObject);
+var
+  Idx: Integer;
+begin
+  if (AOwner = nil) or (FSlots = nil) then
+    Exit;
+  FLock.Enter;
+  try
+    FSlots.Remove(AOwner);
+    Idx := FSlotOrder.IndexOf(AOwner);
+    if Idx >= 0 then
+      FSlotOrder.Delete(Idx);
+  finally
+    FLock.Leave;
+  end;
+  RebuildFromSlots(nil);
+end;
+
 procedure TThumbCache.RequestAsync(const APath: string; ASize: Integer;
   AOnReady: TThumbReadyProc; const ANameHint: string);
 var
@@ -1782,7 +3021,8 @@ begin
       if (not HaveStamp) or
          (SameStamp(Cached, Current) and
           not IsPdfThumbExt(APath) and not IsSvgThumbExt(APath) and
-          not IsPsdThumbExt(APath)) then
+          not IsPsdThumbExt(APath) and
+          not IsMetaThumbExt(ThumbExtOf(APath, ''))) then
         Exit;
       FNoThumb.Remove(APath);
     end;
@@ -1810,12 +3050,24 @@ initialization
 
 finalization
   if Assigned(GlobalThumbCache) then
+  begin
     GlobalThumbCache.Shutdown;
-  FreeAndNil(GlobalThumbCache);
-  {$IFDEF MSWINDOWS}
-  FreeAndNil(GShellThumbMap);
-  FreeAndNil(GShellThumbCS);
-  {$ENDIF}
+    if GlobalThumbCache.Quiescent then
+    begin
+      FreeAndNil(GlobalThumbCache);
+      {$IFDEF MSWINDOWS}
+      FreeAndNil(GShellThumbMap);
+      FreeAndNil(GShellThumbCS);
+      {$ENDIF}
+    end;
+  end
+  else
+  begin
+    {$IFDEF MSWINDOWS}
+    FreeAndNil(GShellThumbMap);
+    FreeAndNil(GShellThumbCS);
+    {$ENDIF}
+  end;
 
 end.
 

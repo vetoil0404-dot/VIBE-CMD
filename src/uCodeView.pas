@@ -10,7 +10,8 @@ uses
   System.SysUtils, System.Classes, System.Types, System.UITypes, System.Math,
   FMX.Types, FMX.Controls, FMX.Layouts, FMX.Objects, FMX.Graphics, FMX.StdCtrls,
   FMX.Platform, FMX.TextLayout,
-  uAppSettings, uThemeManager, uTextCode, uCustomScrollbar, uFluentChrome;
+  uAppSettings, uThemeManager, uTextCode, uCustomScrollbar, uFluentChrome,
+  uLang;
 
 type
   TCodeView = class(TLayout)
@@ -715,8 +716,8 @@ begin
   if FMenu = nil then
     Exit;
   FMenu.ClearItems;
-  FMenu.AddItem('Копировать', 'Ctrl+C', MenuCopy);
-  FMenu.AddItem('Выделить всё', 'Ctrl+A', MenuAll);
+  FMenu.AddItem(L('code.copy'), 'Ctrl+C', MenuCopy);
+  FMenu.AddItem(L('code.all'), 'Ctrl+A', MenuAll);
   FMenu.ApplyTheme(FColors);
   FMenu.PopupAtCursor;
 end;

@@ -6,7 +6,7 @@ uses
   System.SysUtils, System.Types, System.UITypes, System.Classes,
   System.Generics.Collections,
   FMX.Types, FMX.Controls, FMX.Objects, FMX.Layouts, FMX.Graphics, FMX.StdCtrls,
-  uAppSettings, uThemeManager;
+  uAppSettings, uThemeManager, uLang, uLangBind;
 
 type
   TTabCloseEvent = procedure(Sender: TObject; AIndex: Integer; var ACanClose: Boolean) of object;
@@ -45,10 +45,14 @@ type
     FOnTabAdd: TProc;
     FOnTabReorder: TTabReorderEvent;
     FOnTabDragQuery: TTabDragQueryEvent;
+    FOnPointerDown: TNotifyEvent;
     FBusy: TList<Boolean>;
     FBusyTimer: TTimer;
     FBusyFrame: Integer;
 
+    procedure NotifyPointerDown;
+    procedure BarMouseDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
     procedure RebuildTabs;
     procedure BusyTick(Sender: TObject);
     procedure PaintTabSpinner(Sender: TObject; Canvas: TCanvas);
@@ -110,6 +114,7 @@ type
     property OnTabAdd: TProc read FOnTabAdd write FOnTabAdd;
     property OnTabReorder: TTabReorderEvent read FOnTabReorder write FOnTabReorder;
     property OnTabDragQuery: TTabDragQueryEvent read FOnTabDragQuery write FOnTabDragQuery;
+    property OnPointerDown: TNotifyEvent read FOnPointerDown write FOnPointerDown;
   end;
 
 function IsTabDragActive: Boolean;
@@ -211,6 +216,8 @@ end;
 
 procedure TTabChrome.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
 begin
+  if Assigned(FBar) then
+    FBar.NotifyPointerDown;
   inherited;
   if Button = TMouseButton.mbLeft then
   begin
@@ -266,6 +273,7 @@ begin
   Result.HitTest := True;
   Result.Cursor := crHandPoint;
   Result.OnClick := AOnClick;
+  Result.OnMouseDown := BarMouseDown;
   Result.OnMouseEnter := NavMouseEnter;
   Result.OnMouseLeave := NavMouseLeave;
 
@@ -310,6 +318,7 @@ begin
   FContainer.Fill.Kind := TBrushKind.Solid;
   FContainer.Fill.Color := TAlphaColors.Null;
   FContainer.OnMouseWheel := TabsMouseWheel;
+  FContainer.OnMouseDown := BarMouseDown;
   FContainer.OnResize := ContainerResize;
 
   FNavCluster := TLayout.Create(FContainer);
@@ -340,9 +349,10 @@ begin
   FAddButton.HitTest := True;
   FAddButton.Cursor := crHandPoint;
   FAddButton.OnClick := AddClick;
+  FAddButton.OnMouseDown := BarMouseDown;
   FAddButton.OnMouseEnter := AddMouseEnter;
   FAddButton.OnMouseLeave := AddMouseLeave;
-  FAddButton.Hint := 'Новая вкладка';
+  TrHint(FAddButton, 'tab.new');
   FAddButton.ShowHint := True;
 
   FAddLabel := TLabel.Create(FAddButton);
@@ -362,6 +372,7 @@ begin
   FScrollBox.ShowScrollBars := False;
   FScrollBox.Margins.Rect := TRectF.Create(6, 0, 36, 0);
   FScrollBox.OnMouseWheel := TabsMouseWheel;
+  FScrollBox.OnMouseDown := BarMouseDown;
   FScrollBox.OnResize := ScrollBoxResize;
   FScrollBox.OnApplyStyleLookup := ScrollBoxApplyStyle;
   FScrollBox.AniCalculations.Animation := False;
@@ -396,8 +407,26 @@ var
   J, K: Integer;
   Child: TControl;
   CloseBtn: TRectangle;
+  Shade: Byte;
 begin
-  if AIsActive then
+  if TAlphaColorRec(FThemeColors.HeaderBackground).A < 255 then
+  begin
+    { Акрил: полоса прозрачная, неактивная вкладка — тёмная вуаль.
+      Наведение ослабляет тень, активная остаётся чистым стеклом. }
+    if AIsActive then
+      ATabRect.Fill.Color := TAlphaColors.Null
+    else
+    begin
+      if FThemeColors.IsDark then
+        Shade := $48
+      else
+        Shade := $28;
+      if AIsHover then
+        Shade := Shade div 2;
+      ATabRect.Fill.Color := ThemeAdjustAlpha(TAlphaColors.Black, Shade);
+    end;
+  end
+  else if AIsActive then
     ATabRect.Fill.Color := FThemeColors.HeaderBackground
   else if AIsHover then
     ATabRect.Fill.Color := BlendColors(FThemeColors.HeaderBackground,
@@ -830,6 +859,18 @@ begin
     ClearTabDrag;
 end;
 
+procedure TCustomTabsBar.NotifyPointerDown;
+begin
+  if Assigned(FOnPointerDown) then
+    FOnPointerDown(Self);
+end;
+
+procedure TCustomTabsBar.BarMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  NotifyPointerDown;
+end;
+
 procedure TCustomTabsBar.TabClick(Sender: TObject);
 var
   Idx: Integer;
@@ -1161,6 +1202,7 @@ begin
       CloseBtn.HitTest := True;
       CloseBtn.Cursor := crHandPoint;
       CloseBtn.OnClick := CloseClick;
+      CloseBtn.OnMouseDown := BarMouseDown;
       CloseBtn.OnMouseEnter := CloseMouseEnter;
       CloseBtn.OnMouseLeave := CloseMouseLeave;
 

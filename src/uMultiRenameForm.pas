@@ -41,6 +41,8 @@ type
     FPreviewScroll: TCustomFileScrollbar;
     FStatus: TText;
     FBtnStart, FBtnClose: TFluentButton;
+    FCaseMode: TRenameCaseMode;
+    FCaseBtns: array[0..3] of TFluentButton;
 
     procedure BuildUI;
     function MakeCard(AParent: TFmxObject; const ATitle: string): TRectangle;
@@ -48,10 +50,13 @@ type
       AX, AY, AW, AH: Single; ABold: Boolean = False): TText;
     function MakeEdit(AParent: TFmxObject; AX, AY, AW, AH: Single): TFluentEdit;
     function MakeTok(AParent: TFmxObject; const ACaption, AHint: string): TFluentButton;
+    function MakeCase(const ACaption, AHint: string; AMode: TRenameCaseMode;
+      AWidth: Single): TFluentButton;
     procedure Place(ACtrl: TControl; AX, AY, AW, AH: Single);
     procedure LayoutBlocks;
     procedure BlocksResize(Sender: TObject);
     procedure TokenClick(Sender: TObject);
+    procedure CaseClick(Sender: TObject);
     procedure MaskFocus(Sender: TObject);
     procedure ParamChanged(Sender: TObject);
     procedure CollectParams;
@@ -80,6 +85,9 @@ type
 
 implementation
 
+uses
+  uLang, uLangBind;
+
 const
   { --- сетка: правьте эти числа --- }
   GAP        = 10;
@@ -106,7 +114,7 @@ begin
   Height := 700;
   BorderStyle := TFmxFormBorderStyle.Single;
   BorderIcons := [TBorderIcon.biSystemMenu];
-  Caption := 'Пакетное переименование файлов';
+  TrForm(Self, 'rename.title');
   ShowHint := True;
   Position := TFormPosition.OwnerFormCenter;
   BuildUI;
@@ -177,7 +185,7 @@ begin
   Result.Fill.Kind := TBrushKind.Solid;
   Result.Tag := 1;
   if ATitle <> '' then
-    MakeLabel(Result, ATitle, INSET, 8, 400, 20, True);
+    TrText(MakeLabel(Result, ATitle, INSET, 8, 400, 20, True), ATitle);
 end;
 
 function TMultiRenameForm.MakeLabel(AParent: TFmxObject; const ACaption: string;
@@ -212,9 +220,33 @@ begin
   BW := Max(TOK_W, Length(ACaption) * 8 + 18);
   Result := CreateFluentButton(Self, AParent, '', ACaption, fbkSubtle, BW, TokenClick);
   Result.TagString := ACaption;
-  Result.Hint := AHint;
-  Result.ShowHint := True;
+  TrHint(Result, AHint);
   Place(Result, 0, 0, BW, 30);
+end;
+
+function TMultiRenameForm.MakeCase(const ACaption, AHint: string;
+  AMode: TRenameCaseMode; AWidth: Single): TFluentButton;
+var
+  I, J: Integer;
+  Obj, Inner: TFmxObject;
+begin
+  Result := CreateFluentButton(Self, FBlkTok, '', ACaption, fbkSubtle, AWidth, CaseClick);
+  Result.Tag := Ord(AMode);
+  TrHint(Result, AHint);
+  for I := 0 to Result.ChildrenCount - 1 do
+  begin
+    Obj := Result.Children[I];
+    if Obj is TText then
+      TText(Obj).TextSettings.HorzAlign := TTextAlign.Center
+    else
+      for J := 0 to Obj.ChildrenCount - 1 do
+      begin
+        Inner := Obj.Children[J];
+        if Inner is TText then
+          TText(Inner).TextSettings.HorzAlign := TTextAlign.Center;
+      end;
+  end;
+  Place(Result, 0, 0, AWidth, 30);
 end;
 
 procedure TMultiRenameForm.LayoutBlocks;
@@ -223,6 +255,7 @@ var
   I: Integer;
   Ch: TFmxObject;
   C: TControl;
+  CaseRow: Boolean;
 begin
   if FBlocks = nil then
     Exit;
@@ -248,12 +281,23 @@ begin
   begin
     TX := INSET;
     TY := 10;
+    CaseRow := False;
     for I := 0 to FBlkTok.ChildrenCount - 1 do
     begin
       Ch := FBlkTok.Children[I];
       if Ch is TFluentButton then
       begin
         C := TControl(Ch);
+        { Кнопки регистра (Tag <> 0) всегда с новой строки, одним рядом. }
+        if (C.Tag <> 0) and not CaseRow then
+        begin
+          if TX > INSET then
+          begin
+            TX := INSET;
+            TY := TY + 30 + TOK_GAP;
+          end;
+          CaseRow := True;
+        end;
         if (TX > INSET) and (TX + C.Width > W - INSET) then
         begin
           TX := INSET;
@@ -296,9 +340,11 @@ begin
   Footer.Align := TAlignLayout.Bottom;
   Footer.Height := 42;
   Footer.Margins.Top := 10;
-  FBtnClose := CreateFluentButton(Self, Footer, '', 'Закрыть', fbkStandard, 110, CloseClick);
+  FBtnClose := CreateFluentButton(Self, Footer, '', L('rename.close'), fbkStandard, 110, CloseClick);
+  TrButton(FBtnClose, 'rename.close');
   FBtnClose.Align := TAlignLayout.Right;
-  FBtnStart := CreateFluentButton(Self, Footer, '', 'Выполнить', fbkAccent, 148, StartClick);
+  FBtnStart := CreateFluentButton(Self, Footer, '', L('rename.go'), fbkAccent, 148, StartClick);
+  TrButton(FBtnStart, 'rename.go');
   FBtnStart.Align := TAlignLayout.Right;
   FBtnStart.Margins.Right := 8;
   FStatus := TText.Create(Self);
@@ -342,54 +388,54 @@ begin
   FBlocks.Margins.Bottom := GAP;
   FBlocks.OnResize := BlocksResize;
 
-  FBlkName := MakeCard(FBlocks, 'Маска имени файла');
+  FBlkName := MakeCard(FBlocks, 'rename.mask');
   FEdName := MakeEdit(FBlkName, INSET, 34, 200, EDIT_H);
   FEdName.Text := '[N]';
   FLastMask := FEdName;
 
-  FBlkExt := MakeCard(FBlocks, 'Расширение');
+  FBlkExt := MakeCard(FBlocks, 'rename.ext');
   FEdExt := MakeEdit(FBlkExt, INSET, 34, 200, EDIT_H);
   FEdExt.Text := '[E]';
 
   FBlkTok := MakeCard(FBlocks, '');
-  MakeTok(FBlkTok, '[N]', 'Имя файла без расширения');
-  MakeTok(FBlkTok, '[E]', 'Расширение файла');
-  MakeTok(FBlkTok, '[C]', 'Счётчик (старт / шаг / знаки)');
-  MakeTok(FBlkTok, '[P]', 'Имя родительской папки');
-  MakeTok(FBlkTok, '[Y]', 'Год, 4 цифры (2026)');
-  MakeTok(FBlkTok, '[y]', 'Год, 2 цифры (26)');
-  MakeTok(FBlkTok, '[M]', 'Месяц (01–12)');
-  MakeTok(FBlkTok, '[D]', 'День (01–31)');
-  MakeTok(FBlkTok, '[h]', 'Час (00–23)');
-  MakeTok(FBlkTok, '[m]', 'Минута');
-  MakeTok(FBlkTok, '[s]', 'Секунда');
-  MakeTok(FBlkTok, '[N-2]', 'Первые два символа имени');
-  MakeTok(FBlkTok, '[N2-]', 'Имя со второго символа');
-  MakeTok(FBlkTok, '[N1-4]', 'Символы 1–4 имени');
-  MakeTok(FBlkTok, '[Nlower]', 'Имя в нижнем регистре');
-  MakeTok(FBlkTok, '[Nupper]', 'Имя в ВЕРХНЕМ регистре');
-  MakeTok(FBlkTok, '[Nfirstupper]', 'Имя с заглавной первой буквы');
-  MakeTok(FBlkTok, '[Elower]', 'Расширение в нижнем регистре');
-  MakeTok(FBlkTok, '[Eupper]', 'Расширение в ВЕРХНЕМ регистре');
+  MakeTok(FBlkTok, '[N]', 'rename.tok.n');
+  MakeTok(FBlkTok, '[E]', 'rename.tok.e');
+  MakeTok(FBlkTok, '[C]', 'rename.tok.c');
+  MakeTok(FBlkTok, '[P]', 'rename.tok.p');
+  MakeTok(FBlkTok, '[Y]', 'rename.tok.Y');
+  MakeTok(FBlkTok, '[y]', 'rename.tok.y');
+  MakeTok(FBlkTok, '[M]', 'rename.tok.M');
+  MakeTok(FBlkTok, '[D]', 'rename.tok.D');
+  MakeTok(FBlkTok, '[h]', 'rename.tok.h');
+  MakeTok(FBlkTok, '[m]', 'rename.tok.m');
+  MakeTok(FBlkTok, '[s]', 'rename.tok.s');
+  MakeTok(FBlkTok, '[N-2]', 'rename.tok.nhead');
+  MakeTok(FBlkTok, '[N2-]', 'rename.tok.ntail');
+  MakeTok(FBlkTok, '[N1-4]', 'rename.tok.nrange');
+  FCaseBtns[0] := MakeCase('АА', 'rename.case.upper', rcUpper, 52);
+  FCaseBtns[1] := MakeCase('аа', 'rename.case.lower', rcLower, 52);
+  FCaseBtns[2] := MakeCase('Аа', 'rename.case.first', rcFirstUpper, 52);
+  FCaseBtns[3] := MakeCase('Аа Аа', 'rename.case.words', rcWords, 84);
 
-  FBlkCnt := MakeCard(FBlocks, 'Счётчик [C]');
-  MakeLabel(FBlkCnt, 'Старт:', INSET, 34, LAB_W, EDIT_H);
+  FBlkCnt := MakeCard(FBlocks, 'rename.counter');
+  TrText(MakeLabel(FBlkCnt, 'rename.start', INSET, 34, LAB_W, EDIT_H), 'rename.start');
   FEdStart := MakeEdit(FBlkCnt, INSET + LAB_W, 34, CNT_EDIT_W, EDIT_H);
   FEdStart.Text := '1';
-  MakeLabel(FBlkCnt, 'Шаг:', INSET, 68, LAB_W, EDIT_H);
+  TrText(MakeLabel(FBlkCnt, 'rename.step', INSET, 68, LAB_W, EDIT_H), 'rename.step');
   FEdStep := MakeEdit(FBlkCnt, INSET + LAB_W, 68, CNT_EDIT_W, EDIT_H);
   FEdStep.Text := '1';
-  MakeLabel(FBlkCnt, 'Знаков:', INSET, 102, LAB_W, EDIT_H);
+  TrText(MakeLabel(FBlkCnt, 'rename.digits', INSET, 102, LAB_W, EDIT_H), 'rename.digits');
   FEdDigits := MakeEdit(FBlkCnt, INSET + LAB_W, 102, CNT_EDIT_W, EDIT_H);
   FEdDigits.Text := '3';
 
-  FBlkFind := MakeCard(FBlocks, 'Найти и заменить');
-  MakeLabel(FBlkFind, 'Искать:', INSET, 34, LAB_W, EDIT_H);
+  FBlkFind := MakeCard(FBlocks, 'rename.find');
+  TrText(MakeLabel(FBlkFind, 'rename.search', INSET, 34, LAB_W, EDIT_H), 'rename.search');
   FEdFind := MakeEdit(FBlkFind, INSET + LAB_W, 34, 200, EDIT_H);
-  MakeLabel(FBlkFind, 'Заменить:', INSET, 68, LAB_W, EDIT_H);
+  TrText(MakeLabel(FBlkFind, 'rename.replace', INSET, 68, LAB_W, EDIT_H), 'rename.replace');
   FEdReplace := MakeEdit(FBlkFind, INSET + LAB_W, 68, 200, EDIT_H);
   FCbCase := TFluentCheckRow.Create(Self);
-  FCbCase.Setup(FBlkFind, 'С учетом регистра', False);
+  FCbCase.Setup(FBlkFind, L('rename.casesens'), False);
+  TrCheck(FCbCase, 'rename.casesens');
   FCbCase.OnChange := ParamChanged;
   Place(FCbCase, INSET, 100, 240, 28);
 
@@ -425,6 +471,23 @@ begin
     FLastMask.InsertSnippet(TFluentButton(Sender).TagString);
 end;
 
+procedure TMultiRenameForm.CaseClick(Sender: TObject);
+var
+  Mode: TRenameCaseMode;
+  I: Integer;
+begin
+  if not (Sender is TFluentButton) then
+    Exit;
+  Mode := TRenameCaseMode(TFluentButton(Sender).Tag);
+  if Mode = FCaseMode then
+    Mode := rcKeep;
+  FCaseMode := Mode;
+  for I := 0 to High(FCaseBtns) do
+    if FCaseBtns[I] <> nil then
+      FCaseBtns[I].SetSelected(TRenameCaseMode(FCaseBtns[I].Tag) = FCaseMode);
+  RefreshPreview;
+end;
+
 procedure TMultiRenameForm.CollectParams;
 begin
   if (FEngine = nil) or (FEdName = nil) or (FEdExt = nil) then
@@ -434,6 +497,7 @@ begin
   FEngine.FindText := FEdFind.Text;
   FEngine.ReplaceText := FEdReplace.Text;
   FEngine.CaseSensitive := Assigned(FCbCase) and FCbCase.Checked;
+  FEngine.CaseMode := FCaseMode;
   FEngine.UseRegex := False;
   FEngine.CounterStart := StrToIntDef(Trim(FEdStart.Text), 1);
   FEngine.CounterStep := StrToIntDef(Trim(FEdStep.Text), 1);
@@ -459,9 +523,9 @@ begin
   if Assigned(FPreviewScroll) then
     FPreviewScroll.UpdateThumb;
   if C > 0 then
-    FStatus.Text := Format('Файлов: %d    Коллизий: %d', [N, C])
+    FStatus.Text := Lf('rename.filescoll', [N, C])
   else
-    FStatus.Text := Format('Файлов: %d', [N]);
+    FStatus.Text := Lf('rename.files', [N]);
   FPreviewPaint.Repaint;
 end;
 
@@ -500,9 +564,9 @@ begin
     Canvas.Font.Size := 12;
     Head := TRectF.Create(8, 0, Mid - 6, ROW_H);
     Canvas.Fill.Color := FColors.SubTextColor;
-    Canvas.FillText(Head, 'Исходное имя', False, 1, [], TTextAlign.Leading, TTextAlign.Center);
+    Canvas.FillText(Head, L('rename.oldname'), False, 1, [], TTextAlign.Leading, TTextAlign.Center);
     Head := TRectF.Create(Mid + 6, 0, W - 8, ROW_H);
-    Canvas.FillText(Head, 'Новое имя', False, 1, [], TTextAlign.Leading, TTextAlign.Center);
+    Canvas.FillText(Head, L('rename.newname'), False, 1, [], TTextAlign.Leading, TTextAlign.Center);
     Canvas.Stroke.Color := FColors.DividerColor;
     Canvas.Stroke.Thickness := 1;
     Canvas.DrawLine(TPointF.Create(Mid, 4), TPointF.Create(Mid, FPreviewPaint.Height - 4), 1);
@@ -517,7 +581,7 @@ begin
         Canvas.Fill.Color := ThemeAdjustAlpha(FColors.DangerColor, $40);
         Canvas.FillRect(TRectF.Create(0, Y, W, Y + ROW_H), 0, 0, [], 1);
         Canvas.Fill.Color := FColors.DangerColor;
-        NewCaption := NewCaption + '    ⚠  Коллизия';
+        NewCaption := NewCaption + '    ⚠  ' + L('rename.collision');
       end
       else if Odd(I) then
       begin
@@ -566,7 +630,7 @@ begin
   if N > 0 then
     ModalResult := mrOk
   else
-    FStatus.Text := 'Нечего переименовывать (коллизии или имена не изменились)';
+    FStatus.Text := L('rename.nothing');
 end;
 
 procedure TMultiRenameForm.CloseClick(Sender: TObject);

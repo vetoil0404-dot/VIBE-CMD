@@ -36,6 +36,8 @@ procedure GetAppIconBitmap(var ABitmap: FMX.Graphics.TBitmap; ASize: Integer = 3
 function GetFileThumbnail(const AFilePath: string; AWidth, AHeight: Integer; ABitmap: FMX.Graphics.TBitmap): Boolean;
 function GetFileThumbnailRaw(const AFilePath: string; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+function GetFileThumbnailOnly(const AFilePath: string; ASize: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 procedure ClearFolderThumbPlate(var APixels: TBytes; AWidth, AHeight: Integer);
 function GetShellItemThumbnailRaw(const AItem: IUnknown; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
@@ -2004,6 +2006,33 @@ begin
       not IsFolder, APixels, AOutW, AOutH);
   if Result and IsFolder then
     KnockOutWhiteFolderBg(APixels, AOutW, AOutH);
+end;
+
+function GetFileThumbnailOnly(const AFilePath: string; ASize: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+var
+  Size: Integer;
+begin
+  SetLength(APixels, 0);
+  AOutW := 0;
+  AOutH := 0;
+  Result := False;
+  if AFilePath = '' then
+    Exit;
+  Size := ASize;
+  if Size < 96 then
+    Size := 96;
+  if Size > 512 then
+    Size := 512;
+  Result := ShellItemImageRaw(AFilePath, Size, Size, SIIGBF_THUMBNAILONLY, Size,
+    True, APixels, AOutW, AOutH);
+  if Result and ((AOutW < 96) or (AOutH < 96)) then
+  begin
+    Result := False;
+    SetLength(APixels, 0);
+    AOutW := 0;
+    AOutH := 0;
+  end;
 end;
 
 function GetFileThumbnail(const AFilePath: string; AWidth, AHeight: Integer;

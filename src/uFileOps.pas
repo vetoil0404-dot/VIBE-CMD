@@ -6,6 +6,7 @@
   V!be: engine + окно прогресса (конфликты там).
   Тихий: без progress/Shell-диалогов; конфликты имён — uConflictDialog.
   Проводник: SHFileOperation с диалогами Windows.
+  Тихий и Проводник показывают процесс на пилюле средней панели.
 }
 
 interface
@@ -78,18 +79,21 @@ implementation
 
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
-  uFileOpEngine, uArchiveEngine, uConflictDialog;
+  uFileOpEngine, uArchiveEngine, uConflictDialog, uLang;
 
 procedure CopyDirRecursive(const ASrc, ADst: string); forward;
 procedure DeletePathCore(const APath: string; APermanent: Boolean); forward;
 procedure ArchivePathsCore(const ASources: TArray<string>; const AZipFile: string); forward;
 procedure CopyPathCore(const ASource, ADestDir: string); forward;
+function StartOpTrack(AKind: TFileOpKind; const ASources: TArray<string>;
+  const ADest: string; AQueued: Boolean): Integer; forward;
 
 var
   GFileOpMode: TFileOpMode = fomVibe;
   GFileOpWnd: NativeUInt = 0;
   GListOpBusy: Boolean = False;
   GListOpCancel: Boolean = False;
+  GListOpClosing: Boolean = False;
   GFileOpHubChanged: TNotifyEvent;
   GVibeLaunch: TVibeLaunchProc;
   GVibeRestore: TFunc<Integer, Boolean>;
@@ -118,7 +122,7 @@ begin
   if Assigned(GVibeLaunch) then
     GVibeLaunch(Ord(AKind), ASources, ADest, AOnDone, APermanent, AOnItemDone)
   else if Assigned(AOnDone) then
-    AOnDone(False, 'Окно операции не готово');
+    AOnDone(False, L('ops.notready'));
 end;
 
 function RestoreVibeKind(AKind: TFileOpKind): Boolean;
@@ -156,9 +160,13 @@ begin
   Result := RestoreVibeKind(okDelete);
 end;
 
+procedure DrainQuietFileOps; forward;
+
 procedure CancelListFileOps;
 begin
+  GListOpClosing := True;
   GListOpCancel := True;
+  DrainQuietFileOps;
 end;
 
 function IsOfficeLockName(const APath: string): Boolean;
@@ -325,13 +333,13 @@ begin
       begin
         if ShellTransfer(ASource, ADestDir) then
           Exit;
-        raise Exception.Create('Не удалось скопировать с устройства: ' + TargetName);
+        raise Exception.Create(Lf('ops.copydev', [TargetName]));
       end;
       if IsVirtualShellPath(ADestDir) or IsPortableDevicePath(ADestDir) then
       begin
         if ShellTransfer(ASource, ADestDir) then
           Exit;
-        raise Exception.Create('Не удалось скопировать на устройство: ' + TargetName);
+        raise Exception.Create(Lf('ops.copytodev', [TargetName]));
       end;
     end;
   end;
@@ -440,14 +448,14 @@ begin
           TFile.Delete(APath);
       end
       else
-        raise Exception.Create('Не удалось переместить в корзину');
+        raise Exception.Create(L('ops.recycle'));
     end;
     Exit;
   end;
   if not APermanent then
   begin
     if not ShellDeletePath(APath, False) then
-      raise Exception.Create('Не удалось переместить в корзину');
+      raise Exception.Create(L('ops.recycle'));
     Exit;
   end;
   {$ENDIF}
@@ -569,6 +577,7 @@ procedure ArchivePathsAsync(const ASources: TArray<string>; const AZipFile: stri
 var
   Snapshot: TArray<string>;
   ZipPath: string;
+  TrackId: Integer;
 begin
   Snapshot := Copy(ASources);
   ZipPath := AZipFile;
@@ -577,6 +586,7 @@ begin
     LaunchVibe(okArchive, Snapshot, ZipPath, AOnDone);
     Exit;
   end;
+  TrackId := StartOpTrack(okArchive, Snapshot, ZipPath, False);
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -586,6 +596,8 @@ begin
       Fine := True;
       Err := '';
       try
+        if FileOpTrackCancelled(TrackId) then
+          raise Exception.Create(L('op.cancelled'));
         ArchivePathsCore(Snapshot, ZipPath);
       except
         on E: Exception do
@@ -597,6 +609,7 @@ begin
       TThread.Queue(nil,
         procedure
         begin
+          FileOpTrackEnd(TrackId);
           if Assigned(AOnDone) then
             AOnDone(Fine, Err);
         end);
@@ -750,7 +763,7 @@ begin
     if TFile.Exists(ASrc) then
       Local := ASrc
     else if not MaterializeArchiveFile(ASrc, Local) then
-      raise Exception.Create('Не удалось прочитать: ' + SrcName);
+      raise Exception.Create(Lf('ops.readfail', [SrcName]));
     if SameText(TPath.GetFileName(Local), Name) then
     begin
       CopyArchiveEntry(Local, DestDir);
@@ -811,6 +824,7 @@ type
     Move: Boolean;
     OnDone: TFileOpDoneProc;
     OnItem: TFileOpItemDoneProc;
+    TrackId: Integer;
     Conflicts: TList<TConflictItem>;
     Errors: TStringList;
     OrigFolders: TStringList;
@@ -827,11 +841,26 @@ type
 var
   GQuietWait: TList<TListOpJob>;
 
+procedure DrainQuietFileOps;
+var
+  Job: TListOpJob;
+begin
+  if GQuietWait = nil then
+    Exit;
+  while GQuietWait.Count > 0 do
+  begin
+    Job := GQuietWait[0];
+    GQuietWait.Delete(0);
+    Job.Free;
+  end;
+end;
+
 procedure PumpQuietQueue; forward;
 
 function TListOpJob.Cancelled: Boolean;
 begin
-  Result := GListOpCancel or Application.Terminated;
+  Result := GListOpCancel or Application.Terminated or
+    FileOpTrackCancelled(TrackId);
 end;
 
 procedure TListOpJob.Notify(const APath: string; AStatus: TOpItemStatus);
@@ -922,7 +951,7 @@ begin
   end;
   if not OpExists(ASrc) then
   begin
-    Errors.Add(TPath.GetFileName(ASrc) + ': источник исчез');
+    Errors.Add(Lf('ops.gone', [TPath.GetFileName(ASrc)]));
     Notify(ASrc, oisError);
     Exit(oisError);
   end;
@@ -942,7 +971,7 @@ begin
   begin
     if DstExists and not DstDir then
     begin
-      Errors.Add(TPath.GetFileName(ASrc) + ': тип не совпадает');
+      Errors.Add(Lf('ops.typemismatch', [TPath.GetFileName(ASrc)]));
       Notify(ASrc, oisError);
       Exit(oisError);
     end;
@@ -1034,7 +1063,7 @@ begin
 
   if SrcDir <> DstDir then
   begin
-    Errors.Add(TPath.GetFileName(ASrc) + ': тип не совпадает');
+    Errors.Add(Lf('ops.typemismatch', [TPath.GetFileName(ASrc)]));
     Notify(ASrc, oisError);
     Exit(oisError);
   end;
@@ -1053,7 +1082,7 @@ begin
     Exit;
   if not OpExists(AIt.SourcePath) then
   begin
-    Errors.Add(TPath.GetFileName(AIt.SourcePath) + ': источник исчез');
+    Errors.Add(Lf('ops.gone', [TPath.GetFileName(AIt.SourcePath)]));
     Notify(AIt.SourcePath, oisSkipped);
     Exit(oisSkipped);
   end;
@@ -1070,14 +1099,14 @@ begin
     if (Dest = '') or SameText(ExcludeTrailingPathDelimiter(Dest),
        ExcludeTrailingPathDelimiter(AIt.DestPath)) then
     begin
-      Errors.Add(TPath.GetFileName(AIt.SourcePath) + ': не удалось подобрать имя');
+      Errors.Add(Lf('ops.noname', [TPath.GetFileName(AIt.SourcePath)]));
       Notify(AIt.SourcePath, oisError);
       Exit(oisError);
     end;
 {$IFDEF MSWINDOWS}
     if (Length(Dest) > MAX_PATH) and not StartsText('\\?\', Dest) then
     begin
-      Errors.Add(TPath.GetFileName(AIt.SourcePath) + ': имя длиннее MAX_PATH');
+      Errors.Add(Lf('ops.longname', [TPath.GetFileName(AIt.SourcePath)]));
       Notify(AIt.SourcePath, oisError);
       Exit(oisError);
     end;
@@ -1153,10 +1182,12 @@ var
   Acts: TArray<TConflictAction>;
   I: Integer;
   DoneCb: TFileOpDoneProc;
+  EndId: Integer;
 begin
   Fine := True;
   Err := '';
   DoneCb := OnDone;
+  EndId := TrackId;
   Conflicts := TList<TConflictItem>.Create;
   Errors := TStringList.Create;
   OrigFolders := TStringList.Create;
@@ -1197,7 +1228,7 @@ begin
       if Cancelled then
       begin
         Fine := False;
-        Err := 'Отменено';
+        Err := L('op.cancelled');
       end
       else if Errors.Count > 0 then
       begin
@@ -1220,6 +1251,7 @@ begin
     TThread.Queue(nil,
       procedure
       begin
+        FileOpTrackEnd(EndId);
         GListOpBusy := False;
         if Assigned(DoneCb) then
           DoneCb(Fine, Err);
@@ -1232,8 +1264,14 @@ procedure StartQuietJob(Job: TListOpJob); forward;
 
 procedure StartQuietJob(Job: TListOpJob);
 begin
+  if GListOpClosing or Application.Terminated then
+  begin
+    Job.Free;
+    Exit;
+  end;
   GListOpBusy := True;
   GListOpCancel := False;
+  FileOpTrackRunning(Job.TrackId);
   TThread.CreateAnonymousThread(
     procedure
     begin
@@ -1256,10 +1294,36 @@ begin
   StartQuietJob(Job);
 end;
 
+function StartOpTrack(AKind: TFileOpKind; const ASources: TArray<string>;
+  const ADest: string; AQueued: Boolean): Integer;
+var
+  Detail, DestName: string;
+begin
+  Result := 0;
+  if not (GFileOpMode in [fomQuiet, fomExplorer]) then
+    Exit;
+  if Length(ASources) = 0 then
+    Exit;
+  if Length(ASources) = 1 then
+    Detail := TPath.GetFileName(ExcludeTrailingPathDelimiter(ASources[0]))
+  else
+    Detail := LCount(Length(ASources), 'op.obj.one', 'op.obj.few', 'op.obj.many');
+  if ADest <> '' then
+  begin
+    DestName := TPath.GetFileName(ExcludeTrailingPathDelimiter(ADest));
+    if DestName = '' then
+      DestName := ExcludeTrailingPathDelimiter(ADest);
+    if DestName <> '' then
+      Detail := Detail + ' → ' + DestName;
+  end;
+  Result := FileOpTrackBegin(AKind, Detail, AQueued);
+end;
+
 procedure RunQuietCopyMove(const ASources: TArray<string>; const ADestDir: string;
   AMove: Boolean; AOnDone: TFileOpDoneProc; AOnItemDone: TFileOpItemDoneProc);
 var
   Job: TListOpJob;
+  Kind: TFileOpKind;
 begin
   if Length(ASources) = 0 then
   begin
@@ -1267,12 +1331,17 @@ begin
       AOnDone(True, '');
     Exit;
   end;
+  if AMove then
+    Kind := okMove
+  else
+    Kind := okCopy;
   Job := TListOpJob.Create;
   Job.Sources := Copy(ASources);
   Job.DestDir := ADestDir;
   Job.Move := AMove;
   Job.OnDone := AOnDone;
   Job.OnItem := AOnItemDone;
+  Job.TrackId := StartOpTrack(Kind, Job.Sources, ADestDir, GListOpBusy);
   if GListOpBusy then
   begin
     if GQuietWait = nil then
@@ -1290,6 +1359,7 @@ var
   Dest: string;
   Ok: Boolean;
   ErrMsg: string;
+  TrackId: Integer;
 begin
   Snapshot := Copy(ASources);
   Dest := ADestDir;
@@ -1305,6 +1375,7 @@ begin
     RunQuietCopyMove(Snapshot, Dest, False, AOnDone, AOnItemDone);
     Exit;
   end;
+  TrackId := StartOpTrack(okCopy, Snapshot, Dest, False);
   SplitDiskSources(Snapshot, Disk, Other);
 {$IFDEF MSWINDOWS}
   if UseShellDiskOps and (Length(Disk) > 0) and CanShellDiskPath(Dest) and
@@ -1315,19 +1386,23 @@ begin
       Ok := True;
       ErrMsg := '';
       try
-        if not ShellFileOp(FO_COPY, Disk, Dest, True) then
-        begin
-          Ok := False;
-          ErrMsg := 'Копирование отменено или не удалось';
-        end
-        else
-          CopyVibeList(Other, Dest);
-      except
-        on E: Exception do
-        begin
-          Ok := False;
-          ErrMsg := E.Message;
+        try
+          if not ShellFileOp(FO_COPY, Disk, Dest, True) then
+          begin
+            Ok := False;
+            ErrMsg := L('ops.copyfail');
+          end
+          else
+            CopyVibeList(Other, Dest);
+        except
+          on E: Exception do
+          begin
+            Ok := False;
+            ErrMsg := E.Message;
+          end;
         end;
+      finally
+        FileOpTrackEnd(TrackId);
       end;
       if Ok and Assigned(AOnItemDone) then
         for var S in Snapshot do
@@ -1348,6 +1423,8 @@ begin
       Fine := True;
       Err := '';
       try
+        if FileOpTrackCancelled(TrackId) then
+          raise Exception.Create(L('op.cancelled'));
 {$IFDEF MSWINDOWS}
         if UseShellDiskOps and (Length(Disk) > 0) and CanShellDiskPath(Dest) and
            TDirectory.Exists(Dest) then
@@ -1359,7 +1436,11 @@ begin
         else
 {$ENDIF}
           for Src in Snapshot do
+          begin
+            if FileOpTrackCancelled(TrackId) then
+              raise Exception.Create(L('op.cancelled'));
             CopyPathCore(Src, Dest);
+          end;
       except
         on E: Exception do
         begin
@@ -1370,6 +1451,7 @@ begin
       TThread.Queue(nil,
         procedure
         begin
+          FileOpTrackEnd(TrackId);
           if Assigned(AOnDone) then
             AOnDone(Fine, Err);
         end);
@@ -1384,6 +1466,7 @@ var
   Ok: Boolean;
   ErrMsg: string;
   Src: string;
+  TrackId: Integer;
 begin
   Snapshot := Copy(ASources);
   Dest := ADestDir;
@@ -1397,6 +1480,7 @@ begin
     RunQuietCopyMove(Snapshot, Dest, True, AOnDone, AOnItemDone);
     Exit;
   end;
+  TrackId := StartOpTrack(okMove, Snapshot, Dest, False);
   SplitDiskSources(Snapshot, Disk, Other);
 {$IFDEF MSWINDOWS}
   if UseShellDiskOps and (Length(Disk) > 0) and CanShellDiskPath(Dest) and
@@ -1407,23 +1491,27 @@ begin
       Ok := True;
       ErrMsg := '';
       try
-        if not ShellFileOp(FO_MOVE, Disk, Dest, True) then
-        begin
-          Ok := False;
-          ErrMsg := 'Перемещение отменено или не удалось';
-        end
-        else
-          for Src in Other do
+        try
+          if not ShellFileOp(FO_MOVE, Disk, Dest, True) then
           begin
-            CopyPathCore(Src, Dest);
-            DeletePathCore(Src, True);
+            Ok := False;
+            ErrMsg := L('ops.movefail');
+          end
+          else
+            for Src in Other do
+            begin
+              CopyPathCore(Src, Dest);
+              DeletePathCore(Src, True);
+            end;
+        except
+          on E: Exception do
+          begin
+            Ok := False;
+            ErrMsg := E.Message;
           end;
-      except
-        on E: Exception do
-        begin
-          Ok := False;
-          ErrMsg := E.Message;
         end;
+      finally
+        FileOpTrackEnd(TrackId);
       end;
       if Ok and Assigned(AOnItemDone) then
         for var S in Snapshot do
@@ -1444,6 +1532,8 @@ begin
       Fine := True;
       Err := '';
       try
+        if FileOpTrackCancelled(TrackId) then
+          raise Exception.Create(L('op.cancelled'));
 {$IFDEF MSWINDOWS}
         if UseShellDiskOps and (Length(Disk) > 0) and CanShellDiskPath(Dest) and
            TDirectory.Exists(Dest) then
@@ -1464,6 +1554,8 @@ begin
 {$ENDIF}
           for P in Snapshot do
           begin
+            if FileOpTrackCancelled(TrackId) then
+              raise Exception.Create(L('op.cancelled'));
             CopyPathCore(P, Dest);
             DeletePathCore(P, True);
           end;
@@ -1477,6 +1569,7 @@ begin
       TThread.Queue(nil,
         procedure
         begin
+          FileOpTrackEnd(TrackId);
           if Assigned(AOnDone) then
             AOnDone(Fine, Err);
         end);
@@ -1493,7 +1586,7 @@ begin
     if ShellFileOp(FO_DELETE, APaths, '', not APermanent) then
       Exit;
     if not APermanent then
-      raise Exception.Create('Удаление отменено или не удалось');
+      raise Exception.Create(L('ops.delfail'));
   end;
 {$ENDIF}
   for P in APaths do
@@ -1507,6 +1600,7 @@ var
   Disk, Other: TArray<string>;
   Ok: Boolean;
   ErrMsg: string;
+  TrackId: Integer;
 begin
   Snapshot := Copy(APaths);
   if GFileOpMode = fomVibe then
@@ -1514,6 +1608,7 @@ begin
     LaunchVibe(okDelete, Snapshot, '', AOnDone, APermanent);
     Exit;
   end;
+  TrackId := StartOpTrack(okDelete, Snapshot, '', False);
   SplitDiskSources(Snapshot, Disk, Other);
 {$IFDEF MSWINDOWS}
   if UseShellDiskOps and (GFileOpMode = fomExplorer) and (Length(Disk) > 0) then
@@ -1521,14 +1616,18 @@ begin
     Ok := True;
     ErrMsg := '';
     try
-      DeleteDiskList(Disk, APermanent);
-      DeleteDiskList(Other, APermanent);
-    except
-      on E: Exception do
-      begin
-        Ok := False;
-        ErrMsg := E.Message;
+      try
+        DeleteDiskList(Disk, APermanent);
+        DeleteDiskList(Other, APermanent);
+      except
+        on E: Exception do
+        begin
+          Ok := False;
+          ErrMsg := E.Message;
+        end;
       end;
+    finally
+      FileOpTrackEnd(TrackId);
     end;
     if Assigned(AOnDone) then
       AOnDone(Ok, ErrMsg);
@@ -1553,6 +1652,8 @@ begin
       Regular := TStringList.Create;
       try
         try
+          if FileOpTrackCancelled(TrackId) then
+            raise Exception.Create(L('op.cancelled'));
           for P in Snapshot do
             if TryZipItem(P, Z, Inner) and (Inner <> '') then
             begin
@@ -1592,6 +1693,7 @@ begin
       TThread.Queue(nil,
         procedure
         begin
+          FileOpTrackEnd(TrackId);
           if Assigned(AOnDone) then
             AOnDone(Fine, Err);
         end);

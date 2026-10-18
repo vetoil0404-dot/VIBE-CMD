@@ -28,7 +28,7 @@ uses
   Winapi.Windows, Winapi.ActiveX, Winapi.ShellAPI, Winapi.ShlObj,
   Vcl.Graphics, Vcl.Imaging.pngimage,
   FMX.Types, FMX.Platform.Win,
-  uFilePanel, uCustomTabs;
+  uFilePanel, uCustomTabs, uLang;
 
 const
   CF_FMOBJECT = CF_PRIVATEFIRST + 1;
@@ -244,7 +244,7 @@ begin
   if Succeeded(Stm.Stat(Stat, STATFLAG_NONAME)) then
     Total := Stat.cbSize;
   if Total > MaxDropBytes then
-    raise Exception.Create('Файл слишком большой (лимит 100 МБ)');
+    raise Exception.Create(L('drop.toobig'));
   if Total > 0 then
     SetLength(Result, Total);
   Got := 0;
@@ -254,7 +254,7 @@ begin
       Break;
     Chunk := Longint(ReadN);
     if Got + Chunk > MaxDropBytes then
-      raise Exception.Create('Файл слишком большой (лимит 100 МБ)');
+      raise Exception.Create(L('drop.toobig'));
     if Length(Result) < Got + Chunk then
       SetLength(Result, Got + Chunk);
     Move(Buf[0], Result[Got], Chunk);
@@ -903,16 +903,16 @@ begin
       end;
     Resp := Http.Get(AUrl, MS);
     if Aborted then
-      raise Exception.Create('Файл слишком большой (лимит 100 МБ)');
+      raise Exception.Create(L('drop.toobig'));
     if (Resp = nil) or (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
     begin
       if Resp <> nil then
         raise Exception.Create('HTTP ' + IntToStr(Resp.StatusCode))
       else
-        raise Exception.Create('Нет ответа сервера');
+        raise Exception.Create(L('drop.noresponse'));
     end;
     if MS.Size > MaxDropBytes then
-      raise Exception.Create('Файл слишком большой (лимит 100 МБ)');
+      raise Exception.Create(L('drop.toobig'));
     AMime := Resp.MimeType;
     SetLength(ABytes, MS.Size);
     if MS.Size > 0 then
@@ -923,7 +923,7 @@ begin
     if MimeLooksLikeHtml(AMime) and (ExtFromSignature(ABytes) = '') then
     begin
       SetLength(ABytes, 0);
-      raise Exception.Create('Браузер не отдал файл');
+      raise Exception.Create(L('drop.nobrowser'));
     end;
   finally
     MS.Free;
@@ -1027,7 +1027,7 @@ begin
           if Length(Saved) = 0 then
           begin
             if not PanelClosing(FPanel) then
-              FPanel.ShowNotice('Браузер не отдал файл');
+              FPanel.ShowNotice(L('drop.nobrowser'));
             Exit;
           end;
           if not PanelClosing(FPanel) then
@@ -1238,7 +1238,7 @@ begin
 
     if not ParseBrowserDrop(dataObj, Items) then
     begin
-      Panel.ShowNotice('Браузер не отдал файл');
+      Panel.ShowNotice(L('drop.nobrowser'));
       Exit;
     end;
 

@@ -20,6 +20,7 @@ procedure RunVibeOperation(AKind: TFileOpKind; const ASources: TArray<string>;
   const ADest: string; AOnDone: TFileOpDoneProc; APermanent: Boolean = False;
   AOnItemDone: TFileOpItemDoneProc = nil);
 function RestoreVibeBackground(AKind: TFileOpKind): Boolean;
+procedure DismissFileOpProgress;
 
 function FileOpKindIcon(AKind: TFileOpKind): string;
 
@@ -79,6 +80,8 @@ type
     FConfRowName: array[0..7] of TText;
     FArchCombo: TFluentComboBox;
     FBtnConfirmYes: TFluentButton;
+    FBtnConfirmNo: TFluentButton;
+    FKeyBtn: TFluentButton;
     FArchStem: string;
     FArchLock: Boolean;
     FArchKinds: array[0..4] of Integer;
@@ -112,6 +115,17 @@ type
     procedure ArchKindChanged(Sender: TObject);
     procedure ConfirmYesClick(Sender: TObject);
     procedure ConfirmNoClick(Sender: TObject);
+    procedure ArmClick(Sender: TObject);
+    procedure WireKeyButtons;
+    function FocusInField: Boolean;
+    procedure SetKeyBtn(AButton: TFluentButton);
+    procedure CollectKeyRows(out ARows: TArray<TArray<TFluentButton>>;
+      out AAccent: TFluentButton);
+    function FindKeyBtn(const ARows: TArray<TArray<TFluentButton>>;
+      out ARow, AIndex: Integer): Boolean;
+    procedure SyncKeyFocus;
+    procedure MoveKeyFocus(AColDelta, ARowDelta: Integer);
+    procedure PressKeyBtn;
     procedure EngineDone(Success: Boolean; const ErrorMsg: string);
     procedure PlaceNearOwner;
     procedure ThemeTree(AObj: TFmxObject; const AColors: TThemeColors);
@@ -133,7 +147,7 @@ implementation
 
 uses
   System.Math, System.StrUtils, System.DateUtils, FMX.Dialogs, uFileModel,
-  uArchiveEngine;
+  uArchiveEngine, uLang, uLangBind;
 
 type
   TFileOpJob = class
@@ -403,29 +417,29 @@ var
   NamePart, DestPart: string;
 begin
   if J.State = jsQueued then
-    Exit('ждёт');
+    Exit(L('op.wait'));
   if J.State = jsFailed then
   begin
     if J.ErrorMsg <> '' then
       Exit(J.ErrorMsg)
     else
-      Exit('Ошибка');
+      Exit(L('op.error'));
   end;
   if J.State = jsDone then
-    Exit('Готово');
+    Exit(L('op.done'));
   if J.State = jsCancelled then
-    Exit('Отменено');
+    Exit(L('op.cancelled'));
   if J.State = jsNeedAnswer then
-    Exit('Нужен ответ');
+    Exit(L('op.needanswer'));
   if (J.State = jsBackground) and Assigned(J.Form) and
      Assigned(J.Form.FConfirm) and J.Form.FConfirm.Visible and not J.Form.FDeleteAsked then
-    Exit('ждёт подтверждения');
+    Exit(L('op.waitconfirm'));
   if J.Progress.FileName <> '' then
     NamePart := J.Progress.FileName
   else if Length(J.Sources) = 1 then
     NamePart := ExtractFileName(ExcludeTrailingPathDelimiter(J.Sources[0]))
   else
-    NamePart := Format('%d файлов', [Length(J.Sources)]);
+    NamePart := LCount(Length(J.Sources), 'op.files.one', 'op.files.few', 'op.files.many');
   DestPart := '';
   if J.Dest <> '' then
   begin
@@ -442,11 +456,11 @@ end;
 function JobTitleText(J: TFileOpJob): string;
 begin
   case J.State of
-    jsQueued: Result := 'В очереди';
-    jsNeedAnswer: Result := 'Нужен ответ';
-    jsFailed: Result := 'Ошибка';
-    jsDone: Result := 'Готово';
-    jsCancelled: Result := 'Отменено';
+    jsQueued: Result := L('op.queued');
+    jsNeedAnswer: Result := L('op.needanswer');
+    jsFailed: Result := L('op.error');
+    jsDone: Result := L('op.done');
+    jsCancelled: Result := L('op.cancelled');
   else
     Result := FileOpKindCaption(J.Kind);
   end;
@@ -506,7 +520,7 @@ begin
     (J.State in [jsRunning, jsPaused, jsBackground, jsNeedAnswer]);
   Result.Danger := J.State in [jsNeedAnswer, jsFailed];
   if J.State = jsQueued then
-    Result.PercentText := 'ждет'
+    Result.PercentText := L('op.wait')
   else if J.State = jsDone then
     Result.PercentText := ''
   else if J.State = jsFailed then
@@ -674,7 +688,7 @@ begin
   end;
   if J.State = jsQueued then
   begin
-    FireJobDone(J, False, 'Отменено');
+    FireJobDone(J, False, L('op.cancelled'));
     GJobs.Remove(J);
     HubPromote;
     HubTouch;
@@ -697,7 +711,7 @@ begin
     J.Form.CancelClick(nil)
   else
   begin
-    FireJobDone(J, False, 'Отменено');
+    FireJobDone(J, False, L('op.cancelled'));
     GJobs.Remove(J);
     HubPromote;
     HubTouch;
@@ -722,7 +736,7 @@ begin
     J.State := jsDone;
     J.DoneAt := Now;
   end
-  else if ASuccess or (AErr = 'Отменено') then
+  else if ASuccess or (AErr = L('op.cancelled')) then
   begin
     J.State := jsCancelled;
     Drop := True;
@@ -816,6 +830,32 @@ begin
     J.State := jsRunning;
   end;
   HubTouch;
+end;
+
+procedure DismissFileOpProgress;
+var
+  I: Integer;
+  Forms: TList<TFileOpProgressForm>;
+  Frm: TFileOpProgressForm;
+begin
+  if GJobs = nil then
+    Exit;
+  Forms := TList<TFileOpProgressForm>.Create;
+  try
+    for I := 0 to GJobs.Count - 1 do
+      if GJobs[I].Form <> nil then
+        Forms.Add(GJobs[I].Form);
+    for I := 0 to Forms.Count - 1 do
+    begin
+      Frm := Forms[I];
+      if (Frm = nil) or (csDestroying in Frm.ComponentState) then
+        Continue;
+      Frm.Hide;
+      Frm.Close;
+    end;
+  finally
+    Forms.Free;
+  end;
 end;
 
 function RestoreVibeBackground(AKind: TFileOpKind): Boolean;
@@ -912,7 +952,7 @@ begin
   HubUnlinkForm(Self);
   if Assigned(FTimer) then
     FTimer.Enabled := False;
-  FireDone(False, 'Отменено');
+  FireDone(False, L('op.cancelled'));
   FConfDead := True;
   if Assigned(FConfPoll) then
     FConfPoll.Enabled := False;
@@ -920,8 +960,10 @@ begin
   begin
     FEngine.OnDone := nil;
     FEngine.OnConflict := nil;
-    FEngine.Cancel;
-    FreeAndNil(FEngine);
+    if Application.Terminated and FEngine.DetachWorker then
+      FEngine := nil
+    else
+      FreeAndNil(FEngine);
   end;
   inherited;
 end;
@@ -1010,6 +1052,9 @@ begin
   BodyResize(nil);
   if Assigned(FConfirm) and FConfirm.Visible then
     LayoutConfirm;
+  if Assigned(FEngine) then
+    SyncButtons(FEngine.GetProgress);
+  SyncKeyFocus;
 end;
 
 procedure TFileOpProgressForm.BuildUI;
@@ -1095,14 +1140,14 @@ begin
   FStats := MkText(FBody, 12, False, FColors.TextColor);
   FStats.Text := '';
   FPaths := MkText(FBody, 12, False, FColors.SubTextColor);
-  FPaths.Text := 'Из:';
+  FPaths.Text := L('op.from');
   FToPath := MkText(FBody, 12, False, FColors.SubTextColor);
-  FToPath.Text := 'В:';
+  FToPath.Text := L('op.to');
   FCurLbl := MkText(FBody, 11, False, FColors.SubTextColor);
-  FCurLbl.Text := 'Текущий файл';
+  FCurLbl.Text := L('op.current');
   FFileTrack := MkTrack(FBody, FFileFill, FFilePct);
   FAllLbl := MkText(FBody, 11, False, FColors.SubTextColor);
-  FAllLbl.Text := 'Всего';
+  TrText(FAllLbl, 'op.all');
   FTotalTrack := MkTrack(FBody, FTotalFill, FTotalPct);
   FStatus := MkText(FBody, 12, False, FColors.SubTextColor);
   FStatus.Text := '';
@@ -1120,22 +1165,26 @@ begin
   Footer.Height := 38;
 
 
-  FBtnGo := CreateFluentButton(Self, Footer, '', 'Выполнить', fbkAccent, 118, GoClick);
+  FBtnGo := CreateFluentButton(Self, Footer, '', L('op.go'), fbkStandard, 118, GoClick);
   FBtnGo.Align := TAlignLayout.Right;
   FBtnGo.Margins.Right := 8;
 
-  FBtnCancel := CreateFluentButton(Self, Footer, '', 'Отмена', fbkStandard, 92, CancelClick);
+  FBtnCancel := CreateFluentButton(Self, Footer, '', L('op.cancel'), fbkStandard, 92, CancelClick);
+  TrButton(FBtnCancel, 'op.cancel');
   FBtnCancel.Align := TAlignLayout.Right;
   FBtnCancel.Margins.Right := 8;
 
 
-  FBtnBg := CreateFluentButton(Self, Footer, '', 'В фоне', fbkStandard, 92, BgClick);
+  FBtnBg := CreateFluentButton(Self, Footer, '', L('op.background'), fbkStandard, 140, BgClick);
+  TrButton(FBtnBg, 'op.background');
   FBtnBg.Align := TAlignLayout.Right;
 
-  FBtnSkip := CreateFluentButton(Self, Footer, '', 'Пропустить', fbkStandard, 110, SkipClick);
+  FBtnSkip := CreateFluentButton(Self, Footer, '', L('op.skip'), fbkStandard, 110, SkipClick);
+  TrButton(FBtnSkip, 'op.skip');
   FBtnSkip.Align := TAlignLayout.Right;
   FBtnSkip.Margins.Right := 8;
-  FBtnPause := CreateFluentButton(Self, Footer, '', 'Пауза', fbkStandard, 88, PauseClick);
+  FBtnPause := CreateFluentButton(Self, Footer, '', L('op.pause'), fbkStandard, 100, PauseClick);
+  TrButton(FBtnPause, 'op.pause');
   FBtnPause.Align := TAlignLayout.Right;
   FBtnPause.Margins.Right := 8;
 
@@ -1153,7 +1202,7 @@ begin
 
   FConfTitle := MkText(FConflict, 15, True, FColors.TextColor);
   FConfTitle.Height := 24;
-  FConfTitle.Text := 'Файл уже существует';
+  FConfTitle.Text := L('op.exists');
 
   FConfCards := TLayout.Create(Self);
   FConfCards.Parent := FConflict;
@@ -1161,9 +1210,9 @@ begin
   FConfCards.Margins.Top := 6;
   FConfCards.Margins.Bottom := 4;
 
-  BuildConflictCard(FConfCards, 'Новый (копируем)', FSrcCard, FSrcCap, FSrcNewer,
+  BuildConflictCard(FConfCards, 'op.srcnew', FSrcCard, FSrcCap, FSrcNewer,
     FSrcImg, FSrcName, FSrcMeta);
-  BuildConflictCard(FConfCards, 'Уже есть', FDstCard, FDstCap, FDstNewer,
+  BuildConflictCard(FConfCards, 'op.dstexists', FDstCard, FDstCap, FDstNewer,
     FDstImg, FDstName, FDstMeta);
   FSrcCard.Align := TAlignLayout.Left;
   FSrcCard.Width := 340;
@@ -1187,19 +1236,23 @@ begin
   Row.Parent := Track;
   Row.Align := TAlignLayout.Top;
   Row.Height := 38;
-  FBtnConfNewer := CreateFluentButton(Self, Row, '', 'Новее', fbkStandard, 90, ConfClick);
+  FBtnConfNewer := CreateFluentButton(Self, Row, '', L('op.newerbtn'), fbkStandard, 90, ConfClick);
+  TrButton(FBtnConfNewer, 'op.newerbtn');
   FBtnConfNewer.Align := TAlignLayout.Right;
   FBtnConfNewer.Margins.Right := 6;
   FBtnConfNewer.Tag := 6;
-  FBtnConfAuto := CreateFluentButton(Self, Row, '', 'Автоимя', fbkStandard, 96, ConfClick);
+  FBtnConfAuto := CreateFluentButton(Self, Row, '', L('op.autoname'), fbkStandard, 110, ConfClick);
+  TrButton(FBtnConfAuto, 'op.autoname');
   FBtnConfAuto.Align := TAlignLayout.Right;
   FBtnConfAuto.Margins.Right := 6;
   FBtnConfAuto.Tag := 3;
-  FBtnConfSkip := CreateFluentButton(Self, Row, '', 'Пропустить', fbkStandard, 110, ConfClick);
+  FBtnConfSkip := CreateFluentButton(Self, Row, '', L('op.skip'), fbkStandard, 110, ConfClick);
+  TrButton(FBtnConfSkip, 'op.skip');
   FBtnConfSkip.Align := TAlignLayout.Right;
   FBtnConfSkip.Margins.Right := 6;
   FBtnConfSkip.Tag := 2;
-  FBtnConfReplace := CreateFluentButton(Self, Row, '', 'Заменить', fbkAccent, 100, ConfClick);
+  FBtnConfReplace := CreateFluentButton(Self, Row, '', L('op.replace'), fbkStandard, 100, ConfClick);
+  TrButton(FBtnConfReplace, 'op.replace');
   FBtnConfReplace.Align := TAlignLayout.Right;
   FBtnConfReplace.Margins.Right := 6;
   FBtnConfReplace.Tag := 1;
@@ -1208,13 +1261,16 @@ begin
   Row.Parent := Track;
   Row.Align := TAlignLayout.Top;
   Row.Height := 38;
-  FBtnConfCancel := CreateFluentButton(Self, Row, '', 'Отмена', fbkStandard, 90, ConfClick);
+  FBtnConfCancel := CreateFluentButton(Self, Row, '', L('op.cancel'), fbkStandard, 90, ConfClick);
+  TrButton(FBtnConfCancel, 'op.cancel');
   FBtnConfCancel.Align := TAlignLayout.Right;
-  FBtnConfSkipAll := CreateFluentButton(Self, Row, '', 'Все пропустить', fbkStandard, 130, ConfClick);
+  FBtnConfSkipAll := CreateFluentButton(Self, Row, '', L('op.skipall'), fbkStandard, 130, ConfClick);
+  TrButton(FBtnConfSkipAll, 'op.skipall');
   FBtnConfSkipAll.Align := TAlignLayout.Right;
   FBtnConfSkipAll.Margins.Right := 6;
   FBtnConfSkipAll.Tag := 5;
-  FBtnConfAll := CreateFluentButton(Self, Row, '', 'Все заменить', fbkStandard, 120, ConfClick);
+  FBtnConfAll := CreateFluentButton(Self, Row, '', L('op.replaceall'), fbkStandard, 130, ConfClick);
+  TrButton(FBtnConfAll, 'op.replaceall');
   FBtnConfAll.Align := TAlignLayout.Right;
   FBtnConfAll.Margins.Right := 6;
   FBtnConfAll.Tag := 4;
@@ -1257,7 +1313,7 @@ begin
   FConfAskTitle.TextSettings.VertAlign := TTextAlign.Center;
   FConfAskTitle.TextSettings.Trimming := TTextTrimming.Character;
   FConfAskTitle.Tag := 9;
-  FConfAskTitle.Text := 'Подтвердить операцию?';
+  FConfAskTitle.Text := L('op.confirm');
 
   FArchCombo := TFluentComboBox.Create(Self);
   FArchCombo.Parent := FConfBody;
@@ -1265,6 +1321,7 @@ begin
   FArchCombo.DropListOnly := True;
   FArchCombo.Visible := False;
   FArchCombo.OnSelChange := ArchKindChanged;
+  FArchCombo.OnEscape := ConfirmNoClick;
 
   FConfFromCap := TText.Create(Self);
   FConfFromPath := TText.Create(Self);
@@ -1274,8 +1331,8 @@ begin
   FConfFromPath.Parent := FConfBody;
   FConfToCap.Parent := FConfBody;
   FConfToPath.Parent := FConfBody;
-  FConfFromCap.Text := 'Из:';
-  FConfToCap.Text := 'В:';
+  TrText(FConfFromCap, 'op.from');
+  TrText(FConfToCap, 'op.to');
   FConfFromCap.Align := TAlignLayout.None;
   FConfFromPath.Align := TAlignLayout.None;
   FConfToCap.Align := TAlignLayout.None;
@@ -1362,10 +1419,13 @@ begin
   Track.Height := 42;
   Track.Stroke.Kind := TBrushKind.None;
   Track.Fill.Color := TAlphaColors.Null;
-  FBtnConfirmYes := CreateFluentButton(Self, Track, '', 'Выполнить', fbkAccent, 120, ConfirmYesClick);
+  FBtnConfirmYes := CreateFluentButton(Self, Track, '', L('op.go'), fbkStandard, 120, ConfirmYesClick);
   FBtnConfirmYes.Align := TAlignLayout.Right;
   FBtnConfirmYes.Margins.Right := 8;
-  CreateFluentButton(Self, Track, '', 'Отмена', fbkStandard, 100, ConfirmNoClick).Align := TAlignLayout.Right;
+  FBtnConfirmNo := CreateFluentButton(Self, Track, '', L('op.cancel'), fbkStandard, 100, ConfirmNoClick);
+  TrButton(FBtnConfirmNo, 'op.cancel');
+  FBtnConfirmNo.Align := TAlignLayout.Right;
+  WireKeyButtons;
 end;
 
 procedure TFileOpProgressForm.PaintBars(const P: TFileOpProgress);
@@ -1446,35 +1506,36 @@ begin
     end;
     ShowConfirm(P);
   end;
+  Caption := FileOpKindCaption(P.Kind);
   if P.FileName <> '' then
-    FCurLbl.Text := 'Текущий файл    ' + P.FileName
+    FCurLbl.Text := Lf('op.currentfile', [P.FileName])
   else
-    FCurLbl.Text := 'Текущий файл';
+    FCurLbl.Text := L('op.current');
   if P.SourcePath <> '' then
-    FPaths.Text := 'Из:   ' + P.SourcePath
+    FPaths.Text := Lf('op.frompath', [P.SourcePath])
   else
-    FPaths.Text := 'Из:';
+    FPaths.Text := L('op.from');
   if P.DestPath <> '' then
-    FToPath.Text := 'В:   ' + P.DestPath
+    FToPath.Text := Lf('op.topath', [P.DestPath])
   else if FEngine.Dest <> '' then
-    FToPath.Text := 'В:   ' + FEngine.Dest
+    FToPath.Text := Lf('op.topath', [FEngine.Dest])
   else
-    FToPath.Text := 'В:';
+    FToPath.Text := L('op.to');
   St := P.Status;
   if SameText(St, FileOpKindCaption(P.Kind)) or
-     SameText(St, 'Подсчёт файлов…') or StartsText('Подготов', St) then
+     SameText(St, L('op.scan')) or StartsText(L('op.prepare'), St) then
     St := '';
   FStatus.Text := St;
-  FStats.Text := Format('%d / %d   ·   %s / %s   ·   %s   ·   осталось %s',
+  FStats.Text := Lf('op.stats',
     [P.FilesDone, P.FilesTotal, FormatOpBytes(P.TotalBytesDone),
      FormatOpBytes(P.TotalBytesTotal), FormatOpSpeed(P.SpeedBps),
      FormatOpEta(P.RemainingSec)]);
   if P.Skipped > 0 then
-    FStats.Text := FStats.Text + Format('   ·   пропуск %d', [P.Skipped]);
+    FStats.Text := FStats.Text + Lf('op.skipn', [P.Skipped]);
   if P.Unchanged > 0 then
-    FStats.Text := FStats.Text + Format('   ·   без изменений %d', [P.Unchanged]);
+    FStats.Text := FStats.Text + Lf('op.unchanged', [P.Unchanged]);
   if P.Errors > 0 then
-    FStats.Text := FStats.Text + Format('   ·   ошибок %d', [P.Errors]);
+    FStats.Text := FStats.Text + Lf('op.errorsn', [P.Errors]);
   PaintBars(P);
   SyncButtons(P);
   if (P.Phase = opReady) and not FDeleteAsked and not FKeepOpen then
@@ -1484,10 +1545,15 @@ begin
     FBtnGo.Enabled := True;
     FBtnGo.HitTest := True;
     FBtnGo.Opacity := 1;
-    FBtnGo.SetCaption('Закрыть');
+    FBtnGo.SetCaption(L('op.close'));
   end
-  else if P.Phase in [opDone, opCancel, opFail] then
-    FBtnGo.Enabled := False;
+  else
+  begin
+    FBtnGo.SetCaption(L('op.go'));
+    if P.Phase in [opDone, opCancel, opFail] then
+      FBtnGo.Enabled := False;
+  end;
+  SyncKeyFocus;
 end;
 
 procedure TFileOpProgressForm.GoClick(Sender: TObject);
@@ -1581,17 +1647,17 @@ begin
   ApplyFluentText(ACap, 12, True);
   ACap.TextSettings.FontColor := FColors.SubTextColor;
   ACap.TextSettings.HorzAlign := TTextAlign.Leading;
-  ACap.Text := ACaption;
+  TrText(ACap, ACaption);
 
   ANewer := TText.Create(Self);
   ANewer.Parent := Head;
   ANewer.Align := TAlignLayout.Right;
-  ANewer.Width := 56;
+  ANewer.Width := 84;
   ANewer.HitTest := False;
   ApplyFluentText(ANewer, 11, True);
   ANewer.TextSettings.FontColor := FColors.SelectionColor;
   ANewer.TextSettings.HorzAlign := TTextAlign.Trailing;
-  ANewer.Text := 'новее';
+  TrText(ANewer, 'op.newer');
   ANewer.Visible := False;
 
   AMeta := TText.Create(Self);
@@ -1726,9 +1792,9 @@ begin
   Inc(FConfGen);
   Clash := AInfo.TypeClash;
   if Clash then
-    FConfTitle.Text := 'Имя занято другим типом'
+    FConfTitle.Text := L('op.clash')
   else
-    FConfTitle.Text := 'Файл уже существует';
+    FConfTitle.Text := L('op.exists');
 
   SrcDir := TDirectory.Exists(AInfo.Source) and not TFile.Exists(AInfo.Source);
   DstDir := TDirectory.Exists(AInfo.Dest) and not TFile.Exists(AInfo.Dest);
@@ -1766,7 +1832,7 @@ begin
   begin
     if Meta <> '' then
       Meta := Meta + sLineBreak;
-    Meta := Meta + 'вероятно тот же файл';
+    Meta := Meta + L('op.samefile');
   end;
   if Meta = '' then
     Meta := '—';
@@ -1810,6 +1876,7 @@ begin
     FBtnConfNewer.Visible := not Clash;
   FConflict.Visible := True;
   FConflict.BringToFront;
+  SyncKeyFocus;
   if Assigned(FBtnBg) then
   begin
     FBtnBg.Enabled := False;
@@ -1836,25 +1903,15 @@ begin
     FBtnBg.HitTest := True;
     FBtnBg.Opacity := 1;
   end;
+  SyncKeyFocus;
   HubAnswered(FJobId);
 end;
 
 function RuObjects(N: Integer): string;
-var
-  M, D: Integer;
 begin
   if N < 0 then
     N := 0;
-  M := N mod 100;
-  D := M mod 10;
-  if (M >= 11) and (M <= 14) then
-    Result := Format('%d объектов', [N])
-  else if D = 1 then
-    Result := Format('%d объект', [N])
-  else if (D >= 2) and (D <= 4) then
-    Result := Format('%d объекта', [N])
-  else
-    Result := Format('%d объектов', [N]);
+  Result := LCount(N, 'op.obj.one', 'op.obj.few', 'op.obj.many');
 end;
 
 function ArchiveStem(const APath: string): string;
@@ -1896,7 +1953,7 @@ begin
     D := ExcludeTrailingPathDelimiter(
       ExtractFilePath(ExcludeTrailingPathDelimiter(AEngine.SourcePath(I))));
     if not SameText(D, Result) then
-      Exit('Несколько папок');
+      Exit(L('op.multidir'));
   end;
 end;
 
@@ -1919,13 +1976,13 @@ begin
   else
     FConfAskTitle.SetBounds(58, 8, Max(80, W - 66), 36);
   Y := 58;
-  FConfFromCap.SetBounds(8, Y, 32, 20);
-  FConfFromPath.SetBounds(44, Y, Max(40, W - 44), 20);
+  FConfFromCap.SetBounds(8, Y, 56, 20);
+  FConfFromPath.SetBounds(68, Y, Max(40, W - 68), 20);
   Y := Y + 22;
   if FConfToCap.Visible then
   begin
-    FConfToCap.SetBounds(8, Y, 32, 20);
-    FConfToPath.SetBounds(44, Y, Max(40, W - 44), 20);
+    FConfToCap.SetBounds(8, Y, 56, 20);
+    FConfToPath.SetBounds(68, Y, Max(40, W - 68), 20);
     Y := Y + 22;
   end;
   Y := Y + 10;
@@ -1959,7 +2016,7 @@ begin
     FConfMore.Visible := Hidden > 0;
     if Hidden > 0 then
     begin
-      FConfMore.Text := Format('… и ещё %d', [Hidden]);
+      FConfMore.Text := Lf('op.more', [Hidden]);
       FConfMore.SetBounds(66, Y, Max(40, W - 66), 20);
     end;
   end;
@@ -2024,35 +2081,35 @@ begin
       begin
         if FEngine.Permanent then
         begin
-          Verb := 'Удалить навсегда ' + RuObjects(N) + '?';
-          FConfAskText.Text := 'Файлы будут уничтожены без Корзины';
+          Verb := Lf('op.ask.delperm', [RuObjects(N)]);
+          FConfAskText.Text := L('op.note.delperm');
         end
         else
         begin
-          Verb := 'Удалить ' + RuObjects(N) + ' в Корзину?';
-          FConfAskText.Text := 'Можно будет восстановить из Корзины';
+          Verb := Lf('op.ask.delbin', [RuObjects(N)]);
+          FConfAskText.Text := L('op.note.delbin');
         end;
-        YesCap := 'Удалить';
+        YesCap := L('op.yes.delete');
         YesW := 110;
       end;
     okMove:
       begin
-        Verb := 'Переместить ' + RuObjects(N) + '?';
-        FConfAskText.Text := 'К выполнению';
-        YesCap := 'Переместить';
+        Verb := Lf('op.ask.move', [RuObjects(N)]);
+        FConfAskText.Text := L('op.note.ready');
+        YesCap := L('op.yes.move');
         YesW := 130;
       end;
     okArchive:
       begin
-        Verb := 'Архивировать ' + RuObjects(N) + '?';
-        FConfAskText.Text := 'К выполнению';
-        YesCap := 'Выполнить';
+        Verb := Lf('op.ask.arch', [RuObjects(N)]);
+        FConfAskText.Text := L('op.note.ready');
+        YesCap := L('op.go');
         YesW := 120;
       end;
   else
-    Verb := 'Копировать ' + RuObjects(N) + '?';
-    FConfAskText.Text := 'К выполнению';
-    YesCap := 'Копировать';
+    Verb := Lf('op.ask.copy', [RuObjects(N)]);
+    FConfAskText.Text := L('op.note.ready');
+    YesCap := L('op.yes.copy');
     YesW := 120;
   end;
   if P.TotalBytesTotal > 0 then
@@ -2123,6 +2180,7 @@ begin
   FConfirm.Visible := True;
   FConfirm.BringToFront;
   LayoutConfirm;
+  SyncKeyFocus;
 end;
 
 procedure TFileOpProgressForm.HideDeleteConfirm;
@@ -2135,7 +2193,11 @@ begin
   FDeleteAsked := True;
   HideDeleteConfirm;
   if Assigned(FEngine) then
+  begin
     FEngine.Start;
+    SyncButtons(FEngine.GetProgress);
+  end;
+  SyncKeyFocus;
 end;
 
 procedure TFileOpProgressForm.ConfirmNoClick(Sender: TObject);
@@ -2252,13 +2314,13 @@ begin
   if Assigned(FTimer) then
     FTimer.Enabled := False;
   CloseIt := True;
-  if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> 'Отменено') then
+  if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
   begin
     CloseIt := False;
     FKeepOpen := True;
     if not Bg then
       FStatus.Text := ErrorMsg;
-    FBtnGo.SetCaption('Закрыть');
+    FBtnGo.SetCaption(L('op.close'));
     FBtnGo.Enabled := True;
     FBtnGo.HitTest := True;
     FBtnGo.Opacity := 1;
@@ -2273,6 +2335,7 @@ begin
     if Bg then
       Hide;
   end;
+  SyncKeyFocus;
   HubFinishJob(FJobId, Success, ErrorMsg, Bg, CloseIt);
 end;
 
@@ -2286,16 +2349,232 @@ begin
       FEngine.OnDone := nil;
       FEngine.Cancel;
     end;
-    FireDone(False, 'Отменено');
-    HubFinishJob(FJobId, False, 'Отменено', FBackground, False);
+    FireDone(False, L('op.cancelled'));
+    HubFinishJob(FJobId, False, L('op.cancelled'), FBackground, False);
   end;
   CloseAction := TCloseAction.caFree;
   inherited;
 end;
 
+procedure TFileOpProgressForm.ArmClick(Sender: TObject);
+begin
+  if (Sender is TFluentButton) and FluentButtonLive(TFluentButton(Sender)) then
+    SetKeyBtn(TFluentButton(Sender));
+end;
+
+procedure TFileOpProgressForm.WireKeyButtons;
+  procedure Arm(AButton: TFluentButton);
+  begin
+    if AButton = nil then
+      Exit;
+    AButton.CanFocus := False;
+    AButton.TabStop := False;
+    AButton.OnArm := ArmClick;
+  end;
+begin
+  Arm(FBtnPause);
+  Arm(FBtnSkip);
+  Arm(FBtnBg);
+  Arm(FBtnCancel);
+  Arm(FBtnGo);
+  Arm(FBtnConfReplace);
+  Arm(FBtnConfSkip);
+  Arm(FBtnConfAuto);
+  Arm(FBtnConfNewer);
+  Arm(FBtnConfAll);
+  Arm(FBtnConfSkipAll);
+  Arm(FBtnConfCancel);
+  Arm(FBtnConfirmYes);
+  Arm(FBtnConfirmNo);
+end;
+
+function TFileOpProgressForm.FocusInField: Boolean;
+begin
+  Result := (Focused <> nil) and (Focused.GetObject <> Self);
+end;
+
+procedure TFileOpProgressForm.SetKeyBtn(AButton: TFluentButton);
+begin
+  if FKeyBtn = AButton then
+  begin
+    if Assigned(FKeyBtn) then
+      FKeyBtn.SetKeyFocus(True);
+    Exit;
+  end;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(False);
+  FKeyBtn := AButton;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(True);
+end;
+
+procedure TFileOpProgressForm.CollectKeyRows(
+  out ARows: TArray<TArray<TFluentButton>>; out AAccent: TFluentButton);
+var
+  Row: TArray<TFluentButton>;
+
+  procedure AddLive(AButton: TFluentButton);
+  var
+    N: Integer;
+  begin
+    if not FluentButtonLive(AButton) then
+      Exit;
+    N := Length(Row);
+    SetLength(Row, N + 1);
+    Row[N] := AButton;
+  end;
+
+  procedure PushRow;
+  begin
+    SetLength(ARows, Length(ARows) + 1);
+    ARows[High(ARows)] := Row;
+    Row := nil;
+  end;
+
+begin
+  AAccent := nil;
+  SetLength(ARows, 0);
+  SetLength(Row, 0);
+  if Assigned(FConfirm) and FConfirm.Visible then
+  begin
+    AddLive(FBtnConfirmNo);
+    AddLive(FBtnConfirmYes);
+    PushRow;
+    AAccent := FBtnConfirmYes;
+    Exit;
+  end;
+  if Assigned(FConflict) and FConflict.Visible then
+  begin
+    AddLive(FBtnConfReplace);
+    AddLive(FBtnConfSkip);
+    AddLive(FBtnConfAuto);
+    AddLive(FBtnConfNewer);
+    PushRow;
+    AddLive(FBtnConfAll);
+    AddLive(FBtnConfSkipAll);
+    AddLive(FBtnConfCancel);
+    PushRow;
+    if FluentButtonLive(FBtnConfReplace) then
+      AAccent := FBtnConfReplace
+    else
+      AAccent := FBtnConfSkip;
+    Exit;
+  end;
+  AddLive(FBtnPause);
+  AddLive(FBtnSkip);
+  AddLive(FBtnBg);
+  AddLive(FBtnCancel);
+  AddLive(FBtnGo);
+  PushRow;
+  if FKeepOpen then
+    AAccent := FBtnGo
+  else if FluentButtonLive(FBtnPause) then
+    AAccent := FBtnPause
+  else
+    AAccent := FBtnGo;
+end;
+
+function TFileOpProgressForm.FindKeyBtn(const ARows: TArray<TArray<TFluentButton>>;
+  out ARow, AIndex: Integer): Boolean;
+var
+  R, I: Integer;
+begin
+  ARow := 0;
+  AIndex := 0;
+  Result := False;
+  if not Assigned(FKeyBtn) then
+    Exit;
+  for R := 0 to High(ARows) do
+    for I := 0 to High(ARows[R]) do
+      if ARows[R][I] = FKeyBtn then
+      begin
+        ARow := R;
+        AIndex := I;
+        Exit(True);
+      end;
+end;
+
+procedure TFileOpProgressForm.SyncKeyFocus;
+var
+  Rows: TArray<TArray<TFluentButton>>;
+  Accent: TFluentButton;
+  R, I: Integer;
+begin
+  CollectKeyRows(Rows, Accent);
+  if FindKeyBtn(Rows, R, I) then
+  begin
+    FKeyBtn.SetKeyFocus(True);
+    Exit;
+  end;
+  if not FluentButtonLive(Accent) then
+  begin
+    Accent := nil;
+    for R := 0 to High(Rows) do
+      if Length(Rows[R]) > 0 then
+      begin
+        Accent := Rows[R][0];
+        Break;
+      end;
+  end;
+  SetKeyBtn(Accent);
+end;
+
+procedure TFileOpProgressForm.MoveKeyFocus(AColDelta, ARowDelta: Integer);
+var
+  Rows: TArray<TArray<TFluentButton>>;
+  Accent: TFluentButton;
+  R, I, N, NR: Integer;
+begin
+  CollectKeyRows(Rows, Accent);
+  if not FindKeyBtn(Rows, R, I) then
+  begin
+    if FluentButtonLive(Accent) then
+      SetKeyBtn(Accent)
+    else
+      SyncKeyFocus;
+    CollectKeyRows(Rows, Accent);
+    if not FindKeyBtn(Rows, R, I) then
+      Exit;
+  end;
+  if (R < 0) or (R > High(Rows)) then
+    Exit;
+  if ARowDelta <> 0 then
+  begin
+    if Length(Rows) < 2 then
+      Exit;
+    NR := R + ARowDelta;
+    if NR < 0 then
+      NR := High(Rows)
+    else if NR > High(Rows) then
+      NR := 0;
+    if Length(Rows[NR]) = 0 then
+      Exit;
+    if I > High(Rows[NR]) then
+      I := High(Rows[NR]);
+    SetKeyBtn(Rows[NR][I]);
+    Exit;
+  end;
+  N := Length(Rows[R]);
+  if N = 0 then
+    Exit;
+  I := (I + AColDelta) mod N;
+  if I < 0 then
+    Inc(I, N);
+  SetKeyBtn(Rows[R][I]);
+end;
+
+procedure TFileOpProgressForm.PressKeyBtn;
+begin
+  SyncKeyFocus;
+  if Assigned(FKeyBtn) and FluentButtonLive(FKeyBtn) then
+    FKeyBtn.Invoke;
+end;
+
 procedure TFileOpProgressForm.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
 var
   Ch: Char;
+  Btn: TFluentButton;
+  Plain: Boolean;
 begin
   if Key in [vkF2..vkF8] then
   begin
@@ -2303,62 +2582,131 @@ begin
     KeyChar := #0;
     Exit;
   end;
-  inherited;
-  if FKeepOpen then
+
+  if FocusInField then
   begin
-    if (Key = vkReturn) or (Key = vkEscape) then
-    begin
-      GoClick(nil);
-      Key := 0;
-    end;
+    inherited;
     Exit;
   end;
-  if FConfirm.Visible then
+
+  Plain := not (ssAlt in Shift) and not (ssCtrl in Shift);
+  if Plain and (Key = vkLeft) then
   begin
-    if Key = vkEscape then
-      ConfirmNoClick(nil)
-    else if Key = vkReturn then
-      ConfirmYesClick(nil);
-    Key := 0;
-    Exit;
-  end;
-  if FConflict.Visible then
-  begin
-    Ch := UpCase(KeyChar);
-    if Key = vkEscape then
-      ConfClick(FBtnConfCancel)
-    else if Key = vkReturn then
-      ConfClick(FBtnConfSkip)
-    else if (Ch = 'R') or (KeyChar = 'к') or (KeyChar = 'К') then
-      ConfClick(FBtnConfReplace)
-    else if (Ch = 'S') or (KeyChar = 'ы') or (KeyChar = 'Ы') then
-      ConfClick(FBtnConfSkip)
-    else if (Ch = 'A') or (KeyChar = 'ф') or (KeyChar = 'Ф') then
-      ConfClick(FBtnConfAuto)
-    else if (Ch = 'N') or (KeyChar = 'т') or (KeyChar = 'Т') then
-      ConfClick(FBtnConfNewer);
+    MoveKeyFocus(-1, 0);
     Key := 0;
     KeyChar := #0;
     Exit;
   end;
+  if Plain and (Key = vkRight) then
+  begin
+    MoveKeyFocus(1, 0);
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Plain and (Key = vkTab) then
+  begin
+    if ssShift in Shift then
+      MoveKeyFocus(-1, 0)
+    else
+      MoveKeyFocus(1, 0);
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Plain and ((Key = vkUp) or (Key = vkDown)) then
+  begin
+    if Assigned(FConflict) and FConflict.Visible then
+    begin
+      if Key = vkUp then
+        MoveKeyFocus(0, -1)
+      else
+        MoveKeyFocus(0, 1);
+    end;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+
+  if Assigned(FConfirm) and FConfirm.Visible then
+  begin
+    if Key = vkEscape then
+      ConfirmNoClick(nil)
+    else if (Key = vkReturn) or (Key = vkSpace) then
+      PressKeyBtn;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+
+  if Assigned(FConflict) and FConflict.Visible then
+  begin
+    Btn := nil;
+    if Plain then
+    begin
+      Ch := UpCase(KeyChar);
+      if (Ch = 'R') or (KeyChar = 'к') or (KeyChar = 'К') then
+        Btn := FBtnConfReplace
+      else if (Ch = 'S') or (KeyChar = 'ы') or (KeyChar = 'Ы') then
+        Btn := FBtnConfSkip
+      else if (Ch = 'A') or (KeyChar = 'ф') or (KeyChar = 'Ф') then
+        Btn := FBtnConfAuto
+      else if (Ch = 'N') or (KeyChar = 'т') or (KeyChar = 'Т') then
+        Btn := FBtnConfNewer;
+    end;
+    if Key = vkEscape then
+      ConfClick(FBtnConfCancel)
+    else if (Key = vkReturn) or (Key = vkSpace) then
+      PressKeyBtn
+    else if FluentButtonLive(Btn) then
+    begin
+      SetKeyBtn(Btn);
+      Btn.Invoke;
+    end;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+
+  if FKeepOpen then
+  begin
+    if Key = vkEscape then
+      GoClick(nil)
+    else if Key = vkReturn then
+      PressKeyBtn;
+    if (Key = vkEscape) or (Key = vkReturn) then
+    begin
+      Key := 0;
+      KeyChar := #0;
+    end;
+    Exit;
+  end;
+
   if Key = vkEscape then
   begin
     CancelClick(nil);
     Key := 0;
-  end
-  else if (Key = vkSpace) or (Key = vkPause) then
+    KeyChar := #0;
+    Exit;
+  end;
+  if (Key = vkSpace) or (Key = vkPause) then
   begin
-    if FEngine.GetProgress.Phase = opRun then
+    if Assigned(FEngine) and (FEngine.GetProgress.Phase = opRun) then
       PauseClick(nil)
     else
       GoClick(nil);
     Key := 0;
-  end
-  else if (Key = vkReturn) then
-  begin
-    GoClick(nil);
-    Key := 0;
+    KeyChar := #0;
+    Exit;
   end;
+  if Key = vkReturn then
+  begin
+    PressKeyBtn;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  inherited;
 end;
 
 initialization

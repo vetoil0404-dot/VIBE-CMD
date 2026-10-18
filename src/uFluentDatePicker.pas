@@ -10,6 +10,7 @@ uses
   System.SysUtils, System.Classes, System.Types, System.UITypes, System.Math,
   System.DateUtils,
   FMX.Types, FMX.Controls, FMX.Layouts, FMX.Objects, FMX.Graphics, FMX.StdCtrls,
+  FMX.Effects,
   uAppSettings, uThemeManager, uFluentChrome, uFluentEdit, uFileSearch;
 
 type
@@ -20,6 +21,7 @@ type
     FBtn: TFluentButton;
     FPopup: TPopup;
     FHost: TRectangle;
+    FShadow: TShadowEffect;
     FPaint: TPaintBox;
     FView: TDate;
     FPicked: TDate;
@@ -66,6 +68,9 @@ type
 
 implementation
 
+uses
+  uLang, uLangBind;
+
 const
   CAL_W     = 278;
   CAL_H     = 300;
@@ -76,6 +81,20 @@ const
   CELL_H    = 30;
   FOOT_H    = 32;
   ICON_CAL  = '';
+  SH_L      = 18;
+  SH_T      = 14;
+  SH_R      = 18;
+  SH_B      = 22;
+
+function MonthTitle(const AWhen: TDateTime): string;
+const
+  Keys: array[1..12] of string = (
+    'date.month1', 'date.month2', 'date.month3', 'date.month4',
+    'date.month5', 'date.month6', 'date.month7', 'date.month8',
+    'date.month9', 'date.month10', 'date.month11', 'date.month12');
+begin
+  Result := L(Keys[MonthOf(AWhen)]) + ' ' + IntToStr(YearOf(AWhen));
+end;
 
 constructor TFluentDatePicker.Create(AOwner: TComponent);
 begin
@@ -93,31 +112,38 @@ begin
   FEdit.OnChange := EditChanged;
   FEdit.OnKeyDown := EditKeyDown;
   FEdit.OnSubmit := EditSubmit;
-  FEdit.Hint := 'дд.мм.гггг';
+  TrHint(FEdit, 'date.hint');
 
   FBtn := TFluentButton.Create(AOwner);
   FBtn.Setup(Self, ICON_CAL, '', fbkSubtle, BtnClick);
   FBtn.Align := TAlignLayout.Right;
   FBtn.Width := 28;
   FBtn.Margins.Rect := TRectF.Create(0, 0, 0, 0);
-  FBtn.Hint := 'Выбрать дату';
+  TrHint(FBtn, 'date.pick');
 
   FPopup := TPopup.Create(AOwner);
   FPopup.Parent := Self;
   FPopup.PlacementTarget := Self;
   FPopup.Placement := TPlacement.Bottom;
-  FPopup.Width := CAL_W;
-  FPopup.Height := CAL_H;
+  FPopup.DragWithParent := True;
+  FPopup.HorizontalOffset := -SH_L;
+  FPopup.Width := CAL_W + SH_L + SH_R;
+  FPopup.Height := CAL_H + SH_T + SH_B;
 
   FHost := TRectangle.Create(AOwner);
   FHost.Parent := FPopup;
   FHost.Align := TAlignLayout.Client;
+  FHost.Margins.Rect := TRectF.Create(SH_L, SH_T, SH_R, SH_B);
   FHost.XRadius := 8;
   FHost.YRadius := 8;
   FHost.Stroke.Kind := TBrushKind.Solid;
   FHost.Stroke.Thickness := 1;
   FHost.Fill.Kind := TBrushKind.Solid;
   FHost.Padding.Rect := TRectF.Create(0, 0, 0, 0);
+
+  FShadow := TShadowEffect.Create(FHost);
+  FShadow.Parent := FHost;
+  ApplyFluentShadow(FShadow, FColors.IsDark);
 
   FPaint := TPaintBox.Create(AOwner);
   FPaint.Parent := FHost;
@@ -156,6 +182,7 @@ begin
     FHost.Fill.Color := AColors.CardBackground;
     FHost.Stroke.Color := AColors.CardStroke;
   end;
+  ApplyFluentShadow(FShadow, AColors.IsDark);
   if Assigned(FPaint) then
     FPaint.Repaint;
 end;
@@ -351,7 +378,8 @@ end;
 
 procedure TFluentDatePicker.CalPaint(Sender: TObject; Canvas: TCanvas);
 const
-  Days: array[0..6] of string = ('Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс');
+  DayKeys: array[0..6] of string = (
+    'date.mon', 'date.tue', 'date.wed', 'date.thu', 'date.fri', 'date.sat', 'date.sun');
 var
   I, Col, Row, M: Integer;
   D, First, Today: TDate;
@@ -372,8 +400,7 @@ begin
     Canvas.Font.Size := 13;
     Canvas.Fill.Color := FColors.TextColor;
     R := TRectF.Create(PAD + 36, PAD, CAL_W - PAD - 36, PAD + HEADER_H);
-    S := FormatDateTime('mmmm yyyy', StartOfTheMonth(FView));
-    S := AnsiUpperCase(Copy(S, 1, 1)) + Copy(S, 2, MaxInt);
+    S := MonthTitle(FView);
     Canvas.FillText(R, S, False, 1, [], TTextAlign.Center, TTextAlign.Center);
 
     Canvas.Font.Family := FluentIconFamily;
@@ -390,7 +417,7 @@ begin
     begin
       R := TRectF.Create(PAD + I * CELL_W, PAD + HEADER_H,
         PAD + (I + 1) * CELL_W, PAD + HEADER_H + WEEK_H);
-      Canvas.FillText(R, Days[I], False, 1, [], TTextAlign.Center, TTextAlign.Center);
+      Canvas.FillText(R, L(DayKeys[I]), False, 1, [], TTextAlign.Center, TTextAlign.Center);
     end;
 
     First := StartOfTheMonth(FView);
@@ -454,10 +481,10 @@ begin
     Canvas.Font.Size := 12;
     Canvas.Fill.Color := FColors.SelectionColor;
     R := TRectF.Create(PAD, CAL_H - PAD - FOOT_H, CAL_W * 0.5, CAL_H - PAD);
-    Canvas.FillText(R, 'Сегодня', False, 1, [], TTextAlign.Leading, TTextAlign.Center);
+    Canvas.FillText(R, L('date.today'), False, 1, [], TTextAlign.Leading, TTextAlign.Center);
     Canvas.Fill.Color := FColors.SubTextColor;
     R := TRectF.Create(CAL_W * 0.5, CAL_H - PAD - FOOT_H, CAL_W - PAD, CAL_H - PAD);
-    Canvas.FillText(R, 'Очистить', False, 1, [], TTextAlign.Trailing, TTextAlign.Center);
+    Canvas.FillText(R, L('date.clear'), False, 1, [], TTextAlign.Trailing, TTextAlign.Center);
   finally
     Canvas.EndScene;
   end;

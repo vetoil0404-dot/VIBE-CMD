@@ -94,7 +94,6 @@ type
       const Point: TPointF; var Operation: TDragOperation);
     procedure IslandDragDrop(Sender: TObject; const Data: TDragObject; const Point: TPointF);
     procedure IslandDragLeave(Sender: TObject);
-    function TryAcceptExternalDrop(const AScreen: TPointF; const APaths: TArray<string>): Boolean;
     procedure TileMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
     procedure TileMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
     procedure TileMouseUp(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
@@ -155,6 +154,7 @@ type
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
     procedure ApplyTheme(const AColors: TThemeColors);
+    procedure ApplyLanguage;
     procedure ApplyDockOptions(AAlign: TDockAlign; AShowSeps: Boolean);
     procedure LoadItems(const APaths: TArray<string>; const AXs: TArray<Single>;
       const AKinds: TArray<Integer>; const ACaptions, AIcons: TArray<string>;
@@ -166,6 +166,7 @@ type
     procedure CollectState(out APaths: TArray<string>; out AXs: TArray<Single>); overload;
     procedure NotifyDevicesChanged;
     function CollectPaths: TArray<string>;
+    function TryAcceptExternalDrop(const AScreen: TPointF; const APaths: TArray<string>): Boolean;
     property AlignMode: TDockAlign read FAlignMode write SetAlignMode;
     property ShowSeparators: Boolean read FShowSeps;
     property OnOpenFolder: TDockOpenFolderEvent read FOnOpenFolder write FOnOpenFolder;
@@ -180,10 +181,11 @@ implementation
 {$IFDEF MSWINDOWS}
 uses
   Winapi.Windows, Winapi.ShellAPI, Winapi.ShlObj, Winapi.ActiveX,
-  FMX.Platform.Win, System.SyncObjs, System.Hash, uFileModel, uThumbCache;
+  FMX.Platform.Win, System.SyncObjs, System.Hash, uFileModel, uThumbCache,
+  uLang, uLangBind;
 {$ELSE}
 uses
-  System.SyncObjs, System.Hash, uFileModel, uThumbCache;
+  System.SyncObjs, System.Hash, uFileModel, uThumbCache, uLang, uLangBind;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
@@ -542,7 +544,7 @@ begin
   IsSep := True;
   Kind := dkSeparator;
   ItemPath := DOCK_SEP_TOKEN;
-  Caption := 'Разделитель';
+  Caption := L('dock.sep');
   IsBroken := False;
   Width := SEP_CELL;
   IconHost.Visible := False;
@@ -718,7 +720,7 @@ begin
   FEmptyHint.Parent := FIsland;
   FEmptyHint.Align := TAlignLayout.Client;
   FEmptyHint.HitTest := False;
-  FEmptyHint.Text := 'Перетащите сюда файлы, папки или приложения';
+  TrText(FEmptyHint, 'dock.empty');
   FEmptyHint.TextSettings.Font.Family := FluentFontFamily;
   FEmptyHint.TextSettings.Font.Size := 12;
   FEmptyHint.TextSettings.HorzAlign := TTextAlign.Center;
@@ -809,13 +811,13 @@ begin
     if not CanEdit then
       Flags := Flags or MF_GRAYED;
     if not Tile.IsSep then
-      AppendMenu(Pop, Flags, 1, 'Изменить объект…');
+      AppendMenu(Pop, Flags, 1, PChar(L('dock.change')));
     if not Tile.IsSep then
-      AppendMenu(Pop, MF_STRING, 2, 'Изменить картинку…');
+      AppendMenu(Pop, MF_STRING, 2, PChar(L('dock.picture')));
     if (not Tile.IsSep) and ((Tile.IconFile <> '') or Tile.IconLocked) then
-      AppendMenu(Pop, MF_STRING, 3, 'Сбросить картинку');
-    AppendMenu(Pop, Flags, 4, 'Перейти к объекту');
-    AppendMenu(Pop, MF_STRING, 5, 'Убрать с дока');
+      AppendMenu(Pop, MF_STRING, 3, PChar(L('dock.resetpic')));
+    AppendMenu(Pop, Flags, 4, PChar(L('dock.goto')));
+    AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.remove')));
     GetCursorPos(Pt);
     Cmd := UINT(TrackPopupMenuEx(Pop,
       TPM_RETURNCMD or TPM_RIGHTBUTTON or TPM_LEFTALIGN or TPM_TOPALIGN,
@@ -863,11 +865,11 @@ begin
   if FAlignMode = daFree then
     FlFree := FlFree or MF_CHECKED;
   try
-    AppendMenu(Pop, MF_STRING, 1, 'Добавить разделитель');
+    AppendMenu(Pop, MF_STRING, 1, PChar(L('dock.addsep')));
     AppendMenu(Pop, MF_SEPARATOR, 0, nil);
-    AppendMenu(Pop, FlLeft, 2, 'Иконки слева');
-    AppendMenu(Pop, FlCenter, 3, 'Иконки по центру');
-    AppendMenu(Pop, FlFree, 4, 'Иконки произвольно');
+    AppendMenu(Pop, FlLeft, 2, PChar(L('dock.align.left')));
+    AppendMenu(Pop, FlCenter, 3, PChar(L('dock.align.center')));
+    AppendMenu(Pop, FlFree, 4, PChar(L('dock.align.free')));
     GetCursorPos(Pt);
     Cmd := UINT(TrackPopupMenuEx(Pop,
       TPM_RETURNCMD or TPM_RIGHTBUTTON or TPM_LEFTALIGN or TPM_TOPALIGN,
@@ -903,6 +905,23 @@ begin
   FTipBox.Stroke.Color := FColors.CardStroke;
   FTipText.TextSettings.FontColor := FColors.TextColor;
   ApplyFluentShadow(FTipShadow, FColors.IsDark);
+end;
+
+procedure TLaunchDock.ApplyLanguage;
+var
+  I: Integer;
+  Tile: TDockTile;
+begin
+  if Assigned(FEmptyHint) then
+    FEmptyHint.Text := L('dock.empty');
+  if FTiles <> nil then
+    for I := 0 to FTiles.Count - 1 do
+    begin
+      Tile := TileOf(FTiles[I]);
+      if (Tile <> nil) and Tile.IsSep then
+        Tile.Caption := L('dock.sep');
+    end;
+  Repaint;
 end;
 
 procedure TLaunchDock.ApplyTheme(const AColors: TThemeColors);
@@ -983,6 +1002,8 @@ begin
         Tile.Kind := TDockKind(AKinds[I]);
       if (I <= High(ACaptions)) and (ACaptions[I] <> '') then
         Tile.Caption := ACaptions[I];
+      if Tile.IsSep then
+        Tile.Caption := L('dock.sep');
       if (I <= High(AIcons)) then
         Tile.IconFile := AIcons[I];
       if (I <= High(ALocked)) then
@@ -2186,9 +2207,9 @@ begin
   FOpenGuardTick := Tick;
   if Tile.IsBroken then
   begin
-    ShowToast('Путь недоступен');
+    ShowToast(L('dock.badpath'));
     if Assigned(FOnStatus) then
-      FOnStatus(Self, 'Путь недоступен');
+      FOnStatus(Self, L('dock.badpath'));
     Exit;
   end;
   case Tile.Kind of
@@ -2206,7 +2227,7 @@ begin
         Tile.IsBroken := True;
         Tile.ApplyVisual(FColors, FHoverTile = Tile);
       end;
-      ShowToast('Путь недоступен');
+      ShowToast(L('dock.badpath'));
     end;
 {$ELSE}
     OpenFileWithDefaultApp(Tile.ItemPath);
@@ -2223,7 +2244,7 @@ begin
     Exit;
   if Tile.IsBroken then
   begin
-    ShowToast('Путь недоступен');
+    ShowToast(L('dock.badpath'));
     Exit;
   end;
   if Assigned(FOnGoToObject) then
@@ -2271,7 +2292,7 @@ begin
           FOnCopyToFolder(Self, Tile.ItemPath, AFiles)
         else
           CopyPathsAsync(AFiles, Tile.ItemPath, nil);
-        ShowToast('Копирование в «' + Tile.Caption + '»…');
+        ShowToast(Lf('dock.copyto', [Tile.Caption]));
       end;
     dkApp:
       begin
@@ -2284,7 +2305,7 @@ begin
         for S in AFiles do
           OpenFileWithDefaultApp(S);
         {$ENDIF}
-        ShowToast('Открытие в «' + Tile.Caption + '»');
+        ShowToast(Lf('dock.opento', [Tile.Caption]));
       end;
   else
     Args := '';
@@ -2319,15 +2340,15 @@ begin
   if Tile.Kind = dkFolder then
   begin
     {$IFDEF MSWINDOWS}
-    NewPath := PickDockFolder('Изменить папку', Tile.ItemPath);
+    NewPath := PickDockFolder(L('dock.changefolder'), Tile.ItemPath);
     {$ENDIF}
   end
   else
   begin
     Dlg := TOpenDialog.Create(Self);
     try
-      Dlg.Title := 'Изменить объект';
-      Dlg.Filter := 'Все файлы (*.*)|*.*|Программы (*.exe)|*.exe';
+      Dlg.Title := L('dock.changetitle');
+      Dlg.Filter := L('dock.filter.files');
       Dlg.FileName := Tile.ItemPath;
       Dlg.InitialDir := ExtractFilePath(Tile.ItemPath);
       if Dlg.Execute and (Dlg.FileName <> '') then
@@ -2411,7 +2432,7 @@ begin
   begin
     if not RenderSvgThumbRaw(AFile, 128, 128, Pix, W, H) then
     begin
-      ShowToast('SVG недоступен');
+      ShowToast(L('dock.svg'));
       Exit;
     end;
     RawToFmxBitmap(Pix, W, H, Bmp);
@@ -2428,7 +2449,7 @@ begin
   if (Bmp = nil) or (Bmp.Width < 1) then
   begin
     Bmp.Free;
-    ShowToast('Не удалось открыть картинку');
+    ShowToast(L('dock.badpic'));
     Exit;
   end;
   try
@@ -2464,11 +2485,8 @@ begin
     Exit;
   Dlg := TOpenDialog.Create(Self);
   try
-    Dlg.Title := 'Изменить картинку';
-    Dlg.Filter :=
-      'Все картинки|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.ico;*.svg;*.tif;*.tiff|' +
-      'PNG|*.png|JPEG|*.jpg;*.jpeg|ICO|*.ico|SVG|*.svg|' +
-      'Значки и программы|*.ico;*.exe;*.dll;*.lnk|Все файлы|*.*';
+    Dlg.Title := L('dock.pictitle');
+    Dlg.Filter := L('dock.filter.pics');
     if Dlg.Execute and (Dlg.FileName <> '') then
       SetCustomPicture(Tile, Dlg.FileName);
   finally

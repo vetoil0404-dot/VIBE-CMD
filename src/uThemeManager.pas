@@ -99,7 +99,10 @@ type
 
 function IsSystemDarkTheme: Boolean;
 function GetSystemAccentColor: TAlphaColor;
-function GetThemeColors(Theme: TAppTheme): TThemeColors;
+function GetThemeColors(Theme: TAppTheme; AApplyTint: Boolean = True): TThemeColors;
+procedure ApplyColorTint(var Colors: TThemeColors; Tint: Integer; IsDark: Boolean);
+function ThemeTintPaintsControls(const ATinted, APlain: TThemeColors): Boolean;
+procedure ConfigureThemeTint(ATint: Integer; AMaterial: TWindowMaterial);
 procedure SetActiveAppTheme(ATheme: TAppTheme);
 function ActiveAppTheme: TAppTheme;
 
@@ -235,6 +238,98 @@ end;
 
 var
   GActiveTheme: TAppTheme = atSystem;
+  GColorTint: Integer = -1;
+  GWindowMaterial: TWindowMaterial = wmNormal;
+
+procedure ConfigureThemeTint(ATint: Integer; AMaterial: TWindowMaterial);
+begin
+  if ATint < 0 then
+    GColorTint := -1
+  else
+    GColorTint := EnsureRange(ATint, 0, 359);
+  GWindowMaterial := AMaterial;
+end;
+
+{ HSV: hue and saturation replace gray, value stays. Lightness is not
+  boosted back, because near-white layers would clamp and merge.
+  Only the form fill is tinted. Panels, controls, and strokes stay. }
+procedure ApplyColorTint(var Colors: TThemeColors; Tint: Integer; IsDark: Boolean);
+var
+  Hue, Sat: Single;
+
+  function Mod2(Value: Single): Single;
+  begin
+    Result := Value - 2 * Floor(Value / 2);
+    if Result < 0 then
+      Result := Result + 2;
+  end;
+
+  procedure TintOne(var C: TAlphaColor);
+  var
+    Rec: TAlphaColorRec;
+    V, Chroma, X, M, Rf, Gf, Bf: Single;
+    Sector: Integer;
+  begin
+    Rec.Color := C;
+    V := Max(Rec.R, Max(Rec.G, Rec.B)) / 255;
+    if V <= 0 then
+      Exit;
+    Chroma := V * Sat;
+    X := Chroma * (1 - Abs(Mod2(Hue / 60) - 1));
+    M := V - Chroma;
+    Sector := Trunc(Hue / 60) mod 6;
+    case Sector of
+      0: begin Rf := Chroma; Gf := X; Bf := 0; end;
+      1: begin Rf := X; Gf := Chroma; Bf := 0; end;
+      2: begin Rf := 0; Gf := Chroma; Bf := X; end;
+      3: begin Rf := 0; Gf := X; Bf := Chroma; end;
+      4: begin Rf := X; Gf := 0; Bf := Chroma; end;
+    else
+      begin Rf := Chroma; Gf := 0; Bf := X; end;
+    end;
+    Rec.R := EnsureRange(Round((Rf + M) * 255), 0, 255);
+    Rec.G := EnsureRange(Round((Gf + M) * 255), 0, 255);
+    Rec.B := EnsureRange(Round((Bf + M) * 255), 0, 255);
+    C := Rec.Color;
+  end;
+
+begin
+  if Tint < 0 then
+    Exit;
+  Hue := Tint mod 360;
+  if Hue < 0 then
+    Hue := Hue + 360;
+  if IsDark then
+    Sat := 0.16
+  else
+    Sat := 0.12;
+  TintOne(Colors.Background);
+  TintOne(Colors.LayerBackground);
+  TintOne(Colors.TitleBarBackground);
+end;
+
+function ThemeTintPaintsControls(const ATinted, APlain: TThemeColors): Boolean;
+begin
+  Result :=
+    (ATinted.CardBackground <> APlain.CardBackground) or
+    (ATinted.PanelBackground <> APlain.PanelBackground) or
+    (ATinted.ItemBackground <> APlain.ItemBackground) or
+    (ATinted.ItemAltBackground <> APlain.ItemAltBackground) or
+    (ATinted.ItemHover <> APlain.ItemHover) or
+    (ATinted.ToolbarBackground <> APlain.ToolbarBackground) or
+    (ATinted.DockBackground <> APlain.DockBackground) or
+    (ATinted.HeaderBackground <> APlain.HeaderBackground) or
+    (ATinted.FooterBackground <> APlain.FooterBackground) or
+    (ATinted.TabBarBackground <> APlain.TabBarBackground) or
+    (ATinted.AddressBackground <> APlain.AddressBackground) or
+    (ATinted.ControlFill <> APlain.ControlFill) or
+    (ATinted.ControlFillHover <> APlain.ControlFillHover) or
+    (ATinted.ControlFillPressed <> APlain.ControlFillPressed) or
+    (ATinted.BorderColor <> APlain.BorderColor) or
+    (ATinted.CardStroke <> APlain.CardStroke) or
+    (ATinted.DividerColor <> APlain.DividerColor) or
+    (ATinted.ControlStroke <> APlain.ControlStroke);
+end;
 
 procedure SetActiveAppTheme(ATheme: TAppTheme);
 begin
@@ -246,7 +341,7 @@ begin
   Result := GActiveTheme;
 end;
 
-function GetThemeColors(Theme: TAppTheme): TThemeColors;
+function GetThemeColors(Theme: TAppTheme; AApplyTint: Boolean): TThemeColors;
 var
   Dark: Boolean;
   Accent: TAlphaColor;
@@ -335,6 +430,9 @@ begin
     Result.CodeNumber := $FF098658;
     Result.CodeTag := $FF267F99;
   end;
+  { v1: Mica and Acrylic stay neutral. The saved tint returns with Normal. }
+  if AApplyTint and (GWindowMaterial = wmNormal) and (GColorTint >= 0) then
+    ApplyColorTint(Result, GColorTint, Result.IsDark);
 end;
 
 {$IFDEF MSWINDOWS}
@@ -469,7 +567,8 @@ begin
         DwmSetWindowAttribute(AWnd, DWMWA_BORDER_COLOR, @ColorNone, SizeOf(ColorNone));
         if NtBuildNumber >= 22621 then
         begin
-          Backdrop := DWMSBT_MAINWINDOW;
+          Backdrop := DWMSBT_TABBEDWINDOW;
+         // Backdrop := DWMSBT_MAINWINDOW;
           DwmSetWindowAttribute(AWnd, DWMWA_SYSTEMBACKDROP_TYPE, @Backdrop, SizeOf(Backdrop));
         end
         else if NtBuildNumber >= 22000 then
@@ -534,6 +633,11 @@ begin
         AColors.ToolbarBackground := ThemeAdjustAlpha(AColors.ToolbarBackground, $99);
         AColors.FooterBackground := ThemeAdjustAlpha(AColors.FooterBackground, $40);
         AColors.TabBarBackground := ThemeAdjustAlpha(AColors.TabBarBackground, $A0);
+        { Светлый список чуть серее белого. Тёмная тема и шапка остаются как были. }
+        if TAlphaColorRec(AColors.PanelBackground).R > $C0 then
+          AColors.PanelBackground := ThemeAdjustAlpha($FFF0F0F0, $E8)
+        else
+          AColors.PanelBackground := ThemeAdjustAlpha(AColors.PanelBackground, $E8);
       end;
     wmAcrylic:
       begin
@@ -542,7 +646,10 @@ begin
         AColors.DockBackground := ThemeAdjustAlpha(AColors.DockBackground, $A8);
         AColors.ToolbarBackground := ThemeAdjustAlpha(AColors.ToolbarBackground, $B8);
         AColors.FooterBackground := ThemeAdjustAlpha(AColors.FooterBackground, $80);
-        AColors.TabBarBackground := ThemeAdjustAlpha(AColors.TabBarBackground, $B0);
+        { Панель, шапка, вкладки и статус — та же альфа, что у заголовка окна. }
+        AColors.TabBarBackground := ThemeAdjustAlpha(AColors.TabBarBackground, $70);
+        AColors.HeaderBackground := ThemeAdjustAlpha(AColors.HeaderBackground, $70);
+        AColors.PanelBackground := ThemeAdjustAlpha(AColors.PanelBackground, $70);
       end;
   end;
 end;

@@ -16,12 +16,22 @@ type
     FDoc: Pointer;
     FCount: Integer;
     FPath: string;
+    function ReadPagePoints(AIndex: Integer; out AWf, AHf: Double): Boolean;
   public
     constructor Create(const APath: string);
     destructor Destroy; override;
+    { AScaleCap > 0 — потолок масштаба (плитка, 2.5). 0 — ровно в заданные пиксели. }
     function RenderPageRaw(AIndex, AMaxW, AMaxH: Integer; out APixels: TBytes;
-      out AWidth, AHeight: Integer): Boolean;
-    function RenderPage(AIndex, AMaxW, AMaxH: Integer): TBitmap;
+      out AWidth, AHeight: Integer; AScaleCap: Double = 2.5): Boolean;
+    function RenderPage(AIndex, AMaxW, AMaxH: Integer;
+      AScaleCap: Double = 2.5): TBitmap;
+    function PagePointSize(AIndex: Integer; out W, H: Integer): Boolean;
+    { Пиксели Round(pt / 72 × dpi). Не размер битмапа. }
+    function PagePixelSize(AIndex, ADpi: Integer; out W, H: Integer): Boolean;
+    { QV: рендер в печатных пикселях 300 dpi, длинная сторона не больше 4096.
+      Наружу — полный расчёт, даже если битмап ужат. }
+    function RenderPagePrint(AIndex: Integer;
+      out APrintW, APrintH, APointW, APointH: Integer): TBitmap;
     property PageCount: Integer read FCount;
     property FilePath: string read FPath;
     class function Available: Boolean; static;
@@ -35,11 +45,15 @@ function RenderPdfThumbRaw(const APath: string; AMaxW, AMaxH: Integer;
   out APixels: TBytes; out AWidth, AHeight: Integer): Boolean;
 function RenderPdfThumb(const APath: string; AWidth, AHeight: Integer;
   ABitmap: FMX.Graphics.TBitmap): Boolean;
+{ Первая страница в пунктах PDF, округлённых до целых. }
+function TryPdfPageSize(const APath: string; out W, H: Integer): Boolean;
+{ Первая страница в печатных пикселях: Round(pt / 72 × 300). Для подписи плитки. }
+function TryPdfPrintSize(const APath: string; out W, H: Integer): Boolean;
 
 implementation
 
 uses
-  System.SyncObjs
+  System.SyncObjs, uLang
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 var
@@ -293,7 +307,7 @@ begin
   PdfEnter;
   try
     if not EnsurePdfium then
-      raise Exception.Create('pdfium.dll не найден');
+      raise Exception.Create(L('pdf.nodll'));
     Utf8 := UTF8String(APath);
     FDoc := FPDF_LoadDocument(PAnsiChar(Utf8), nil);
     if (FDoc = nil) and Assigned(FPDF_LoadMemDocument) then
@@ -310,7 +324,7 @@ begin
         FDoc := FPDF_LoadMemDocument(@Bytes[0], Length(Bytes), nil);
     end;
     if FDoc = nil then
-      raise Exception.Create('Не удалось открыть PDF');
+      raise Exception.Create(L('pdf.openfail'));
     FCount := FPDF_GetPageCount(FDoc);
     if FCount < 1 then
       FCount := 0;
@@ -318,7 +332,7 @@ begin
     PdfLeave;
   end;
   {$ELSE}
-  raise Exception.Create('PDF только на Windows');
+  raise Exception.Create(L('pdf.windows'));
   {$ENDIF}
 end;
 
@@ -338,7 +352,7 @@ begin
 end;
 
 function TPdfiumDoc.RenderPageRaw(AIndex, AMaxW, AMaxH: Integer; out APixels: TBytes;
-  out AWidth, AHeight: Integer): Boolean;
+  out AWidth, AHeight: Integer; AScaleCap: Double): Boolean;
 {$IFDEF MSWINDOWS}
 var
   Page: FPDF_PAGE;
@@ -366,17 +380,51 @@ begin
       Hf := FPDF_GetPageHeight(Page);
       if (Wf < 1) or (Hf < 1) then
         Exit;
-      if AMaxW < 32 then
-        AMaxW := 256;
-      if AMaxH < 32 then
-        AMaxH := 256;
+      if AScaleCap > 0 then
+      begin
+        if AMaxW < 32 then
+          AMaxW := 256;
+        if AMaxH < 32 then
+          AMaxH := 256;
+      end
+      else
+      begin
+        if AMaxW < 1 then
+          AMaxW := 1;
+        if AMaxH < 1 then
+          AMaxH := 1;
+      end;
       Scale := Min(AMaxW / Wf, AMaxH / Hf);
-      if Scale > 2.5 then
-        Scale := 2.5;
-      if Scale < 0.15 then
-        Scale := 0.15;
-      W := Max(8, Round(Wf * Scale));
-      H := Max(8, Round(Hf * Scale));
+      if Scale <= 0 then
+        Exit;
+      { Плитка: не раздувать мелкую страницу сильнее 2.5 и не схлопывать огромную. }
+      if AScaleCap > 0 then
+      begin
+        if Scale > AScaleCap then
+          Scale := AScaleCap;
+        if Scale < 0.15 then
+          Scale := 0.15;
+      end;
+      W := Round(Wf * Scale);
+      H := Round(Hf * Scale);
+      if AScaleCap > 0 then
+      begin
+        if W < 8 then
+          W := 8;
+        if H < 8 then
+          H := 8;
+      end
+      else
+      begin
+        if W > AMaxW then
+          W := AMaxW;
+        if H > AMaxH then
+          H := AMaxH;
+        if W < 1 then
+          W := 1;
+        if H < 1 then
+          H := 1;
+      end;
       Bmp := FPDFBitmap_Create(W, H, 1);
       if Bmp = nil then
         Exit;
@@ -405,13 +453,14 @@ begin
   {$ENDIF}
 end;
 
-function TPdfiumDoc.RenderPage(AIndex, AMaxW, AMaxH: Integer): FMX.Graphics.TBitmap;
+function TPdfiumDoc.RenderPage(AIndex, AMaxW, AMaxH: Integer;
+  AScaleCap: Double): FMX.Graphics.TBitmap;
 var
   Pix: TBytes;
   W, H: Integer;
 begin
   Result := nil;
-  if not RenderPageRaw(AIndex, AMaxW, AMaxH, Pix, W, H) then
+  if not RenderPageRaw(AIndex, AMaxW, AMaxH, Pix, W, H, AScaleCap) then
     Exit;
   Result := FMX.Graphics.TBitmap.Create;
   try
@@ -420,6 +469,197 @@ begin
       FreeAndNil(Result);
   except
     FreeAndNil(Result);
+  end;
+end;
+
+function TPdfiumDoc.ReadPagePoints(AIndex: Integer; out AWf, AHf: Double): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Page: FPDF_PAGE;
+{$ENDIF}
+begin
+  Result := False;
+  AWf := 0;
+  AHf := 0;
+  {$IFDEF MSWINDOWS}
+  PdfEnter;
+  try
+    if (FDoc = nil) or (AIndex < 0) or (AIndex >= FCount) then
+      Exit;
+    if not Assigned(FPDF_LoadPage) or not Assigned(FPDF_GetPageWidth) or
+       not Assigned(FPDF_GetPageHeight) or not Assigned(FPDF_ClosePage) then
+      Exit;
+    Page := FPDF_LoadPage(FDoc, AIndex);
+    if Page = nil then
+      Exit;
+    try
+      AWf := FPDF_GetPageWidth(Page);
+      AHf := FPDF_GetPageHeight(Page);
+      Result := (AWf >= 1) and (AHf >= 1) and (AWf <= 1000000) and (AHf <= 1000000);
+      if not Result then
+      begin
+        AWf := 0;
+        AHf := 0;
+      end;
+    finally
+      FPDF_ClosePage(Page);
+    end;
+  finally
+    PdfLeave;
+  end;
+  {$ENDIF}
+end;
+
+function TPdfiumDoc.PagePointSize(AIndex: Integer; out W, H: Integer): Boolean;
+var
+  Wf, Hf: Double;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  if not ReadPagePoints(AIndex, Wf, Hf) then
+    Exit;
+  W := Max(1, Round(Wf));
+  H := Max(1, Round(Hf));
+  Result := True;
+end;
+
+function TPdfiumDoc.PagePixelSize(AIndex, ADpi: Integer; out W, H: Integer): Boolean;
+var
+  Wf, Hf: Double;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  if ADpi < 1 then
+    Exit;
+  if not ReadPagePoints(AIndex, Wf, Hf) then
+    Exit;
+  W := Max(1, Round(Wf / 72 * ADpi));
+  H := Max(1, Round(Hf / 72 * ADpi));
+  Result := True;
+end;
+
+function TPdfiumDoc.RenderPagePrint(AIndex: Integer;
+  out APrintW, APrintH, APointW, APointH: Integer): FMX.Graphics.TBitmap;
+const
+  PrintDpi = 300;
+  MaxSide = 4096;
+var
+  Wf, Hf, Fit: Double;
+  Rw, Rh: Integer;
+begin
+  Result := nil;
+  APrintW := 0;
+  APrintH := 0;
+  APointW := 0;
+  APointH := 0;
+  if not ReadPagePoints(AIndex, Wf, Hf) then
+    Exit;
+  APointW := Max(1, Round(Wf));
+  APointH := Max(1, Round(Hf));
+  APrintW := Max(1, Round(Wf / 72 * PrintDpi));
+  APrintH := Max(1, Round(Hf / 72 * PrintDpi));
+  Rw := APrintW;
+  Rh := APrintH;
+  Fit := Max(Rw, Rh);
+  if Fit > MaxSide then
+  begin
+    Fit := MaxSide / Fit;
+    Rw := Max(1, Round(Rw * Fit));
+    Rh := Max(1, Round(Rh * Fit));
+  end;
+  { 0 — без потолка 2.5: 240 pt дают 1000 px, а не 600. }
+  Result := RenderPage(AIndex, Rw, Rh, 0);
+end;
+
+function AiPdfCandidate(const APath: string): Boolean;
+var
+  FS: TFileStream;
+  Buf: array[0..1023] of Byte;
+  N, I: Integer;
+  S: AnsiString;
+begin
+  Result := False;
+  try
+    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      N := FS.Read(Buf[0], SizeOf(Buf));
+    finally
+      FS.Free;
+    end;
+  except
+    Exit(False);
+  end;
+  if N <= 0 then
+    Exit;
+  SetString(S, PAnsiChar(@Buf[0]), N);
+  if Pos(AnsiString('%PDF-'), S) > 0 then
+    Exit(True);
+  { Двоичный AI без текстового заголовка. Чистый PostScript не трогаем:
+    у него размер берётся из BoundingBox, без чтения всего файла в PDFium. }
+  for I := 0 to N - 1 do
+    if (Buf[I] < 9) and (Buf[I] <> 0) then
+      Exit(True);
+end;
+
+function TryPdfPageSize(const APath: string; out W, H: Integer): Boolean;
+var
+  Doc: TPdfiumDoc;
+  Ext: string;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  Ext := LowerCase(ExtractFileExt(APath));
+  if (Ext <> '.pdf') and (Ext <> '.ai') then
+    Exit;
+  if not TPdfiumDoc.Available then
+    Exit;
+  if (Ext = '.ai') and not AiPdfCandidate(APath) then
+    Exit;
+  Doc := nil;
+  try
+    try
+      Doc := TPdfiumDoc.Create(APath);
+      if Doc.PageCount < 1 then
+        Exit;
+      Result := Doc.PagePointSize(0, W, H);
+    except
+      Result := False;
+    end;
+  finally
+    Doc.Free;
+  end;
+end;
+
+function TryPdfPrintSize(const APath: string; out W, H: Integer): Boolean;
+var
+  Doc: TPdfiumDoc;
+  Ext: string;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  Ext := LowerCase(ExtractFileExt(APath));
+  if (Ext <> '.pdf') and (Ext <> '.ai') then
+    Exit;
+  if not TPdfiumDoc.Available then
+    Exit;
+  if (Ext = '.ai') and not AiPdfCandidate(APath) then
+    Exit;
+  Doc := nil;
+  try
+    try
+      Doc := TPdfiumDoc.Create(APath);
+      if Doc.PageCount < 1 then
+        Exit;
+      Result := Doc.PagePixelSize(0, 300, W, H);
+    except
+      Result := False;
+    end;
+  finally
+    Doc.Free;
   end;
 end;
 

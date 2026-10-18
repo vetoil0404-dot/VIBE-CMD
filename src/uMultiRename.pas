@@ -12,7 +12,7 @@ uses
   uFileModel;
 
 type
-  TRenameCaseMode = (rcKeep, rcLower, rcUpper, rcFirstUpper);
+  TRenameCaseMode = (rcKeep, rcLower, rcUpper, rcFirstUpper, rcWords);
 
   TRenameItem = record
     OldName: string;
@@ -302,22 +302,50 @@ begin
 end;
 
 function TMultiRenameEngine.ApplyCaseMode(const S: string): string;
-var
-  Base, Ext: string;
+
+  function CapFirst(const T: string): string;
+  begin
+    Result := AnsiLowerCase(T);
+    if Result <> '' then
+      Result := AnsiUpperCase(Copy(Result, 1, 1)) + Copy(Result, 2, MaxInt);
+  end;
+
+  { Пробел, «_» и «-» начинают слово. Точка не начинает: расширение остаётся строчным. }
+  function CapWords(const T: string): string;
+  var
+    I: Integer;
+    NewWord: Boolean;
+    Ch: Char;
+    Up: string;
+  begin
+    Result := AnsiLowerCase(T);
+    NewWord := True;
+    for I := 1 to Length(Result) do
+    begin
+      Ch := Result[I];
+      if (Ch = ' ') or (Ch = '_') or (Ch = '-') or (Ch = #9) then
+        NewWord := True
+      else if NewWord then
+      begin
+        Up := AnsiUpperCase(Ch);
+        if (Length(Up) <> 1) or (Up <> AnsiLowerCase(Ch)) then
+        begin
+          if Up <> '' then
+            Result[I] := Up[1];
+          NewWord := False;
+        end;
+      end;
+    end;
+  end;
+
 begin
-  Result := S;
   case CaseMode of
     rcLower: Result := AnsiLowerCase(S);
     rcUpper: Result := AnsiUpperCase(S);
-    rcFirstUpper:
-      begin
-        Ext := ExtractFileExt(S);
-        Base := ChangeFileExt(S, '');
-        Base := AnsiLowerCase(Base);
-        if Base <> '' then
-          Base[1] := UpCase(Base[1]);
-        Result := Base + Ext;
-      end;
+    rcFirstUpper: Result := CapFirst(S);
+    rcWords: Result := CapWords(S);
+  else
+    Result := S;
   end;
 end;
 

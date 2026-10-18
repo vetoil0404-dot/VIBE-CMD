@@ -9,6 +9,7 @@ uses
   uFileModel in 'uFileModel.pas',
   uArchiveEngine in 'uArchiveEngine.pas',
   uThumbCache in 'uThumbCache.pas',
+  uHtmlThumb in 'uHtmlThumb.pas',
   uIconCache in 'uIconCache.pas',
   uWinFileDrag in 'uWinFileDrag.pas',
   uClipboardImage in 'uClipboardImage.pas',
@@ -23,11 +24,14 @@ uses
   uDriveBar in 'uDriveBar.pas',
   uLaunchDock in 'uLaunchDock.pas',
   uAppSettings in 'uAppSettings.pas',
+  uLang in 'uLang.pas',
+  uLangBind in 'uLangBind.pas',
   uFileOps in 'uFileOps.pas',
   uFileOpEngine in 'uFileOpEngine.pas',
   uFileOpProgressForm in 'uFileOpProgressForm.pas',
   uConflictDialog in 'uConflictDialog.pas',
   uFilePreview in 'uFilePreview.pas',
+  uFontConvert in 'uFontConvert.pas',
   uQuickViewForm in 'uQuickViewForm.pas',
   uSettingsForm in 'uSettingsForm.pas',
   uMultiRename in 'uMultiRename.pas',
@@ -43,16 +47,22 @@ uses
   uImageSniff in 'uImageSniff.pas',
   uPdfium in 'uPdfium.pas',
   uPsdPreview in 'uPsdPreview.pas',
+  uVecPreview in 'uVecPreview.pas',
   uMpvPlayer in 'uMpvPlayer.pas',
-  uMetaCache in 'uMetaCache.pas';
+  uMetaCache in 'uMetaCache.pas',
+  uFolderSize in 'uFolderSize.pas',
+  uPeInfo in 'uPeInfo.pas',
+  uNetworkVfs in 'uNetworkVfs.pas',
+  uNetworkPanel in 'uNetworkPanel.pas';
 
 {$R *.res}
 
 begin
+  GlobalUseSkia := True;
   NoteAppStart;
   if TryActivateRunningInstance then
     Halt(0);
-  GlobalUseSkia := True;
+  ClearTcCloneTemp;
 {$IFDEF DEBUG}
   ReportMemoryLeaksOnShutdown := True;
 {$ENDIF}

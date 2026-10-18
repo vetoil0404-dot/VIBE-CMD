@@ -29,10 +29,20 @@ function SplitArchivePath(const APath: string; out AArchive, AInner: string): Bo
 function IsBrowsablePath(const APath: string): Boolean;
 function IsUncPath(const APath: string): Boolean;
 function IsRemotePath(const APath: string): Boolean;
+{ Виртуальный корень панели «Сеть»: network://, Сеть, ftp:// и http(s)://.
+  UNC со шарой сюда не входит — его читает обычный список. }
+function IsVibeNetworkPath(const APath: string): Boolean;
+function IsVibeNetworkRoot(const APath: string): Boolean;
+function NormalizeVibeNetwork(const APath: string): string;
+function VibeNetworkHost(const APath: string): string;
+function VibeNetworkParent(const APath: string): string;
 function IsListablePath(const APath: string): Boolean;
 function ParentOfBrowsablePath(const APath: string): string;
+function ResolveStartupTabPath(const APath: string): string;
 function NetworkFolderPath: string;
 function MaterializeFile(const APath: string; out ALocalPath: string): Boolean;
+{ %TEMP%\TCClone: остатки прошлого сеанса. Пустую папку не трогает. }
+procedure ClearTcCloneTemp;
 function ShellTransfer(const ASource, ADestDir: string): Boolean;
 procedure BeginArchiveAccess(const AZipPath: string);
 procedure EndArchiveAccess(const AZipPath: string);
@@ -119,11 +129,13 @@ function FormatDriveFreeUsed(AFree, ATotal: Int64): string;
 function CollectAllPlaces(AIncludeNetwork: Boolean): TArray<TDriveInfo>;
 function CollectDriveLetters: TArray<TDriveInfo>;
 function TryListComputerPlaces(AList: TFileEntryList; AIncludeNetwork: Boolean = True): Boolean;
+function TryReadArchiveRoot(const APath: string; AList: TFileEntryList;
+  out AError: string): Boolean;
 
 implementation
 
 uses
-  System.StrUtils, uArchiveEngine
+  System.StrUtils, uArchiveEngine, uFolderSize, uLang
   {$IFDEF MSWINDOWS}, Winapi.Windows, Winapi.ShlObj, Winapi.ActiveX{$ENDIF};
 
 const
@@ -817,11 +829,20 @@ var
   Item: IShellItem;
 {$ENDIF}
 begin
+  if IsVibeNetworkPath(APath) then
+  begin
+    if IsVibeNetworkRoot(APath) then
+      Exit(L('drive.network'));
+    Result := VibeNetworkHost(APath);
+    if Result = '' then
+      Result := APath;
+    Exit;
+  end;
   if IsThisPCPath(APath) then
-    Exit('Этот компьютер');
+    Exit(L('drive.thispc'));
   if SameText(APath, '\\') or SameText(APath, 'Network') or
      (IsUncPath(APath) and (Length(ExcludeTrailingPathDelimiter(APath)) <= 2)) then
-    Exit('Сеть');
+    Exit(L('drive.network'));
   {$IFDEF MSWINDOWS}
   if IsVirtualShellPath(APath) and TryCreateShellItem(APath, Item) then
   begin
@@ -836,7 +857,7 @@ begin
     if IsDriveRoot(APath) then
       Result := IncludeTrailingPathDelimiter(APath)
     else if IsPortableDevicePath(APath) then
-      Result := 'Устройство'
+      Result := L('drive.device')
     else
       Result := APath;
   end;
@@ -936,6 +957,150 @@ begin
   Result := (Length(APath) >= 2) and (APath[1] = '\') and (APath[2] = '\');
 end;
 
+function UncHostOnly(const APath: string; out AHost: string): Boolean;
+var
+  S: string;
+  P: Integer;
+begin
+  Result := False;
+  AHost := '';
+  if not IsUncPath(APath) then
+    Exit;
+  S := ExcludeTrailingPathDelimiter(Trim(APath));
+  if Length(S) <= 2 then
+    Exit;
+  Delete(S, 1, 2);
+  P := Pos('\', S);
+  if P > 0 then
+    Exit;
+  if S = '' then
+    Exit;
+  AHost := S;
+  Result := True;
+end;
+
+function IsUrlScheme(const APath, AScheme: string): Boolean;
+begin
+  Result := StartsText(AScheme, Trim(APath));
+end;
+
+function IsVibeNetworkPath(const APath: string): Boolean;
+var
+  S, Host: string;
+begin
+  S := Trim(APath);
+  Result := False;
+  if S = '' then
+    Exit;
+  if SameText(S, 'Сеть') or SameText(S, 'network') or SameText(S, 'network:') or
+     SameText(S, 'network://') or SameText(S, 'network:\\') or (S = '\\') then
+    Exit(True);
+  if StartsText('network://', S) or StartsText('network:\\', S) or
+     StartsText('network:', S) then
+    Exit(True);
+  if IsUrlScheme(S, 'ftp://') or IsUrlScheme(S, 'ftps://') or
+     IsUrlScheme(S, 'sftp://') or IsUrlScheme(S, 'http://') or
+     IsUrlScheme(S, 'https://') then
+    Exit(True);
+  Result := UncHostOnly(S, Host);
+end;
+
+function NetHostBody(const APath: string): string;
+var
+  S: string;
+  P: Integer;
+begin
+  S := Trim(APath);
+  if StartsText('network://', S) then
+    S := Copy(S, 11, MaxInt)
+  else if StartsText('network:\\', S) then
+    S := Copy(S, 11, MaxInt)
+  else if StartsText('network:', S) then
+    S := Copy(S, 9, MaxInt);
+  while (S <> '') and ((S[1] = '/') or (S[1] = '\')) do
+    Delete(S, 1, 1);
+  while (S <> '') and ((S[Length(S)] = '/') or (S[Length(S)] = '\')) do
+    Delete(S, Length(S), 1);
+  P := Pos('/', S);
+  if P = 0 then
+    P := Pos('\', S);
+  if P > 0 then
+    S := Copy(S, 1, P - 1);
+  Result := S;
+end;
+
+function NormalizeVibeNetwork(const APath: string): string;
+var
+  S, Host: string;
+begin
+  S := Trim(APath);
+  if SameText(S, 'Сеть') or SameText(S, 'network') or SameText(S, 'network:') or
+     SameText(S, 'network://') or SameText(S, 'network:\\') or (S = '\\') then
+    Exit('network://');
+  if UncHostOnly(S, Host) then
+    Exit('network://' + Host);
+  if StartsText('network://', S) or StartsText('network:\\', S) or
+     StartsText('network:', S) then
+  begin
+    Host := NetHostBody(S);
+    if Host = '' then
+      Exit('network://');
+    Exit('network://' + Host);
+  end;
+  Result := S;
+end;
+
+function IsVibeNetworkRoot(const APath: string): Boolean;
+begin
+  Result := IsVibeNetworkPath(APath) and
+    SameText(NormalizeVibeNetwork(APath), 'network://');
+end;
+
+function VibeNetworkHost(const APath: string): string;
+var
+  Host: string;
+begin
+  Result := '';
+  if not IsVibeNetworkPath(APath) then
+    Exit;
+  if UncHostOnly(APath, Host) then
+    Exit(Host);
+  if IsVibeNetworkRoot(APath) then
+    Exit;
+  if StartsText('network://', Trim(APath)) or StartsText('network:\\', Trim(APath)) or
+     StartsText('network:', Trim(APath)) or SameText(Trim(APath), 'Сеть') then
+    Result := NetHostBody(APath);
+end;
+
+function VibeNetworkParent(const APath: string): string;
+var
+  S, Scheme, Rest: string;
+  P, Slash: Integer;
+begin
+  Result := '';
+  if not IsVibeNetworkPath(APath) then
+    Exit;
+  S := NormalizeVibeNetwork(APath);
+  if SameText(S, 'network://') then
+    Exit;
+  if StartsText('network://', S) then
+    Exit('network://');
+  P := Pos('://', S);
+  if P <= 0 then
+    Exit('network://');
+  Scheme := Copy(S, 1, P + 2);
+  Rest := Copy(S, P + 3, MaxInt);
+  while (Rest <> '') and ((Rest[Length(Rest)] = '/') or (Rest[Length(Rest)] = '\')) do
+    Delete(Rest, Length(Rest), 1);
+  Slash := LastDelimiter('/\', Rest);
+  if Slash <= 0 then
+    Exit('network://');
+  Rest := Copy(Rest, 1, Slash - 1);
+  if Rest = '' then
+    Exit('network://');
+  Result := Scheme + Rest;
+end;
+
 function DriveRootOf(const APath: string): string;
 var
   S: string;
@@ -1012,8 +1177,9 @@ begin
   Result := Trim(APath) <> '';
   if not Result then
     Exit;
-  if IsUncPath(APath) or IsRemotePath(APath) or IsVirtualShellPath(APath) or
-     IsPortableDevicePath(APath) or IsThisPCPath(APath) then
+  if IsVibeNetworkPath(APath) or IsUncPath(APath) or IsRemotePath(APath) or
+     IsVirtualShellPath(APath) or IsPortableDevicePath(APath) or
+     IsThisPCPath(APath) then
     Exit(True);
   Result := TDirectory.Exists(APath) or SplitArchivePath(APath, Arc, Inner);
 end;
@@ -1023,8 +1189,9 @@ begin
   Result := Trim(APath) <> '';
   if not Result then
     Exit;
-  if IsUncPath(APath) or IsRemotePath(APath) or IsVirtualShellPath(APath) or
-     IsPortableDevicePath(APath) or IsThisPCPath(APath) then
+  if IsVibeNetworkPath(APath) or IsUncPath(APath) or IsRemotePath(APath) or
+     IsVirtualShellPath(APath) or IsPortableDevicePath(APath) or
+     IsThisPCPath(APath) then
     Exit(True);
   if TDirectory.Exists(APath) then
     Exit(True);
@@ -1123,6 +1290,64 @@ begin
   Result := ExtractFileDir(ExcludeTrailingPathDelimiter(APath));
 end;
 {$ENDIF}
+
+function ResolveStartupTabPath(const APath: string): string;
+var
+  P, Parent: string;
+  Letter: Char;
+  Mask, Kind: DWORD;
+  Guard: Integer;
+  Arc, Inner: string;
+begin
+  Result := 'C:\';
+  P := Trim(APath);
+  if P = '' then
+    Exit;
+  if IsVirtualShellPath(P) or IsThisPCPath(P) or IsPortableDevicePath(P) or
+     IsUncPath(P) then
+    Exit(P);
+
+  if (Length(P) >= 2) and (P[2] = ':') and CharInSet(P[1], ['A'..'Z', 'a'..'z']) then
+  begin
+    Letter := UpCase(P[1]);
+{$IFDEF MSWINDOWS}
+    Mask := GetLogicalDrives;
+    if (Mask and (1 shl (Ord(Letter) - Ord('A')))) = 0 then
+      Exit('C:\');
+    Kind := GetDriveType(PChar(string(Letter) + ':\'));
+    if Kind = DRIVE_REMOTE then
+      Exit(P);
+    if (Kind = DRIVE_NO_ROOT_DIR) or (Kind = DRIVE_UNKNOWN) then
+      Exit('C:\');
+{$ENDIF}
+  end
+  else
+    Exit(P);
+
+  if SplitArchivePath(P, Arc, Inner) and (Arc <> '') and TFile.Exists(Arc) then
+    Exit(P);
+
+  Guard := 0;
+  while Guard < 48 do
+  begin
+    Inc(Guard);
+    if IsDriveRoot(P) then
+    begin
+      Parent := UpperCase(P[1]) + ':\';
+      if TDirectory.Exists(Parent) then
+        Exit(Parent);
+      Exit('C:\');
+    end;
+    if TDirectory.Exists(P) then
+      Exit(P);
+    if TFile.Exists(P) and IsArchiveFileName(P) then
+      Exit(P);
+    Parent := ExcludeTrailingPathDelimiter(ExtractFilePath(ExcludeTrailingPathDelimiter(P)));
+    if (Parent = '') or SameText(Parent, ExcludeTrailingPathDelimiter(P)) then
+      Exit('C:\');
+    P := Parent;
+  end;
+end;
 
 function ShellName(Pidl: PItemIDList; ASig: Cardinal): string;
 var
@@ -1369,7 +1594,7 @@ begin
   Info.Letter := '';
   Info.VolumeName := AName;
   if Info.VolumeName = '' then
-    Info.VolumeName := 'Устройство';
+    Info.VolumeName := L('drive.device');
   Info.Ready := True;
   SetLength(AList, Length(AList) + 1);
   AList[High(AList)] := Info;
@@ -1895,7 +2120,8 @@ begin
   end;
 end;
 
-function TryListArchive(const APath: string; AList: TFileEntryList): Boolean;
+function TryListArchive(const APath: string; AList: TFileEntryList;
+  AShellFallback: Boolean): Boolean;
 var
   Arc, Inner: string;
   Kids: TArray<TArcChild>;
@@ -1908,6 +2134,8 @@ begin
   try
     if not ListArchiveChildren(APath, Kids) then
     begin
+      if not AShellFallback then
+        Exit;
       if Inner = '' then
         Result := TryListShellFolder(Arc, AList)
       else
@@ -1917,7 +2145,7 @@ begin
   except
     on E: Exception do
     begin
-      if (Inner = '') and TryListShellFolder(Arc, AList) then
+      if AShellFallback and (Inner = '') and TryListShellFolder(Arc, AList) then
         Exit(True);
       raise;
     end;
@@ -1938,6 +2166,105 @@ begin
     PrepareFileEntry(Entry);
     AList.Add(Entry);
   end;
+end;
+
+function TryReadArchiveRoot(const APath: string; AList: TFileEntryList;
+  out AError: string): Boolean;
+begin
+  Result := False;
+  AError := '';
+  if not Assigned(AList) then
+    Exit;
+  try
+    { Без оболочки: ложный zip не должен становиться пустым «каталогом». }
+    Result := TryListArchive(APath, AList, False);
+    if not Result then
+      AError := L('arch.notarchive');
+  except
+    on E: Exception do
+    begin
+      Result := False;
+      AError := E.Message;
+      if AError = '' then
+        AError := L('arch.notarchive');
+    end;
+  end;
+end;
+
+procedure DeleteTempEntry(const APath: string);
+begin
+  try
+    TFile.SetAttributes(APath, []);
+  except
+  end;
+  try
+    if TFile.Exists(APath) then
+      TFile.Delete(APath);
+  except
+  end;
+end;
+
+function TempDirIsLink(const APath: string): Boolean;
+var
+  Attrs: TFileAttributes;
+begin
+  Result := False;
+  try
+    Attrs := TDirectory.GetAttributes(APath, False);
+    Result := (TFileAttribute.faReparsePoint in Attrs) or
+      (TFileAttribute.faSymLink in Attrs);
+  except
+  end;
+end;
+
+procedure WipeTempDir(const ADir: string; ARemoveSelf: Boolean);
+var
+  S: string;
+begin
+  try
+    for S in TDirectory.GetFiles(ADir) do
+      DeleteTempEntry(S);
+  except
+  end;
+  try
+    for S in TDirectory.GetDirectories(ADir) do
+      if TempDirIsLink(S) then
+      begin
+        try
+          TDirectory.Delete(S, False);
+        except
+        end;
+      end
+      else
+        WipeTempDir(S, True);
+  except
+  end;
+  if not ARemoveSelf then
+    Exit;
+  try
+    TDirectory.Delete(ADir, False);
+  except
+  end;
+end;
+
+procedure ClearTcCloneTemp;
+var
+  Root: string;
+  Has: Boolean;
+begin
+  Root := TPath.Combine(TPath.GetTempPath, 'TCClone');
+  if not TDirectory.Exists(Root) then
+    Exit;
+  Has := False;
+  try
+    Has := (Length(TDirectory.GetFiles(Root)) > 0) or
+      (Length(TDirectory.GetDirectories(Root)) > 0);
+  except
+    Exit;
+  end;
+  if not Has then
+    Exit;
+  WipeTempDir(Root, False);
 end;
 
 function UniqueTempPath(const AName: string): string;
@@ -2205,7 +2532,7 @@ begin
     if AEntry.Extension <> '' then
       AEntry.DisplayType := AEntry.Extension
     else
-      AEntry.DisplayType := 'Папка';
+      AEntry.DisplayType := L('model.folder');
     if AEntry.FreeBytes > 0 then
       AEntry.DisplaySize := FormatDriveFreeUsed(AEntry.FreeBytes, AEntry.Size)
     else
@@ -2358,12 +2685,12 @@ begin
     dkSSD:       Result := 'SSD';
     dkHDD:       Result := 'HDD';
     dkRemovable: Result := 'USB';
-    dkNetwork:   Result := 'Сеть';
+    dkNetwork:   Result := L('drive.network');
     dkOptical:   Result := 'DVD';
-    dkDevice:    Result := 'Устройство';
-    dkNetHood:   Result := 'Сеть';
+    dkDevice:    Result := L('drive.device');
+    dkNetHood:   Result := L('drive.network');
   else
-    Result := 'Диск';
+    Result := L('drive.disk');
   end;
 end;
 
@@ -2371,9 +2698,14 @@ function DrivePlaceTitle(const AInfo: TDriveInfo): string;
 var
   Name: string;
 begin
-  Name := Trim(AInfo.VolumeName);
-  if Name = '' then
-    Name := DriveKindCaption(AInfo.Kind);
+  if AInfo.Kind = dkNetHood then
+    Name := L('drive.network')
+  else
+  begin
+    Name := Trim(AInfo.VolumeName);
+    if Name = '' then
+      Name := DriveKindCaption(AInfo.Kind);
+  end;
   if AInfo.Letter <> '' then
     Result := AInfo.Letter + '  ' + Name
   else
@@ -2443,6 +2775,29 @@ begin
   PrepareFileEntry(Result);
 end;
 
+function EntrySortSize(const E: TFileEntry): Int64;
+var
+  Bytes: Int64;
+begin
+  { Диск оставляет объём тома. Папка без готового обхода, в том числе «…», — 0. }
+  if not E.IsDirectory or (E.FreeBytes > 0) then
+    Exit(E.Size);
+  if not FolderSizesShown then
+    Exit(0);
+  { Сетевой размер в кэше есть только после Alt+Enter. Сортировку он не двигает. }
+  if IsRemotePath(E.FullPath) then
+    Exit(0);
+  if Assigned(GlobalFolderSizes) and GlobalFolderSizes.SortSnapshotOn then
+  begin
+    if GlobalFolderSizes.SnapshotBytes(E.FullPath, Bytes) then
+      Exit(Bytes);
+    Exit(0);
+  end;
+  if FolderSizeReadyBytes(E.FullPath, E.Modified, Bytes) then
+    Exit(Bytes);
+  Result := 0;
+end;
+
 procedure SortEntries(List: TFileEntryList; Field: TSortField; Ascending: Boolean);
 var
   Comparer: IComparer<TFileEntry>;
@@ -2452,6 +2807,8 @@ begin
 
   Comparer := TComparer<TFileEntry>.Construct(
     function(const A, B: TFileEntry): Integer
+    var
+      SizeCmp: Integer;
     begin
       if A.IsDirectory <> B.IsDirectory then
       begin
@@ -2461,7 +2818,14 @@ begin
       case Field of
         sfName: Result := CompareText(A.Name, B.Name);
         sfExt:  Result := CompareText(A.Extension, B.Extension);
-        sfSize: Result := CompareValue(A.Size, B.Size);
+        sfSize:
+          begin
+            SizeCmp := CompareValue(EntrySortSize(A), EntrySortSize(B));
+            if SizeCmp = 0 then
+              Result := CompareText(A.Name, B.Name)
+            else
+              Result := SizeCmp;
+          end;
         sfDate: Result := CompareDateTime(A.Modified, B.Modified);
       else
         Result := 0;
@@ -2673,13 +3037,13 @@ function NetErrorText(ACode: DWORD): string;
 begin
   if (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_NETWORK_ACCESS_DENIED) or
      (ACode = ERROR_LOGON_FAILURE) then
-    Result := 'Нет доступа'
+    Result := L('op.noaccess')
   else if NetIsOfflineCode(ACode) then
-    Result := 'Сервер не отвечает'
+    Result := L('model.server.down')
   else if ACode <> 0 then
-    Result := 'Не удалось открыть папку'
+    Result := L('model.open.folder')
   else
-    Result := 'Сервер не отвечает';
+    Result := L('model.server.down');
 end;
 
 procedure TDirLoadThread.Execute;
@@ -2716,17 +3080,17 @@ begin
               Result := Terminated;
             end)
         else
-          raise Exception.Create('Ветвь каталога недоступна: ' + FPath);
+          raise Exception.Create(Lf('model.branch.fail', [FPath]));
       end
       else if IsThisPCPath(FPath) then
       begin
         if not TryListComputerPlaces(Entries, True) then
-          raise Exception.Create('Не удалось открыть: Этот компьютер');
+          raise Exception.Create(L('model.open.thispc'));
       end
       else if SplitArchivePath(FPath, Arc, Inner) then
       begin
-        if not TryListArchive(FPath, Entries) then
-          raise Exception.Create('Не удалось открыть архив: ' + Arc);
+        if not TryListArchive(FPath, Entries, True) then
+          raise Exception.Create(Lf('model.open.archive', [Arc]));
       end
       else if (not IsVirtualShellPath(FPath)) and
               (Remote or (not Remote and TDirectory.Exists(FPath))) then
@@ -2742,7 +3106,7 @@ begin
                 if not Terminated then
                 begin
                   Terminate;
-                  SendError('Сервер не отвечает');
+                  SendError(L('model.server.down'));
                 end;
             end).Start;
         end;
@@ -2773,7 +3137,7 @@ begin
             else
               raise Exception.Create(NetErrorText(ErrCode));
 {$ELSE}
-            raise Exception.Create('Не удалось открыть: ' + FPath);
+            raise Exception.Create(Lf('model.open.path', [FPath]));
 {$ENDIF}
           end
           else if Entries.Count = 0 then
@@ -2815,7 +3179,7 @@ begin
       else if not TryListShellFolder(FPath, Entries, FShowHidden) then
       begin
         if not IsVirtualShellPath(FPath) then
-          raise Exception.Create('Не удалось открыть: ' + FPath);
+          raise Exception.Create(Lf('model.open.path', [FPath]));
       end;
 
       if Terminated then

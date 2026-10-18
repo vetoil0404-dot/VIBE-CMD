@@ -26,6 +26,7 @@ type
     FExtPos: Single;
     FOnExtScroll: TProc<Single>;
 
+    function UseExternal: Boolean;
     function AdjustAlpha(AColor: TAlphaColor; AAlpha: Byte): TAlphaColor;
     function TrackCtrl: TControl;
     function ViewSize: Single;
@@ -132,6 +133,11 @@ begin
   Result := Rec.Color;
 end;
 
+function TCustomFileScrollbar.UseExternal: Boolean;
+begin
+  Result := (FTrack <> nil) or Assigned(FOnExtScroll);
+end;
+
 function TCustomFileScrollbar.TrackCtrl: TControl;
 begin
   if Assigned(FPresented) then
@@ -146,7 +152,7 @@ function TCustomFileScrollbar.ViewSize: Single;
 var
   C: TControl;
 begin
-  if FTrack <> nil then
+  if UseExternal then
     Exit(FExtView);
   C := TrackCtrl;
   if C = nil then
@@ -159,7 +165,7 @@ end;
 
 function TCustomFileScrollbar.ContentSize: Single;
 begin
-  if FTrack <> nil then
+  if UseExternal then
     Exit(FExtContent);
   if Assigned(FPresented) then
   begin
@@ -181,7 +187,7 @@ end;
 
 function TCustomFileScrollbar.Viewport: Single;
 begin
-  if FTrack <> nil then
+  if UseExternal then
     Exit(FExtPos);
   if Assigned(FPresented) then
   begin

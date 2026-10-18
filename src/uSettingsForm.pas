@@ -9,11 +9,15 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.UITypes, System.Types, System.Math,
+  System.Generics.Collections,
   FMX.Graphics, FMX.Forms, FMX.Layouts, FMX.StdCtrls, FMX.Objects, FMX.Types,
   {$IFDEF MSWINDOWS}Winapi.Windows, FMX.Platform.Win,{$ENDIF}
-  uAppSettings, uThemeManager, uFluentChrome, uFluentEdit, uThumbCache;
+  uAppSettings, uThemeManager, uFluentChrome, uFluentEdit, uLang, uLangBind;
 
 type
+  TSettingsApply = (saBands, saPanels, saBehavior, saFileOp);
+  TSettingsApplySet = set of TSettingsApply;
+  TOptionsChangedProc = reference to procedure(const AApply: TSettingsApplySet);
   TThemeChangedProc = reference to procedure(NewTheme: TAppTheme);
 
   TSettingsForm = class(TForm)
@@ -21,7 +25,8 @@ type
     FSettings: TAppSettings;
     FSaveTimer: TTimer;
     FOnThemeChanged: TThemeChangedProc;
-    FOnOptionsChanged: TProc;
+    FOnOptionsChanged: TOptionsChangedProc;
+    FOnTintChanged: TProc;
     FColors: TThemeColors;
     FPage: Integer;
 
@@ -29,36 +34,60 @@ type
     FBody: TLayout;
     FNav: TRectangle;
     FNavStack: TLayout;
-    FNavBtns: array[0..2] of TFluentButton;
+    FNavBtns: array[0..3] of TFluentButton;
     FContent: TRectangle;
-    FPages: array[0..2] of TVertScrollBox;
+    FPages: array[0..3] of TVertScrollBox;
     FFooter: TLayout;
     FBtnClose: TFluentButton;
 
     FCardSystem, FCardLight, FCardDark: TRectangle;
     FCardMatNormal, FCardMatAcrylic, FCardMatMica: TRectangle;
-    FCbDock, FCbMid, FCbDrives, FCbStatus, FCbFn, FCbQuick, FCbCmd: TFluentCheckRow;
-    FCbHidden, FCbNetwork: TFluentCheckRow;
+    FTintCard: TRectangle;
+    FTintSlider: TPaintBox;
+    FTintHint: TText;
+    FCbTint: TFluentCheckRow;
+    FTintHold: Integer;
+    FTintDrag: Boolean;
+    FTintSync: Boolean;
+    FCbDock, FCbMid, FCbDrives, FCbDriveHome, FCbFn, FCbQuick, FCbCmd: TFluentCheckRow;
+    FCbFollow: TFluentCheckRow;
+    FCbSelExplorer, FCbSelVibe: TFluentCheckRow;
+    FCbHidden, FCbFolderSize, FCbNetwork: TFluentCheckRow;
+    FCbAutoStart, FCbSingleInstance: TFluentCheckRow;
     FCbOpQuiet, FCbOpExplorer, FCbOpVibe: TFluentCheckRow;
     FCbTabIcons, FCbEqualTabs: TFluentCheckRow;
     FCbDockLeft, FCbDockCenter, FCbDockFree, FCbDockSeps: TFluentCheckRow;
-    FCbThumbs: TFluentCheckRow;
-    FThumbLimitEdit: TFluentEdit;
-    FThumbInfo: TText;
-    FBtnClearCache: TFluentButton;
     FFontSizeEdit: TFluentEdit;
+    FLangCard: TRectangle;
+    FLangRows: TList<TFluentCheckRow>;
+    FOnLanguageChanged: TProc;
 
     procedure BuildUI;
     procedure BuildNav;
     procedure BuildPages;
     function AddPage: TVertScrollBox;
-    function AddCard(AParent: TFmxObject; const ATitle: string): TRectangle;
-    function AddCheck(AParent: TFmxObject; const ACaption: string;
+    function AddCard(AParent: TFmxObject; const AKey: string): TRectangle;
+    function AddCheck(AParent: TFmxObject; const AKey: string;
       AChecked: Boolean; AOnChange: TNotifyEvent): TFluentCheckRow;
+    procedure RebuildLangPage;
     procedure BuildThemeCard(var ACard: TRectangle; AParent: TFmxObject;
-      const ATitle: string; ATheme: TAppTheme);
+      const AKey: string; ATheme: TAppTheme);
     procedure BuildMaterialCard(var ACard: TRectangle; AParent: TFmxObject;
-      const ATitle: string; AMaterial: TWindowMaterial; APreview: TAlphaColor);
+      const AKey: string; AMaterial: TWindowMaterial; APreview: TAlphaColor);
+    procedure BuildTintCard(AParent: TFmxObject);
+    procedure TintTrack(out TrackL, TrackR: Single);
+    function TintFromSliderX(X: Single): Integer;
+    procedure PaintTintSlider(Sender: TObject; Canvas: TCanvas);
+    procedure TintSliderDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure TintSliderMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+    procedure TintSliderUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure TintSliderDblClick(Sender: TObject);
+    procedure TintEnabledClick(Sender: TObject);
+    procedure SyncTintCheck;
+    procedure ApplyTintLive(AValue: Integer; ASave: Boolean);
+    procedure SyncTintHint;
     procedure NavClick(Sender: TObject);
     procedure ShowPage(AIndex: Integer);
     procedure ThemeCardClick(Sender: TObject);
@@ -66,14 +95,14 @@ type
     procedure OptionChanged(Sender: TObject);
     procedure DockAlignClick(Sender: TObject);
     procedure FileOpModeClick(Sender: TObject);
+    procedure MouseModeClick(Sender: TObject);
+    procedure LangClick(Sender: TObject);
     procedure CloseClick(Sender: TObject);
     procedure SaveTimerTick(Sender: TObject);
     procedure ScheduleSave;
-    procedure ClearCacheClick(Sender: TObject);
     procedure CollectFromUI;
     procedure UpdateThemeCards;
     procedure UpdateMaterialCards;
-    procedure UpdateThumbInfo;
     function ThemeOfCard(ACard: TRectangle): TAppTheme;
     procedure ApplyNativeChrome;
   protected
@@ -82,8 +111,13 @@ type
   public
     constructor Create(AOwner: TComponent; ASettings: TAppSettings;
       AOnThemeChanged: TThemeChangedProc); reintroduce;
+    destructor Destroy; override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
     procedure ApplyTheme(const AColors: TThemeColors);
-    property OnOptionsChanged: TProc read FOnOptionsChanged write FOnOptionsChanged;
+    procedure ApplyLanguage;
+    property OnOptionsChanged: TOptionsChangedProc read FOnOptionsChanged write FOnOptionsChanged;
+    property OnLanguageChanged: TProc read FOnLanguageChanged write FOnLanguageChanged;
+    property OnTintChanged: TProc read FOnTintChanged write FOnTintChanged;
   end;
 
 implementation
@@ -98,7 +132,7 @@ begin
   Height := 620;
   BorderStyle := TFmxFormBorderStyle.Single;
   BorderIcons := [TBorderIcon.biSystemMenu];
-  Caption := 'Настройки';
+  TrForm(Self, 'set.title');
   Position := TFormPosition.OwnerFormCenter;
   FColors := GetThemeColors(FSettings.Theme);
   FPage := 0;
@@ -141,7 +175,7 @@ begin
   Result.Visible := False;
 end;
 
-function TSettingsForm.AddCard(AParent: TFmxObject; const ATitle: string): TRectangle;
+function TSettingsForm.AddCard(AParent: TFmxObject; const AKey: string): TRectangle;
 var
   Cap: TText;
 begin
@@ -161,24 +195,26 @@ begin
   Cap.Parent := Result;
   Cap.Align := TAlignLayout.Top;
   Cap.Height := 22;
-  Cap.Text := ATitle;
   Cap.HitTest := False;
   Cap.Tag := 7;
   ApplyFluentText(Cap, 13, True);
   Cap.TextSettings.HorzAlign := TTextAlign.Leading;
+  if AKey <> '' then
+    TrText(Cap, AKey);
 end;
 
-function TSettingsForm.AddCheck(AParent: TFmxObject; const ACaption: string;
+function TSettingsForm.AddCheck(AParent: TFmxObject; const AKey: string;
   AChecked: Boolean; AOnChange: TNotifyEvent): TFluentCheckRow;
 begin
   Result := TFluentCheckRow.Create(Self);
-  Result.Setup(AParent, ACaption, AChecked);
+  Result.Setup(AParent, L(AKey), AChecked);
   Result.OnChange := AOnChange;
   Result.ApplyTheme(FColors);
+  TrCheck(Result, AKey);
 end;
 
 procedure TSettingsForm.BuildThemeCard(var ACard: TRectangle; AParent: TFmxObject;
-  const ATitle: string; ATheme: TAppTheme);
+  const AKey: string; ATheme: TAppTheme);
 var
   Preview, Swatch1, Swatch2, AccentBar: TRectangle;
   Lbl: TText;
@@ -244,15 +280,15 @@ begin
   Lbl := TText.Create(Self);
   Lbl.Parent := ACard;
   Lbl.Align := TAlignLayout.Client;
-  Lbl.Text := ATitle;
   Lbl.HitTest := False;
   ApplyFluentText(Lbl, 13, False);
   Lbl.TextSettings.HorzAlign := TTextAlign.Center;
   Lbl.TextSettings.VertAlign := TTextAlign.Center;
+  TrText(Lbl, AKey);
 end;
 
 procedure TSettingsForm.BuildMaterialCard(var ACard: TRectangle; AParent: TFmxObject;
-  const ATitle: string; AMaterial: TWindowMaterial; APreview: TAlphaColor);
+  const AKey: string; AMaterial: TWindowMaterial; APreview: TAlphaColor);
 var
   Preview, Glass: TRectangle;
   Lbl: TText;
@@ -302,24 +338,336 @@ begin
   Lbl := TText.Create(Self);
   Lbl.Parent := ACard;
   Lbl.Align := TAlignLayout.Client;
-  Lbl.Text := ATitle;
   Lbl.HitTest := False;
   ApplyFluentText(Lbl, 13, False);
   Lbl.TextSettings.HorzAlign := TTextAlign.Center;
   Lbl.TextSettings.VertAlign := TTextAlign.Center;
+  TrText(Lbl, AKey);
+end;
+
+procedure TSettingsForm.BuildTintCard(AParent: TFmxObject);
+var
+  I: Integer;
+begin
+  FTintCard := AddCard(AParent, '');
+  for I := 0 to FTintCard.ControlsCount - 1 do
+    if (FTintCard.Controls[I] is TText) and (TText(FTintCard.Controls[I]).Tag = 7) then
+    begin
+      TText(FTintCard.Controls[I]).Visible := False;
+      TText(FTintCard.Controls[I]).Height := 0;
+    end;
+  if Assigned(FSettings) and (FSettings.ColorTint >= 0) then
+    FTintHold := FSettings.ColorTint
+  else
+    FTintHold := 200;
+  { Align=Top: последний добавленный оказывается сверху. }
+  FTintHint := TText.Create(Self);
+  FTintHint.Parent := FTintCard;
+  FTintHint.Align := TAlignLayout.Top;
+  FTintHint.Height := 34;
+  FTintHint.Margins.Rect := TRectF.Create(0, 4, 0, 0);
+  TrText(FTintHint, 'set.tint.hint');
+  FTintHint.HitTest := False;
+  FTintHint.Tag := 8;
+  FTintHint.WordWrap := True;
+  ApplyFluentText(FTintHint, 12, False);
+  FTintHint.TextSettings.HorzAlign := TTextAlign.Leading;
+  FTintHint.TextSettings.VertAlign := TTextAlign.Leading;
+  FTintSlider := TPaintBox.Create(Self);
+  FTintSlider.Parent := FTintCard;
+  FTintSlider.Align := TAlignLayout.Top;
+  FTintSlider.Height := 36;
+  FTintSlider.Margins.Rect := TRectF.Create(0, 2, 0, 0);
+  FTintSlider.Cursor := crHandPoint;
+  FTintSlider.OnPaint := PaintTintSlider;
+  FTintSlider.OnMouseDown := TintSliderDown;
+  FTintSlider.OnMouseMove := TintSliderMove;
+  FTintSlider.OnMouseUp := TintSliderUp;
+  FTintSlider.OnDblClick := TintSliderDblClick;
+  FCbTint := AddCheck(FTintCard, 'set.tint',
+    Assigned(FSettings) and (FSettings.ColorTint >= 0), TintEnabledClick);
+  SyncTintHint;
+end;
+
+function HueSwatch(Hue: Single): TAlphaColor;
+var
+  Rec: TAlphaColorRec;
+  Hp, C, X, M, Rf, Gf, Bf, F: Single;
+  Sector: Integer;
+begin
+  Hp := Hue / 60;
+  Sector := Trunc(Hp) mod 6;
+  if Sector < 0 then
+    Sector := Sector + 6;
+  F := Hp - Trunc(Hp);
+  C := 1;
+  if (Sector mod 2) = 0 then
+    X := C * F
+  else
+    X := C * (1 - F);
+  M := 0;
+  case Sector of
+    0: begin Rf := C; Gf := X; Bf := 0; end;
+    1: begin Rf := X; Gf := C; Bf := 0; end;
+    2: begin Rf := 0; Gf := C; Bf := X; end;
+    3: begin Rf := 0; Gf := X; Bf := C; end;
+    4: begin Rf := X; Gf := 0; Bf := C; end;
+  else
+    begin Rf := C; Gf := 0; Bf := X; end;
+  end;
+  Rec.A := 255;
+  Rec.R := EnsureRange(Round((Rf + M) * 255), 0, 255);
+  Rec.G := EnsureRange(Round((Gf + M) * 255), 0, 255);
+  Rec.B := EnsureRange(Round((Bf + M) * 255), 0, 255);
+  Result := Rec.Color;
+end;
+
+procedure TSettingsForm.TintTrack(out TrackL, TrackR: Single);
+begin
+  TrackL := 4;
+  TrackR := 48;
+  if Assigned(FTintSlider) then
+    TrackR := FTintSlider.Width - 52;
+  if TrackR < TrackL + 40 then
+    TrackR := TrackL + 40;
+end;
+
+function TSettingsForm.TintFromSliderX(X: Single): Integer;
+var
+  TrackL, TrackR: Single;
+begin
+  TintTrack(TrackL, TrackR);
+  Result := EnsureRange(Round((X - TrackL) / (TrackR - TrackL) * 359), 0, 359);
+end;
+
+procedure TSettingsForm.PaintTintSlider(Sender: TObject; Canvas: TCanvas);
+var
+  TrackL, TrackR, ThumbX, MidY: Single;
+  Bar, R: TRectF;
+  Grad: TGradient;
+  Stop: TGradientPoint;
+  I: Integer;
+  Caption: string;
+begin
+  if not Assigned(FTintSlider) or not Assigned(FSettings) then
+    Exit;
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := FColors.CardBackground;
+  Canvas.FillRect(FTintSlider.LocalRect, 0, 0, [], 1);
+  TintTrack(TrackL, TrackR);
+  MidY := FTintSlider.Height / 2;
+  Bar := TRectF.Create(TrackL, MidY - 5, TrackR, MidY + 5);
+  Grad := TGradient.Create;
+  try
+    Grad.Style := TGradientStyle.Linear;
+    Grad.StartPosition.X := 0;
+    Grad.StartPosition.Y := 0;
+    Grad.StopPosition.X := 1;
+    Grad.StopPosition.Y := 0;
+    Grad.Points.Clear;
+    for I := 0 to 6 do
+    begin
+      Stop := TGradientPoint(Grad.Points.Add);
+      Stop.Offset := I / 6;
+      Stop.Color := HueSwatch(I * 60);
+    end;
+    Canvas.Fill.Kind := TBrushKind.Gradient;
+    Canvas.Fill.Gradient.Assign(Grad);
+  finally
+    Grad.Free;
+  end;
+  Canvas.FillRect(Bar, 4, 4, AllCorners, 1);
+  Canvas.Font.Family := 'Segoe UI';
+  Canvas.Font.Size := 12;
+  Canvas.Font.Style := [];
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := FColors.SubTextColor;
+  if FSettings.ColorTint < 0 then
+    Caption := L('set.tint.off')
+  else
+    Caption := IntToStr(FSettings.ColorTint) + '°';
+  R := TRectF.Create(FTintSlider.Width - 46, 0, FTintSlider.Width, FTintSlider.Height);
+  Canvas.FillText(R, Caption, False, 1, [], TTextAlign.Trailing, TTextAlign.Center);
+  if FSettings.ColorTint >= 0 then
+  begin
+    ThumbX := TrackL + (TrackR - TrackL) * (FSettings.ColorTint / 359);
+    Canvas.Fill.Color := $FF1A1A1A;
+    Canvas.FillEllipse(TRectF.Create(ThumbX - 8, MidY - 8, ThumbX + 8, MidY + 8), 1);
+    Canvas.Fill.Color := HueSwatch(FSettings.ColorTint);
+    Canvas.FillEllipse(TRectF.Create(ThumbX - 5, MidY - 5, ThumbX + 5, MidY + 5), 1);
+  end;
+end;
+
+procedure TSettingsForm.ApplyTintLive(AValue: Integer; ASave: Boolean);
+var
+  Next: Integer;
+  WasPainting, NowPainting: Boolean;
+  Plain, Live: TThemeColors;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  if AValue < 0 then
+    Next := -1
+  else
+    Next := EnsureRange(AValue, 0, 359);
+  if FSettings.ColorTint = Next then
+  begin
+    if Assigned(FTintSlider) then
+      FTintSlider.Repaint;
+    if ASave then
+      ScheduleSave;
+    Exit;
+  end;
+
+  WasPainting := False;
+  if FSettings.ColorTint >= 0 then
+  begin
+    ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+    Plain := GetThemeColors(FSettings.Theme, False);
+    Live := GetThemeColors(FSettings.Theme);
+    WasPainting := ThemeTintPaintsControls(Live, Plain);
+  end;
+
+  FSettings.ColorTint := Next;
+  ConfigureThemeTint(Next, FSettings.WindowMaterial);
+  Plain := GetThemeColors(FSettings.Theme, False);
+  Live := GetThemeColors(FSettings.Theme);
+  NowPainting := ThemeTintPaintsControls(Live, Plain);
+  if WasPainting or NowPainting then
+  begin
+    if Assigned(FOnThemeChanged) then
+      FOnThemeChanged(FSettings.Theme);
+    ApplyTheme(Live);
+  end
+  else
+  begin
+    { Оттенок красит только фон. Панели, док и кнопки не трогаем. }
+    FColors := Live;
+    Fill.Color := Live.Background;
+    if Assigned(FContent) then
+      FContent.Fill.Color := Live.LayerBackground;
+    if Assigned(FOnTintChanged) then
+      FOnTintChanged();
+    if Assigned(FTintSlider) then
+      FTintSlider.Repaint;
+  end;
+  if Next >= 0 then
+    FTintHold := Next;
+  SyncTintCheck;
+  if ASave then
+    ScheduleSave;
+end;
+
+procedure TSettingsForm.TintSliderDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  FTintDrag := True;
+  if Assigned(FTintSlider) and Assigned(FTintSlider.Root) then
+    FTintSlider.Root.Captured := FTintSlider;
+  ApplyTintLive(TintFromSliderX(X), False);
+end;
+
+procedure TSettingsForm.TintSliderMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+begin
+  if FTintDrag then
+    ApplyTintLive(TintFromSliderX(X), False);
+end;
+
+procedure TSettingsForm.TintSliderUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  if FTintDrag then
+    ApplyTintLive(TintFromSliderX(X), True);
+  FTintDrag := False;
+  if Assigned(FTintSlider) and Assigned(FTintSlider.Root) and
+     Assigned(FTintSlider.Root.Captured) and
+     (FTintSlider.Root.Captured.GetObject = FTintSlider) then
+    FTintSlider.Root.Captured := nil;
+end;
+
+procedure TSettingsForm.TintSliderDblClick(Sender: TObject);
+begin
+  FTintDrag := False;
+  ApplyTintLive(-1, True);
+end;
+
+procedure TSettingsForm.TintEnabledClick(Sender: TObject);
+begin
+  if FTintSync or not Assigned(FSettings) or not Assigned(FCbTint) then
+    Exit;
+  if FCbTint.Checked then
+  begin
+    if FSettings.ColorTint < 0 then
+    begin
+      if (FTintHold < 0) or (FTintHold > 359) then
+        FTintHold := 200;
+      ApplyTintLive(FTintHold, True);
+    end;
+  end
+  else if FSettings.ColorTint >= 0 then
+  begin
+    FTintHold := FSettings.ColorTint;
+    ApplyTintLive(-1, True);
+  end;
+end;
+
+procedure TSettingsForm.SyncTintCheck;
+begin
+  if not Assigned(FCbTint) or not Assigned(FSettings) then
+    Exit;
+  FTintSync := True;
+  try
+    FCbTint.Checked := FSettings.ColorTint >= 0;
+  finally
+    FTintSync := False;
+  end;
+end;
+
+procedure TSettingsForm.SyncTintHint;
+var
+  ShowHint: Boolean;
+begin
+  if not Assigned(FTintCard) then
+    Exit;
+  ShowHint := Assigned(FSettings) and (FSettings.WindowMaterial <> wmNormal);
+  if Assigned(FTintHint) then
+  begin
+    FTintHint.Visible := ShowHint;
+    if ShowHint then
+    begin
+      FTintHint.Height := 34;
+      FTintHint.Margins.Rect := TRectF.Create(0, 4, 0, 0);
+    end
+    else
+    begin
+      FTintHint.Height := 0;
+      FTintHint.Margins.Rect := TRectF.Create(0, 0, 0, 0);
+    end;
+  end;
+  if ShowHint then
+    FTintCard.Height := 124
+  else
+    FTintCard.Height := 86;
+  if Assigned(FTintSlider) then
+    FTintSlider.Repaint;
 end;
 
 procedure TSettingsForm.BuildNav;
 const
-  Caps: array[0..2] of string = ('Основные', 'Вид и темы', 'Кэш');
-  Icons: array[0..2] of string = ('', '', '');
+  Keys: array[0..3] of string = (
+    'set.nav.general', 'set.nav.view', 'set.nav.ops', 'set.nav.lang');
+  Icons: array[0..3] of string = ('', '', #$E8C8, #$E774);
 var
   I: Integer;
 begin
   FNav := TRectangle.Create(Self);
   FNav.Parent := FBody;
   FNav.Align := TAlignLayout.Left;
-  FNav.Width := 208;
+  FNav.Width := 232;
   FNav.XRadius := 10;
   FNav.YRadius := 10;
   FNav.Stroke.Kind := TBrushKind.Solid;
@@ -330,16 +678,17 @@ begin
   FNavStack := TLayout.Create(Self);
   FNavStack.Parent := FNav;
   FNavStack.Align := TAlignLayout.Top;
-  FNavStack.Height := 3 * 44;
+  FNavStack.Height := 4 * 44;
 
-  for I := 0 to 2 do
+  for I := 0 to 3 do
   begin
-    FNavBtns[I] := CreateFluentButton(Self, FNavStack, Icons[I], Caps[I],
-      fbkSubtle, 188, NavClick);
+    FNavBtns[I] := CreateFluentButton(Self, FNavStack, Icons[I], L(Keys[I]),
+      fbkSubtle, 212, NavClick);
     FNavBtns[I].Align := TAlignLayout.Top;
     FNavBtns[I].Height := 40;
     FNavBtns[I].Tag := I;
     FNavBtns[I].Margins.Rect := TRectF.Create(0, 0, 0, 4);
+    TrButton(FNavBtns[I], Keys[I]);
   end;
 end;
 
@@ -359,45 +708,53 @@ begin
   FPages[0] := AddPage;
   FPages[1] := AddPage;
   FPages[2] := AddPage;
+  FPages[3] := AddPage;
 
-  { --- Основные --- }
-  Card := AddCard(FPages[0], 'Элементы интерфейса');
-  Card.Height := 22 + 7 * 36 + 16;
+  { Список в карточке идёт снизу вверх: последний пункт оказывается сверху. }
+  Card := AddCard(FPages[0], 'set.card.ui');
+  Card.Height := 22 + 8 * 36 + 16;
+  FCbCmd := AddCheck(Card, 'set.ui.cmdline', FSettings.ShowCommandLine, OptionChanged);
+  FCbFn := AddCheck(Card, 'set.ui.fn', FSettings.ShowFnBar, OptionChanged);
+  FCbQuick := AddCheck(Card, 'set.ui.viewbtns', FSettings.ShowQuickAccess, OptionChanged);
+  FCbDriveHome := AddCheck(Card, 'set.ui.drivehome', FSettings.ShowDriveHome, OptionChanged);
+  FCbNetwork := AddCheck(Card, 'set.ui.network', FSettings.ShowNetworkButton, OptionChanged);
+  FCbDrives := AddCheck(Card, 'set.ui.drives', FSettings.ShowDriveBar, OptionChanged);
+  FCbMid := AddCheck(Card, 'set.ui.mid', FSettings.ShowMidBar, OptionChanged);
+  FCbDock := AddCheck(Card, 'set.ui.dock', FSettings.ShowDock, OptionChanged);
 
-    // для правильго отображения список должен быть  в обратном порядке
-    FCbCmd := AddCheck(Card, 'Командная строка', FSettings.ShowCommandLine, OptionChanged);
-    FCbFn := AddCheck(Card, 'Панель функциональных клавиш', FSettings.ShowFnBar, OptionChanged);
-    FCbQuick := AddCheck(Card, 'Кнопки быстрого доступа', FSettings.ShowQuickAccess, OptionChanged);
-    FCbStatus := AddCheck(Card, 'Строка состояния', FSettings.ShowStatusBar, OptionChanged);
-    FCbDrives := AddCheck(Card, 'Панель дисков', FSettings.ShowDriveBar, OptionChanged);
-    FCbMid := AddCheck(Card, 'Вертикальная панель команд', FSettings.ShowMidBar, OptionChanged);
-    FCbDock := AddCheck(Card, 'Док-панель', FSettings.ShowDock, OptionChanged);
+  Card := AddCard(FPages[0], 'set.card.behavior');
+  Card.Height := 22 + 4 * 36 + 16;
+  FCbFolderSize := AddCheck(Card, 'set.beh.foldersize', FSettings.ShowFolderSizes, OptionChanged);
+  FCbHidden := AddCheck(Card, 'set.beh.hidden', FSettings.ShowHiddenFiles, OptionChanged);
+  FCbSingleInstance := AddCheck(Card, 'set.beh.single', FSettings.SingleInstance, OptionChanged);
+  FCbAutoStart := AddCheck(Card, 'set.beh.autorun', FSettings.AutoStart, OptionChanged);
 
-
-
-
-
-  Card := AddCard(FPages[0], 'Поведение');
+  Card := AddCard(FPages[0], 'set.card.tabs');
   Card.Height := 22 + 2 * 36 + 16;
-  FCbHidden := AddCheck(Card, 'Показывать скрытые и системные файлы', FSettings.ShowHiddenFiles, OptionChanged);
-  FCbNetwork := AddCheck(Card, 'Кнопка «Сеть» на панели дисков', FSettings.ShowNetworkButton, OptionChanged);
+  FCbEqualTabs := AddCheck(Card, 'set.tabs.equal', FSettings.EqualTabWidth, OptionChanged);
+  FCbTabIcons := AddCheck(Card, 'set.tabs.icons', FSettings.ShowTabIcons, OptionChanged);
 
-  Card := AddCard(FPages[0], 'Файловые операции и архиватор');
-  Card.Height := 22 + 3 * 36 + 22 + 16;
-  FCbOpVibe := AddCheck(Card, 'Методом V!be CMD', FSettings.FileOpMode = fomVibe, FileOpModeClick);
-  FCbOpExplorer := AddCheck(Card, 'Методом Проводника', FSettings.FileOpMode = fomExplorer, FileOpModeClick);
-  FCbOpQuiet := AddCheck(Card, 'Тихий режим', FSettings.FileOpMode = fomQuiet, FileOpModeClick);
-  Hint := TText.Create(Self);
-  Hint.Parent := Card;
-  Hint.Align := TAlignLayout.Top;
-  Hint.Height := 20;
-  Hint.Text := 'Копирование, перемещение, удаление и упаковка в ZIP';
-  Hint.HitTest := False;
-  Hint.Tag := 8;
-  ApplyFluentText(Hint, 12, False);
+  Card := AddCard(FPages[0], 'set.card.dock');
+  Card.Height := 22 + 4 * 36 + 16;
+  FCbDockSeps := AddCheck(Card, 'set.dock.seps', FSettings.DockShowSeparators, OptionChanged);
+  FCbDockFree := AddCheck(Card, 'set.dock.free', FSettings.DockAlign = daFree, DockAlignClick);
+  FCbDockCenter := AddCheck(Card, 'set.dock.center', FSettings.DockAlign = daCenter, DockAlignClick);
+  FCbDockLeft := AddCheck(Card, 'set.dock.left', FSettings.DockAlign = daLeft, DockAlignClick);
 
-  { --- Вид --- }
-  Card := AddCard(FPages[1], 'Тема оформления');
+  Card := AddCard(FPages[0], 'set.card.select');
+  Card.Height := 22 + 2 * 36 + 16;
+  FCbSelVibe := AddCheck(Card, 'set.sel.vibe',
+    FSettings.MouseSelectMode <> msmExplorer, MouseModeClick);
+  FCbSelExplorer := AddCheck(Card, 'set.sel.explorer',
+    FSettings.MouseSelectMode = msmExplorer, MouseModeClick);
+
+  Card := AddCard(FPages[0], 'set.card.view');
+  Card.Height := 22 + 36 + 16;
+  FCbFollow := AddCheck(Card, 'set.view.follow',
+    FSettings.FollowCursor, OptionChanged);
+
+  { --- Вид и темы --- }
+  Card := AddCard(FPages[1], 'set.card.theme');
   Card.Height := 22 + 126 + 12;
   Row := TRectangle.Create(Self);
   Row.Parent := Card;
@@ -405,11 +762,13 @@ begin
   Row.Height := 126;
   Row.Stroke.Kind := TBrushKind.None;
   Row.Fill.Color := TAlphaColors.Null;
-  BuildThemeCard(FCardSystem, Row, 'Как в системе', atSystem);
-  BuildThemeCard(FCardLight, Row, 'Светлая', atLight);
-  BuildThemeCard(FCardDark, Row, 'Тёмная', atDark);
+  BuildThemeCard(FCardSystem, Row, 'set.theme.system', atSystem);
+  BuildThemeCard(FCardLight, Row, 'set.theme.light', atLight);
+  BuildThemeCard(FCardDark, Row, 'set.theme.dark', atDark);
 
-  Card := AddCard(FPages[1], 'Материал окна');
+  BuildTintCard(FPages[1]);
+
+  Card := AddCard(FPages[1], 'set.card.material');
   Card.Height := 22 + 78 + 12;
   Row := TRectangle.Create(Self);
   Row.Parent := Card;
@@ -417,26 +776,20 @@ begin
   Row.Height := 78;
   Row.Stroke.Kind := TBrushKind.None;
   Row.Fill.Color := TAlphaColors.Null;
-  BuildMaterialCard(FCardMatNormal, Row, 'Нормал', wmNormal, $FF3B3B3B);
-  BuildMaterialCard(FCardMatAcrylic, Row, 'Акрил', wmAcrylic, $FF5A7A9A);
-  BuildMaterialCard(FCardMatMica, Row, 'Мика', wmMica, $FF4A5560);
+  BuildMaterialCard(FCardMatNormal, Row, 'set.mat.normal', wmNormal, $FF3B3B3B);
+  BuildMaterialCard(FCardMatAcrylic, Row, 'set.mat.acrylic', wmAcrylic, $FF5A7A9A);
+  BuildMaterialCard(FCardMatMica, Row, 'set.mat.mica', wmMica, $FF4A5560);
 
-  Card := AddCard(FPages[1], 'Вкладки панелей');
-  Card.Height := 22 + 2 * 36 + 16;
-    FCbEqualTabs := AddCheck(Card, 'Одинаковая ширина вкладок', FSettings.EqualTabWidth, OptionChanged);
-  FCbTabIcons := AddCheck(Card, 'Показывать иконки на вкладках', FSettings.ShowTabIcons, OptionChanged);
-
-
-  Card := AddCard(FPages[1], 'Шрифт списка');
+  Card := AddCard(FPages[1], 'set.card.font');
   Card.Height := 22 + 40 + 16;
   Hint := TText.Create(Self);
   Hint.Parent := Card;
   Hint.Align := TAlignLayout.Top;
   Hint.Height := 20;
-  Hint.Text := 'Размер шрифта (10–22)';
   Hint.HitTest := False;
   Hint.Tag := 8;
   ApplyFluentText(Hint, 12, False);
+  TrText(Hint, 'set.font.size');
   FFontSizeEdit := CreateFluentEdit(Self, Card);
   FFontSizeEdit.Align := TAlignLayout.Top;
   FFontSizeEdit.Height := 32;
@@ -444,43 +797,15 @@ begin
   FFontSizeEdit.Text := IntToStr(FSettings.ListFontSize);
   FFontSizeEdit.OnChange := OptionChanged;
 
-  Card := AddCard(FPages[1], 'Док-панель');
-  Card.Height := 22 + 4 * 36 + 16;
-  FCbDockSeps := AddCheck(Card, 'Отображать разделители', FSettings.DockShowSeparators, OptionChanged);
-  FCbDockFree := AddCheck(Card, 'Иконки произвольно', FSettings.DockAlign = daFree, DockAlignClick);
-  FCbDockCenter := AddCheck(Card, 'Выравнивание по центру', FSettings.DockAlign = daCenter, DockAlignClick);
-  FCbDockLeft := AddCheck(Card, 'Выравнивание слева', FSettings.DockAlign = daLeft, DockAlignClick);
+  Card := AddCard(FPages[2], 'set.card.ops');
+  Card.Height := 22 + 3 * 36 + 16;
+  FCbOpVibe := AddCheck(Card, 'set.ops.vibe', FSettings.FileOpMode = fomVibe, FileOpModeClick);
+  FCbOpExplorer := AddCheck(Card, 'set.ops.explorer', FSettings.FileOpMode = fomExplorer, FileOpModeClick);
+  FCbOpQuiet := AddCheck(Card, 'set.ops.quiet', FSettings.FileOpMode = fomQuiet, FileOpModeClick);
 
-  { --- Кэш --- }
-  Card := AddCard(FPages[2], 'Миниатюры');
-  Card.Height := 22 + 36 + 40 + 28 + 40 + 16;
-  FCbThumbs := AddCheck(Card, 'Кэшировать миниатюры в режиме плиток', FSettings.ThumbCacheEnabled, OptionChanged);
-  Hint := TText.Create(Self);
-  Hint.Parent := Card;
-  Hint.Align := TAlignLayout.Top;
-  Hint.Height := 20;
-  Hint.Text := 'Лимит элементов в кэше (50–4000)';
-  Hint.HitTest := False;
-  Hint.Tag := 8;
-  ApplyFluentText(Hint, 12, False);
-  FThumbLimitEdit := CreateFluentEdit(Self, Card);
-  FThumbLimitEdit.Align := TAlignLayout.Top;
-  FThumbLimitEdit.Height := 32;
-  FThumbLimitEdit.FillMode := fefSubtle;
-  FThumbLimitEdit.Text := IntToStr(FSettings.ThumbCacheMaxItems);
-  FThumbLimitEdit.OnChange := OptionChanged;
-  FThumbInfo := TText.Create(Self);
-  FThumbInfo.Parent := Card;
-  FThumbInfo.Align := TAlignLayout.Top;
-  FThumbInfo.Height := 22;
-  FThumbInfo.HitTest := False;
-  FThumbInfo.Tag := 8;
-  ApplyFluentText(FThumbInfo, 12, False);
-  FBtnClearCache := CreateFluentButton(Self, Card, '', 'Очистить кэш', fbkStandard, 160, ClearCacheClick);
-  FBtnClearCache.Align := TAlignLayout.Top;
-  FBtnClearCache.Height := 34;
-  FBtnClearCache.Margins.Rect := TRectF.Create(0, 8, 0, 0);
-  UpdateThumbInfo;
+  FLangCard := AddCard(FPages[3], 'lang.title');
+  FLangRows := TList<TFluentCheckRow>.Create;
+  RebuildLangPage;
 end;
 
 procedure TSettingsForm.BuildUI;
@@ -495,7 +820,8 @@ begin
   FFooter.Align := TAlignLayout.Bottom;
   FFooter.Height := 40;
   FFooter.Margins.Top := 10;
-  FBtnClose := CreateFluentButton(Self, FFooter, '', 'Закрыть', fbkAccent, 120, CloseClick);
+  FBtnClose := CreateFluentButton(Self, FFooter, '', L('set.close'), fbkAccent, 120, CloseClick);
+  TrButton(FBtnClose, 'set.close');
   FBtnClose.Align := TAlignLayout.Right;
   FBtnClose.Margins.Rect := TRectF.Create(0, 0, 0, 0);
 
@@ -517,10 +843,12 @@ procedure TSettingsForm.ShowPage(AIndex: Integer);
 var
   I: Integer;
 begin
-  if (AIndex < 0) or (AIndex > 2) then
+  if (AIndex < 0) or (AIndex > High(FPages)) then
     Exit;
+  if AIndex = 3 then
+    RebuildLangPage;
   FPage := AIndex;
-  for I := 0 to 2 do
+  for I := 0 to High(FPages) do
   begin
     FPages[I].Visible := I = AIndex;
     FNavBtns[I].SetSelected(I = AIndex);
@@ -536,9 +864,15 @@ procedure TSettingsForm.UpdateThemeCards;
   procedure StyleCard(ACard: TRectangle);
   var
     Selected: Boolean;
-    I: Integer;
+    I, J: Integer;
+    PreviewColors: TThemeColors;
+    Child: TFmxObject;
+    Prev, Bar: TRectangle;
   begin
+    if ACard = nil then
+      Exit;
     Selected := ThemeOfCard(ACard) = FSettings.Theme;
+    PreviewColors := GetThemeColors(ThemeOfCard(ACard));
     if Selected then
     begin
       ACard.Stroke.Color := FColors.SelectionColor;
@@ -552,8 +886,25 @@ procedure TSettingsForm.UpdateThemeCards;
       ACard.Fill.Color := FColors.CardBackground;
     end;
     for I := 0 to ACard.ControlsCount - 1 do
-      if ACard.Controls[I] is TText then
-        TText(ACard.Controls[I]).TextSettings.FontColor := FColors.TextColor;
+    begin
+      Child := ACard.Controls[I];
+      if Child is TText then
+        TText(Child).TextSettings.FontColor := FColors.TextColor
+      else if Child is TRectangle then
+      begin
+        Prev := TRectangle(Child);
+        Prev.Fill.Color := PreviewColors.Background;
+        for J := 0 to Prev.ControlsCount - 1 do
+          if Prev.Controls[J] is TRectangle then
+          begin
+            Bar := TRectangle(Prev.Controls[J]);
+            if Bar.Align = TAlignLayout.Top then
+              Bar.Fill.Color := PreviewColors.SelectionColor
+            else
+              Bar.Fill.Color := PreviewColors.CardBackground;
+          end;
+      end;
+    end;
   end;
 begin
   StyleCard(FCardSystem);
@@ -592,12 +943,6 @@ begin
   StyleCard(FCardMatMica);
 end;
 
-procedure TSettingsForm.UpdateThumbInfo;
-begin
-  if Assigned(FThumbInfo) and Assigned(GlobalThumbCache) then
-    FThumbInfo.Text := Format('Сейчас в кэше: %d миниатюр', [GlobalThumbCache.ItemCount]);
-end;
-
 procedure TSettingsForm.ThemeCardClick(Sender: TObject);
 var
   NewTheme: TAppTheme;
@@ -617,13 +962,16 @@ begin
   if not (Sender is TRectangle) then
     Exit;
   FSettings.WindowMaterial := TWindowMaterial(TRectangle(Sender).Tag);
+  ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
   ScheduleSave;
   UpdateMaterialCards;
+  SyncTintHint;
   { Материал влияет на chrome главного окна — обновляем тему, не весь layout. }
   if Assigned(FOnThemeChanged) then
     FOnThemeChanged(FSettings.Theme)
   else if Assigned(FOnOptionsChanged) then
-    FOnOptionsChanged();
+    FOnOptionsChanged([saBands, saPanels, saBehavior, saFileOp]);
+  ApplyTheme(GetThemeColors(FSettings.Theme));
 end;
 
 procedure TSettingsForm.CollectFromUI;
@@ -633,15 +981,20 @@ begin
   FSettings.ShowDock := FCbDock.Checked;
   FSettings.ShowMidBar := FCbMid.Checked;
   FSettings.ShowDriveBar := FCbDrives.Checked;
-  FSettings.ShowBreadcrumbs := True;
-  FSettings.ShowStatusBar := FCbStatus.Checked;
+  FSettings.ShowDriveHome := FCbDriveHome.Checked;
   FSettings.ShowFnBar := FCbFn.Checked;
   FSettings.ShowQuickAccess := FCbQuick.Checked;
   FSettings.ShowCommandLine := FCbCmd.Checked;
-  FSettings.QuickViewEnabled := True;
-  FSettings.WindowAnimate := True;
+  FSettings.FollowCursor := FCbFollow.Checked;
+  if FCbSelExplorer.Checked then
+    FSettings.MouseSelectMode := msmExplorer
+  else
+    FSettings.MouseSelectMode := msmVibe;
   FSettings.ShowNetworkButton := FCbNetwork.Checked;
   FSettings.ShowHiddenFiles := FCbHidden.Checked;
+  FSettings.ShowFolderSizes := FCbFolderSize.Checked;
+  FSettings.AutoStart := FCbAutoStart.Checked;
+  FSettings.SingleInstance := FCbSingleInstance.Checked;
   FSettings.ShowTabIcons := FCbTabIcons.Checked;
   FSettings.EqualTabWidth := FCbEqualTabs.Checked;
   FSettings.DockShowSeparators := FCbDockSeps.Checked;
@@ -657,11 +1010,107 @@ begin
     FSettings.FileOpMode := fomExplorer
   else
     FSettings.FileOpMode := fomVibe;
-  FSettings.ThumbCacheEnabled := FCbThumbs.Checked;
   N := StrToIntDef(Trim(FFontSizeEdit.Text), FSettings.ListFontSize);
   FSettings.ListFontSize := EnsureRange(N, 10, 22);
-  N := StrToIntDef(Trim(FThumbLimitEdit.Text), FSettings.ThumbCacheMaxItems);
-  FSettings.ThumbCacheMaxItems := EnsureRange(N, 50, 4000);
+end;
+
+procedure TSettingsForm.MouseModeClick(Sender: TObject);
+begin
+  if Sender = FCbSelExplorer then
+  begin
+    FCbSelExplorer.Checked := True;
+    FCbSelVibe.Checked := False;
+  end
+  else
+  begin
+    FCbSelExplorer.Checked := False;
+    FCbSelVibe.Checked := True;
+  end;
+  OptionChanged(Sender);
+end;
+
+procedure TSettingsForm.RebuildLangPage;
+var
+  Langs: TArray<TLangChoice>;
+  I, N: Integer;
+  Row: TFluentCheckRow;
+  Saved: string;
+begin
+  if (FLangCard = nil) or (FLangRows = nil) then
+    Exit;
+  while FLangRows.Count > 0 do
+  begin
+    Row := FLangRows[0];
+    FLangRows.Delete(0);
+    Row.Parent := nil;
+    Row.Free;
+  end;
+  Saved := 'system';
+  if Assigned(FSettings) then
+    Saved := FSettings.Language;
+  Langs := AvailableLanguages;
+  N := Length(Langs) + 1;
+  FLangCard.Height := 22 + N * 36 + 16;
+  { Align=Top: первый добавленный оказывается снизу. }
+  Row := TFluentCheckRow.Create(Self);
+  Row.Setup(FLangCard, L('lang.system'), SameText(Saved, 'system'));
+  Row.TagString := 'system';
+  Row.OnChange := LangClick;
+  Row.ApplyTheme(FColors);
+  FLangRows.Add(Row);
+  for I := High(Langs) downto 0 do
+  begin
+    Row := TFluentCheckRow.Create(Self);
+    Row.Setup(FLangCard, Langs[I].Name, SameText(Saved, Langs[I].Code));
+    Row.TagString := Langs[I].Code;
+    Row.OnChange := LangClick;
+    Row.ApplyTheme(FColors);
+    FLangRows.Add(Row);
+  end;
+end;
+
+procedure TSettingsForm.ApplyLanguage;
+var
+  I: Integer;
+  Saved: string;
+begin
+  if Assigned(FTintSlider) then
+    FTintSlider.Repaint;
+  { Карточки и пункты меню обновляет uLangBind. Здесь только «как в системе»:
+    имя берётся из текущего словаря, а названия языков — из их файлов. }
+  if (FLangRows = nil) or (FLangRows.Count = 0) then
+    Exit;
+  Saved := 'system';
+  if Assigned(FSettings) then
+    Saved := FSettings.Language;
+  for I := 0 to FLangRows.Count - 1 do
+    if SameText(FLangRows[I].TagString, 'system') then
+      FLangRows[I].SetCaption(L('lang.system'));
+  for I := 0 to FLangRows.Count - 1 do
+    FLangRows[I].Checked := SameText(FLangRows[I].TagString, Saved);
+end;
+
+procedure TSettingsForm.LangClick(Sender: TObject);
+var
+  Code: string;
+  I: Integer;
+begin
+  if not (Sender is TFluentCheckRow) then
+    Exit;
+  Code := TFluentCheckRow(Sender).TagString;
+  if Code = '' then
+    Exit;
+  if FLangRows <> nil then
+    for I := 0 to FLangRows.Count - 1 do
+      FLangRows[I].Checked := SameText(FLangRows[I].TagString, Code);
+  if not Assigned(FSettings) or SameText(FSettings.Language, Code) then
+    Exit;
+  FSettings.Language := Code;
+  SetLanguage(Code);
+  ApplyLanguage;
+  if Assigned(FOnLanguageChanged) then
+    FOnLanguageChanged();
+  ScheduleSave;
 end;
 
 procedure TSettingsForm.FileOpModeClick(Sender: TObject);
@@ -731,34 +1180,106 @@ begin
 end;
 
 procedure TSettingsForm.OptionChanged(Sender: TObject);
+type
+  TUiSnap = record
+    ShowDock, ShowMidBar, ShowFnBar, ShowCommandLine: Boolean;
+    DockShowSeparators: Boolean;
+    DockAlign: TDockAlign;
+    ShowDriveBar, ShowDriveHome, ShowQuickAccess, ShowNetworkButton: Boolean;
+    ShowTabIcons, EqualTabWidth, ShowHiddenFiles, ShowFolderSizes: Boolean;
+    MouseSelectMode: TMouseSelectMode;
+    ListFontSize: Integer;
+    AutoStart, SingleInstance: Boolean;
+    FileOpMode: TFileOpMode;
+  end;
+
+  function Snap: TUiSnap;
+  begin
+    Result.ShowDock := FSettings.ShowDock;
+    Result.ShowMidBar := FSettings.ShowMidBar;
+    Result.ShowFnBar := FSettings.ShowFnBar;
+    Result.ShowCommandLine := FSettings.ShowCommandLine;
+    Result.DockShowSeparators := FSettings.DockShowSeparators;
+    Result.DockAlign := FSettings.DockAlign;
+    Result.ShowDriveBar := FSettings.ShowDriveBar;
+    Result.ShowDriveHome := FSettings.ShowDriveHome;
+    Result.ShowQuickAccess := FSettings.ShowQuickAccess;
+    Result.ShowNetworkButton := FSettings.ShowNetworkButton;
+    Result.ShowTabIcons := FSettings.ShowTabIcons;
+    Result.EqualTabWidth := FSettings.EqualTabWidth;
+    Result.ShowHiddenFiles := FSettings.ShowHiddenFiles;
+    Result.ShowFolderSizes := FSettings.ShowFolderSizes;
+    Result.MouseSelectMode := FSettings.MouseSelectMode;
+    Result.ListFontSize := FSettings.ListFontSize;
+    Result.AutoStart := FSettings.AutoStart;
+    Result.SingleInstance := FSettings.SingleInstance;
+    Result.FileOpMode := FSettings.FileOpMode;
+  end;
+
+  function Diff(const A, B: TUiSnap): TSettingsApplySet;
+  begin
+    Result := [];
+    if (A.ShowDock <> B.ShowDock) or (A.ShowMidBar <> B.ShowMidBar) or
+       (A.ShowFnBar <> B.ShowFnBar) or (A.ShowCommandLine <> B.ShowCommandLine) or
+       (A.DockAlign <> B.DockAlign) or
+       (A.DockShowSeparators <> B.DockShowSeparators) then
+      Include(Result, saBands);
+    { Диски и кнопки вида живут в панели, не в полосах формы. }
+    if (A.ShowDriveBar <> B.ShowDriveBar) or (A.ShowDriveHome <> B.ShowDriveHome) or
+       (A.ShowQuickAccess <> B.ShowQuickAccess) or
+       (A.ShowNetworkButton <> B.ShowNetworkButton) or
+       (A.ShowTabIcons <> B.ShowTabIcons) or (A.EqualTabWidth <> B.EqualTabWidth) or
+       (A.ShowHiddenFiles <> B.ShowHiddenFiles) or
+       (A.ShowFolderSizes <> B.ShowFolderSizes) or
+       (A.MouseSelectMode <> B.MouseSelectMode) or
+       (A.ListFontSize <> B.ListFontSize) then
+      Include(Result, saPanels);
+    if (A.AutoStart <> B.AutoStart) or (A.SingleInstance <> B.SingleInstance) then
+      Include(Result, saBehavior);
+    if A.FileOpMode <> B.FileOpMode then
+      Include(Result, saFileOp);
+  end;
+
+var
+  Apply: TSettingsApplySet;
 begin
+  if not Assigned(FSettings) then
+    Exit;
+  var Before := Snap;
   CollectFromUI;
   ScheduleSave;
-  { Применяем layout main-формы; Save уходит в фон. }
-  if Assigned(FOnOptionsChanged) then
-    FOnOptionsChanged();
-end;
-
-procedure TSettingsForm.ClearCacheClick(Sender: TObject);
-begin
-  if Assigned(GlobalThumbCache) then
-    GlobalThumbCache.Clear;
-  UpdateThumbInfo;
+  Apply := Diff(Before, Snap);
+  if (Apply <> []) and Assigned(FOnOptionsChanged) then
+    FOnOptionsChanged(Apply);
 end;
 
 procedure TSettingsForm.CloseClick(Sender: TObject);
 begin
-  { Подхватить текст из edit'ов, если OnChange ещё не сработал. }
-  CollectFromUI;
-  if Assigned(FSaveTimer) then
-    FSaveTimer.Enabled := False;
-  { Всё уже пишется на лету (ScheduleSave/SaveAsync) — синхронный Save
-    на Закрыть только фризит UI. Добиваем возможный pending в фоне и выходим. }
-  if Assigned(FSettings) then
-    FSettings.SaveAsync;
-  if Assigned(FOnOptionsChanged) then
-    FOnOptionsChanged();
   Close;
+end;
+
+procedure TSettingsForm.KeyDown(var Key: Word; var KeyChar: WideChar;
+  Shift: TShiftState);
+begin
+  if Key = vkEscape then
+  begin
+    Key := 0;
+    Close;
+    Exit;
+  end;
+  inherited;
+end;
+
+destructor TSettingsForm.Destroy;
+begin
+  { Кнопка «Закрыть» ничего не пишет. Если правка ещё в таймере — дописать в фоне. }
+  if Assigned(FSaveTimer) and FSaveTimer.Enabled and Assigned(FSettings) then
+  begin
+    FSaveTimer.Enabled := False;
+    FSettings.SaveAsync;
+  end;
+  FreeAndNil(FLangRows);
+  inherited;
 end;
 
 procedure TSettingsForm.ApplyTheme(const AColors: TThemeColors);
@@ -794,32 +1315,20 @@ begin
   FContent.Fill.Color := AColors.LayerBackground;
   FContent.Stroke.Color := AColors.CardStroke;
   FBtnClose.ApplyTheme(AColors);
-  for I := 0 to 2 do
+  for I := 0 to High(FNavBtns) do
     FNavBtns[I].ApplyTheme(AColors);
   if Assigned(FFontSizeEdit) then
     FFontSizeEdit.ApplyTheme(AColors);
-  if Assigned(FThumbLimitEdit) then
-    FThumbLimitEdit.ApplyTheme(AColors);
-  if Assigned(FBtnClearCache) then
-    FBtnClearCache.ApplyTheme(AColors);
-  if Assigned(FThumbInfo) then
-    FThumbInfo.TextSettings.FontColor := AColors.SubTextColor;
 
-  if Assigned(FPages[0]) then
-    for I := 0 to FPages[0].Content.ControlsCount - 1 do
-      if FPages[0].Content.Controls[I] is TRectangle then
-        PaintCard(TRectangle(FPages[0].Content.Controls[I]));
-  if Assigned(FPages[1]) then
-    for I := 0 to FPages[1].Content.ControlsCount - 1 do
-      if FPages[1].Content.Controls[I] is TRectangle then
-        PaintCard(TRectangle(FPages[1].Content.Controls[I]));
-  if Assigned(FPages[2]) then
-    for I := 0 to FPages[2].Content.ControlsCount - 1 do
-      if FPages[2].Content.Controls[I] is TRectangle then
-        PaintCard(TRectangle(FPages[2].Content.Controls[I]));
+  for var P := 0 to High(FPages) do
+    if Assigned(FPages[P]) then
+      for I := 0 to FPages[P].Content.ControlsCount - 1 do
+        if FPages[P].Content.Controls[I] is TRectangle then
+          PaintCard(TRectangle(FPages[P].Content.Controls[I]));
 
   UpdateThemeCards;
   UpdateMaterialCards;
+  SyncTintHint;
 end;
 
 end.

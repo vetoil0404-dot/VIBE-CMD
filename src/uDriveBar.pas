@@ -46,6 +46,8 @@ type
       AActive: Boolean; ALite: Boolean = False);
     procedure RefreshSpace;
     procedure Enrich;
+    function IsActive: Boolean;
+    procedure AssignShellIcon(ATarget: FMX.Graphics.TBitmap);
     procedure SetActive(AActive: Boolean);
     procedure ApplyTheme(const AColors: TThemeColors);
     property Info: TDriveInfo read FInfo;
@@ -68,6 +70,7 @@ type
     FOnDriveClick: TDriveClickEvent;
     FOnDriveContext: TDriveClickEvent;
     FOnPlacesChanged: TNotifyEvent;
+    FOnPointerDown: TNotifyEvent;
     FShowNetwork: Boolean;
     FMask: DWORD;
     FNeedRebuild: Boolean;
@@ -79,6 +82,8 @@ type
     FWnd: HWND;
     procedure WndProc(var Message: TMessage);
     {$ENDIF}
+    procedure BarMouseDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
     procedure TileClick(Sender: TObject);
     procedure TileContext(Sender: TObject; const ARoot: string);
     procedure TimerTick(Sender: TObject);
@@ -104,19 +109,40 @@ type
     procedure StartUsageFill;
     procedure AddPortablePlaces;
     procedure RefreshUsage;
+    function PlaceCount: Integer;
+    function PlaceTile(AIndex: Integer): TDriveTile;
     procedure SetActivePath(const APath: string);
     procedure ApplyTheme(const AColors: TThemeColors);
+    procedure ApplyLanguage;
     procedure SetShowNetwork(AValue: Boolean);
     property ShowNetwork: Boolean read FShowNetwork write SetShowNetwork;
     property OnDriveClick: TDriveClickEvent read FOnDriveClick write FOnDriveClick;
     property OnDriveContext: TDriveClickEvent read FOnDriveContext write FOnDriveContext;
     property OnPlacesChanged: TNotifyEvent read FOnPlacesChanged write FOnPlacesChanged;
+    property OnPointerDown: TNotifyEvent read FOnPointerDown write FOnPointerDown;
   end;
+
+  THomePlace = record
+    Caption: string;
+    Path: string;
+  end;
+
+  TExplorerHome = record
+    Pinned: TArray<THomePlace>;
+    Frequent: TArray<THomePlace>;
+  end;
+
+function DriveKindIcon(AKind: TDriveKind): string;
+{ Quick Access при открытии меню и стартовый набор дока. Не на полосе дисков. }
+function ReadExplorerHome: TExplorerHome;
+function UnpinHomePlace(const APath: string): Boolean;
+procedure SeedDockIfNeeded(ASettings: TAppSettings);
 
 implementation
 
 uses
-  System.StrUtils, UCoreEngine;
+  System.StrUtils, UCoreEngine, uLang
+  {$IFDEF MSWINDOWS}, Winapi.PropSys, Winapi.KnownFolders, Winapi.ShLwApi{$ENDIF};
 
 const
   TILE_W = 156;
@@ -129,13 +155,13 @@ const
   ICON_NET = #$E968;
   ICON_CD  = #$E958;
 
-function KindIcon(AKind: TDriveKind): string;
+function DriveKindIcon(AKind: TDriveKind): string;
 begin
   case AKind of
     dkSSD:       Result := ICON_SSD;
     dkHDD:       Result := ICON_HDD;
     dkRemovable: Result := ICON_USB;
-    dkNetwork:   Result := ICON_NET;
+    dkNetwork, dkNetHood: Result := ICON_NET;
     dkOptical:   Result := ICON_CD;
   else
     Result := ICON_HDD;
@@ -274,13 +300,13 @@ begin
     Usage := FormatDriveUsage(Used, AInfo.TotalBytes);
   end
   else if AInfo.Kind = dkNetHood then
-    Usage := 'Окружение'
+    Usage := L('drive.env')
   else if AInfo.Kind = dkDevice then
-    Usage := 'Устройство'
+    Usage := L('drive.device')
   else if ALite then
     Usage := ''
   else
-    Usage := 'Нет данных';
+    Usage := L('drive.nodata');
   if FUsage.Text <> Usage then
     FUsage.Text := Usage;
   FTrack.Visible := AInfo.Ready and (AInfo.TotalBytes > 0);
@@ -390,6 +416,21 @@ end;
 begin
 end;
 {$ENDIF}
+
+function TDriveTile.IsActive: Boolean;
+begin
+  Result := FActive;
+end;
+
+procedure TDriveTile.AssignShellIcon(ATarget: FMX.Graphics.TBitmap);
+begin
+  if ATarget = nil then
+    Exit;
+  if (FIcon = nil) or (FIcon.Bitmap.Width <= 0) then
+    ATarget.SetSize(0, 0)
+  else
+    ATarget.Assign(FIcon.Bitmap);
+end;
 
 procedure TDriveTile.SetActive(AActive: Boolean);
 begin
@@ -502,6 +543,7 @@ begin
   Align := TAlignLayout.Top;
   Height := BAR_H;
   HitTest := True;
+  OnMouseDown := BarMouseDown;
   FColors := GetThemeColors(atSystem);
 
   FBg := TRectangle.Create(Self);
@@ -537,6 +579,7 @@ begin
   FScroll.HitTest := True;
   FScroll.AniCalculations.Animation := False;
   FScroll.OnMouseWheel := BarMouseWheel;
+  FScroll.OnMouseDown := BarMouseDown;
   FScroll.OnResize := ScrollResize;
 
   FHost := TLayout.Create(Self);
@@ -609,6 +652,9 @@ begin
     case FTiles[I].Info.Kind of
       dkNetHood:
         FTiles[I].SetActive(StartsText('\\', Root) or
+          StartsText('network://', Root) or StartsText('ftp://', Root) or
+          StartsText('ftps://', Root) or StartsText('http://', Root) or
+          StartsText('https://', Root) or SameText(Root, 'Сеть') or
           SameText(Root, FTiles[I].Info.Root) or SameText(Root, 'Network'));
       dkDevice:
         FTiles[I].SetActive(SameText(Root, FTiles[I].Info.Root) or
@@ -686,7 +732,7 @@ begin
   begin
     Net := Default(TDriveInfo);
     Net.Kind := dkNetHood;
-    Net.Root := '\\';
+    Net.Root := NetworkFolderPath;
     Net.VolumeName := 'Сеть';
     Net.Ready := True;
     Tile := TDriveTile.Create(FHost);
@@ -694,7 +740,8 @@ begin
     Tile.OnClick := TileClick;
     Tile.OnContext := TileContext;
     Tile.OnMouseWheel := BarMouseWheel;
-    Tile.Bind(Net, FColors, False, True);
+    { Не lite: у «Сети» нет Enrich, иконка нужна сразу. Корень тот же, что у CollectAllPlaces. }
+    Tile.Bind(Net, FColors, False, False);
     FTiles.Add(Tile);
   end;
   FPopulated := True;
@@ -732,11 +779,15 @@ begin
   begin
     Have := False;
     for Tile in FTiles do
-      if SameText(Tile.Info.Root, Places[I].Root) or
+      if ((Places[I].Kind = dkNetHood) and (Tile.Info.Kind = dkNetHood)) or
+         SameText(Tile.Info.Root, Places[I].Root) or
          SameText(ExcludeTrailingPathDelimiter(Tile.Info.Root),
            ExcludeTrailingPathDelimiter(Places[I].Root)) then
       begin
         Have := True;
+        if (Places[I].Kind = dkNetHood) and
+           not SameText(Tile.Info.Root, Places[I].Root) then
+          Tile.Bind(Places[I], FColors, Tile.IsActive, False);
         Break;
       end;
     if Have then
@@ -746,7 +797,7 @@ begin
     Tile.OnClick := TileClick;
     Tile.OnContext := TileContext;
     Tile.OnMouseWheel := BarMouseWheel;
-    Tile.Bind(Places[I], FColors, False, True);
+    Tile.Bind(Places[I], FColors, False, Places[I].Kind <> dkNetHood);
     FTiles.Add(Tile);
   end;
   FReadyForFull := True;
@@ -780,10 +831,35 @@ begin
     FTiles[I].RefreshSpace;
 end;
 
+function TDriveBar.PlaceCount: Integer;
+begin
+  if FTiles = nil then
+    Result := 0
+  else
+    Result := FTiles.Count;
+end;
+
+function TDriveBar.PlaceTile(AIndex: Integer): TDriveTile;
+begin
+  Result := nil;
+  if (FTiles <> nil) and (AIndex >= 0) and (AIndex < FTiles.Count) then
+    Result := FTiles[AIndex];
+end;
+
 procedure TDriveBar.SetActivePath(const APath: string);
 begin
   FActiveRoot := APath;
   ApplyActive;
+end;
+
+procedure TDriveBar.ApplyLanguage;
+begin
+  if not FPopulated then
+    Exit;
+  if FReadyForFull then
+    Rebuild
+  else
+    PopulateLetters;
 end;
 
 procedure TDriveBar.ApplyTheme(const AColors: TThemeColors);
@@ -803,6 +879,13 @@ begin
     FNextLabel.TextSettings.FontColor := AColors.TextColor;
   for I := 0 to FTiles.Count - 1 do
     FTiles[I].ApplyTheme(AColors);
+end;
+
+procedure TDriveBar.BarMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Assigned(FOnPointerDown) then
+    FOnPointerDown(Self);
 end;
 
 procedure TDriveBar.TileClick(Sender: TObject);
@@ -835,6 +918,7 @@ begin
   Result.HitTest := True;
   Result.Cursor := crHandPoint;
   Result.OnClick := AOnClick;
+  Result.OnMouseDown := BarMouseDown;
   Result.OnMouseEnter := NavEnter;
   Result.OnMouseLeave := NavLeave;
   Result.OnMouseWheel := BarMouseWheel;
@@ -963,5 +1047,686 @@ begin
     Message.Result := DefWindowProc(FWnd, Message.Msg, Message.WParam, Message.LParam);
 end;
 {$ENDIF}
+
+{$IFDEF MSWINDOWS}
+const
+  FOLDERID_QuickAccess: TGUID = '{679F85CB-0220-4080-B29B-5540CC05AAB6}';
+  { System.Home.IsPinned — propkey.h / wine }
+  PKEY_Home_IsPinned: TPropertyKey = (
+    fmtid: '{30C8EEF4-A832-41E2-AB32-E3C3CA28FD29}';
+    pid: 4);
+  PKEY_ItemNameDisplay: TPropertyKey = (
+    fmtid: '{B725F130-47EF-101A-A5F1-02608C9EEBAC}';
+    pid: 10);
+  HOME_ENUM_CAP = 48;
+  HOME_FREQUENT_MAX = 8;
+
+function ShellVirtual(const APath: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(APath);
+  Result := StartsText('shell:', S) or StartsText('::', S) or (Pos('::{', S) > 0);
+end;
+
+function NormalizeHomePath(const APath: string): string;
+begin
+  Result := Trim(StringReplace(APath, '/', '\', [rfReplaceAll]));
+  if Result <> '' then
+    Result := ExcludeTrailingPathDelimiter(Result);
+end;
+
+function IsHomeFilePath(const APath: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(APath);
+  if (S = '') or ShellVirtual(S) then
+    Exit(False);
+  if (Length(S) >= 3) and (S[2] = ':') and ((S[3] = '\') or (S[3] = '/')) then
+    Exit(True);
+  Result := StartsText('\\', S) and (Length(S) > 2);
+end;
+
+function HomeKey(const APath: string): string;
+var
+  S: string;
+begin
+  S := NormalizeHomePath(APath);
+  if (Length(S) = 2) and (S[2] = ':') then
+    S := S + '\';
+  Result := AnsiLowerCase(IncludeTrailingPathDelimiter(S));
+end;
+
+function ShellText(const AItem: IShellItem; ASig: DWORD): string;
+var
+  W: LPWSTR;
+begin
+  Result := '';
+  if (AItem <> nil) and Succeeded(AItem.GetDisplayName(ASig, W)) and (W <> nil) then
+  begin
+    Result := W;
+    CoTaskMemFree(W);
+  end;
+end;
+
+function ItemFilePath(const AItem: IShellItem): string;
+var
+  Parse, Fs: string;
+begin
+  Result := '';
+  Parse := ShellText(AItem, SIGDN_DESKTOPABSOLUTEPARSING);
+  if (Parse <> '') and (not ShellVirtual(Parse)) and
+     IsHomeFilePath(NormalizeHomePath(Parse)) then
+    Exit(NormalizeHomePath(Parse));
+  if (Parse = '') or ShellVirtual(Parse) then
+  begin
+    Fs := NormalizeHomePath(ShellText(AItem, SIGDN_FILESYSPATH));
+    if (Fs <> '') and (not ShellVirtual(Fs)) and IsHomeFilePath(Fs) then
+      Exit(Fs);
+  end;
+end;
+
+function UsableHomeCaption(const ACaption: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(ACaption);
+  Result := (S <> '') and (S <> '.') and (S <> '..') and not ShellVirtual(S);
+end;
+
+function ItemIsPinned(const AItem: IShellItem): Boolean;
+var
+  Item2: IShellItem2;
+  Store: IPropertyStore;
+  V: TPropVariant;
+begin
+  Result := False;
+  if not Supports(AItem, IID_IShellItem2, Item2) then
+    Exit;
+  Store := nil;
+  { IsPinned не лежит в быстром наборе: FASTPROPERTIESONLY отдаёт пусто,
+    и закреплённые папки пропадают из списка. }
+  if Failed(Item2.GetPropertyStore(Winapi.PropSys.GPS_BESTEFFORT,
+       IID_IPropertyStore, Store)) or (Store = nil) then
+    Exit;
+  FillChar(V, SizeOf(V), 0);
+  if Failed(Store.GetValue(PKEY_Home_IsPinned, V)) then
+    Exit;
+  try
+    if V.vt = VT_BOOL then
+      Result := V.boolVal
+    else if (V.vt = VT_I4) or (V.vt = VT_INT) then
+      Result := V.lVal <> 0
+    else if V.vt = VT_UI4 then
+      Result := V.ulVal <> 0;
+  finally
+    PropVariantClear(V);
+  end;
+end;
+
+function FolderChildCaption(const AFolder: IShellFolder; AChild: PItemIDList): string;
+var
+  SR: TStrRet;
+  W: LPWSTR;
+begin
+  Result := '';
+  if (AFolder = nil) or (AChild = nil) then
+    Exit;
+  FillChar(SR, SizeOf(SR), 0);
+  if Failed(AFolder.GetDisplayNameOf(AChild, SHGDN_NORMAL, SR)) then
+    Exit;
+  W := nil;
+  if Succeeded(StrRetToStr(@SR, AChild, W)) and (W <> nil) then
+  begin
+    Result := Trim(W);
+    CoTaskMemFree(W);
+  end;
+end;
+
+function ItemPropCaption(const AItem: IShellItem): string;
+var
+  Item2: IShellItem2;
+  Store: IPropertyStore;
+  V: TPropVariant;
+begin
+  Result := '';
+  if not Supports(AItem, IID_IShellItem2, Item2) then
+    Exit;
+  Store := nil;
+  if Failed(Item2.GetPropertyStore(Winapi.PropSys.GPS_BESTEFFORT,
+       IID_IPropertyStore, Store)) or (Store = nil) then
+    Exit;
+  FillChar(V, SizeOf(V), 0);
+  if Failed(Store.GetValue(PKEY_ItemNameDisplay, V)) then
+    Exit;
+  try
+    if (V.vt = VT_LPWSTR) and (V.pwszVal <> nil) then
+      Result := Trim(V.pwszVal)
+    else if (V.vt = VT_BSTR) and (V.bstrVal <> nil) then
+      Result := Trim(string(V.bstrVal));
+  finally
+    PropVariantClear(V);
+  end;
+end;
+
+function RawLinkTarget(const ALnk: string): string;
+var
+  Link: IShellLink;
+  Pf: IPersistFile;
+  Buf: array[0..MAX_PATH] of WideChar;
+  Fd: TWin32FindDataW;
+begin
+  Result := '';
+  if Failed(CoCreateInstance(CLSID_ShellLink, nil, CLSCTX_INPROC_SERVER,
+      IShellLink, Link)) then
+    Exit;
+  if Failed(Link.QueryInterface(IPersistFile, Pf)) then
+    Exit;
+  if Failed(Pf.Load(PWideChar(ALnk), STGM_READ)) then
+    Exit;
+  FillChar(Fd, SizeOf(Fd), 0);
+  FillChar(Buf, SizeOf(Buf), 0);
+  if Failed(Link.GetPath(@Buf[0], MAX_PATH, Fd, SLGP_RAWPATH)) then
+    Exit;
+  Result := NormalizeHomePath(string(Buf));
+end;
+
+function ChildIsFolder(const AFolder: IShellFolder; AChild: PItemIDList): Boolean;
+var
+  Attr: UINT;
+  One: PItemIDList;
+begin
+  Result := True;
+  if (AFolder = nil) or (AChild = nil) then
+    Exit;
+  One := AChild;
+  Attr := SFGAO_FOLDER;
+  if Failed(AFolder.GetAttributesOf(1, One, Attr)) then
+    Exit;
+  Result := (Attr and SFGAO_FOLDER) <> 0;
+end;
+
+function TryAddPlace(var AList: TArray<THomePlace>; ASeen: TDictionary<string, Byte>;
+  const APlace: THomePlace; ALimit: Integer): Boolean;
+var
+  Path, Key, Cap: string;
+  N: Integer;
+begin
+  Result := False;
+  Path := NormalizeHomePath(APlace.Path);
+  if not IsHomeFilePath(Path) then
+    Exit;
+  if (ALimit > 0) and (Length(AList) >= ALimit) then
+    Exit;
+  Key := HomeKey(Path);
+  if (Key = '') or ASeen.ContainsKey(Key) then
+    Exit;
+  Cap := Trim(APlace.Caption);
+  if not UsableHomeCaption(Cap) then
+    Cap := ExtractFileName(Path);
+  if not UsableHomeCaption(Cap) then
+    Cap := Path;
+  if not UsableHomeCaption(Cap) then
+    Exit;
+  ASeen.Add(Key, 1);
+  N := Length(AList);
+  SetLength(AList, N + 1);
+  AList[N].Path := Path;
+  AList[N].Caption := Cap;
+  Result := True;
+end;
+
+function KnownPlace(const AId: TGUID; out APlace: THomePlace): Boolean;
+var
+  P: LPWSTR;
+  Item: IShellItem;
+begin
+  Result := False;
+  APlace.Caption := '';
+  APlace.Path := '';
+  P := nil;
+  if Failed(SHGetKnownFolderPath(AId, KF_FLAG_DONT_VERIFY, 0, P)) or (P = nil) then
+    Exit;
+  try
+    APlace.Path := NormalizeHomePath(string(P));
+  finally
+    CoTaskMemFree(P);
+  end;
+  if not IsHomeFilePath(APlace.Path) then
+    Exit;
+  if not IsUncPath(APlace.Path) then
+  begin
+    Item := nil;
+    if Succeeded(SHCreateItemFromParsingName(PChar(APlace.Path), nil,
+         IID_IShellItem, Item)) and (Item <> nil) then
+      APlace.Caption := ShellText(Item, SIGDN_NORMALDISPLAY);
+  end;
+  Result := True;
+end;
+
+procedure AppendKnownFolders(var AList: TArray<THomePlace>);
+var
+  Seen: TDictionary<string, Byte>;
+
+  procedure AddOne(const AId: TGUID);
+  var
+    Place: THomePlace;
+  begin
+    if KnownPlace(AId, Place) then
+      TryAddPlace(AList, Seen, Place, 0);
+  end;
+
+begin
+  Seen := TDictionary<string, Byte>.Create;
+  try
+    AddOne(FOLDERID_Desktop);
+    AddOne(FOLDERID_Downloads);
+    AddOne(FOLDERID_Documents);
+    AddOne(FOLDERID_Pictures);
+    AddOne(FOLDERID_Music);
+    AddOne(FOLDERID_Videos);
+  finally
+    Seen.Free;
+  end;
+end;
+
+function OpenQuickAccess(out AItem: IShellItem): Boolean;
+var
+  Raw: Pointer;
+begin
+  AItem := nil;
+  Raw := nil;
+  if Succeeded(SHGetKnownFolderItem(FOLDERID_QuickAccess, KF_FLAG_DONT_VERIFY, 0,
+       IID_IShellItem, Raw)) and (Raw <> nil) then
+  begin
+    Pointer(AItem) := Raw;
+    Exit(True);
+  end;
+  Result := Succeeded(SHCreateItemFromParsingName(
+    'shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}', nil,
+    IID_IShellItem, AItem)) and (AItem <> nil);
+end;
+
+function EnumQuickAccess(var APinned, AFrequent: TArray<THomePlace>): Boolean;
+var
+  RootItem: IShellItem;
+  Folder: IShellFolder;
+  ParentPidl, Child: PItemIDList;
+  Enum: IEnumIDList;
+  Fetched: ULONG;
+  Item: IShellItem;
+  Place: THomePlace;
+  SeenPin, SeenFreq: TDictionary<string, Byte>;
+  N: Integer;
+begin
+  Result := False;
+  if not OpenQuickAccess(RootItem) then
+    Exit;
+  if Failed(RootItem.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, Folder)) or
+     (Folder = nil) then
+    Exit;
+  ParentPidl := nil;
+  if Failed(SHGetIDListFromObject(RootItem, ParentPidl)) or (ParentPidl = nil) then
+    Exit;
+  try
+    if Failed(Folder.EnumObjects(0,
+         SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or SHCONTF_INCLUDEHIDDEN or
+         SHCONTF_FASTITEMS, Enum)) or
+       (Enum = nil) then
+      Exit;
+    Result := True;
+    SeenPin := TDictionary<string, Byte>.Create;
+    SeenFreq := TDictionary<string, Byte>.Create;
+    try
+      N := 0;
+      while N < HOME_ENUM_CAP do
+      begin
+        Child := nil;
+        Fetched := 0;
+        if Enum.Next(1, Child, Fetched) <> S_OK then
+          Break;
+        if (Fetched = 0) or (Child = nil) then
+        begin
+          if Child <> nil then
+            ILFree(Child);
+          Break;
+        end;
+        Inc(N);
+        try
+          Item := nil;
+          if Failed(SHCreateItemWithParent(ParentPidl, Folder, Child,
+               IID_IShellItem, Item)) or (Item = nil) then
+            Continue;
+          Place.Path := ItemFilePath(Item);
+          if SameText(ExtractFileExt(Place.Path), '.lnk') then
+          begin
+            Place.Path := RawLinkTarget(Place.Path);
+            if not IsHomeFilePath(Place.Path) then
+              Continue;
+          end;
+          if Place.Path = '' then
+            Continue;
+          { Недавние файлы Home не показываем. Папку без атрибута оставляем. }
+          if (not ChildIsFolder(Folder, Child)) and
+             (ExtractFileExt(Place.Path) <> '') then
+            Continue;
+          Place.Caption := FolderChildCaption(Folder, Child);
+          if not UsableHomeCaption(Place.Caption) then
+            Place.Caption := ShellText(Item, SIGDN_PARENTRELATIVEFORADDRESSBAR);
+          if not UsableHomeCaption(Place.Caption) then
+            Place.Caption := ShellText(Item, SIGDN_NORMALDISPLAY);
+          if not UsableHomeCaption(Place.Caption) then
+            Place.Caption := ItemPropCaption(Item);
+          if IsRemotePath(Place.Path) then
+            TryAddPlace(AFrequent, SeenFreq, Place, 32)
+          else if ItemIsPinned(Item) then
+            TryAddPlace(APinned, SeenPin, Place, 0)
+          else
+            TryAddPlace(AFrequent, SeenFreq, Place, 32);
+        finally
+          ILFree(Child);
+        end;
+      end;
+    finally
+      SeenPin.Free;
+      SeenFreq.Free;
+    end;
+  finally
+    ILFree(ParentPidl);
+  end;
+end;
+
+function VerbCommandId(const AMenu: IContextMenu; APop: HMENU;
+  const AVerb: string): UINT;
+var
+  I, Count: Integer;
+  Id: UINT;
+  Name: string;
+  WideBuf: array[0..127] of WideChar;
+  AnsiBuf: array[0..127] of AnsiChar;
+begin
+  Result := 0;
+  if (AMenu = nil) or (APop = 0) or (AVerb = '') then
+    Exit;
+  Count := GetMenuItemCount(APop);
+  for I := 0 to Count - 1 do
+  begin
+    Id := GetMenuItemID(APop, I);
+    if (Id = 0) or (Id = High(UINT)) then
+      Continue;
+    Name := '';
+    FillChar(WideBuf, SizeOf(WideBuf), 0);
+    if Succeeded(AMenu.GetCommandString(Id - 1, GCS_VERBW, nil,
+         PAnsiChar(@WideBuf[0]), Length(WideBuf))) then
+      Name := WideBuf;
+    if Name = '' then
+    begin
+      FillChar(AnsiBuf, SizeOf(AnsiBuf), 0);
+      if Succeeded(AMenu.GetCommandString(Id - 1, GCS_VERBA, nil,
+           @AnsiBuf[0], Length(AnsiBuf))) then
+        Name := string(AnsiBuf);
+    end;
+    if SameText(Name, AVerb) then
+      Exit(Id);
+  end;
+end;
+
+function InvokeMenuVerb(const AMenu: IContextMenu; APop: HMENU;
+  const AVerb: string; AById: Boolean): Boolean;
+var
+  Id: UINT;
+  ICI: TCMInvokeCommandInfoEx;
+  VerbA: AnsiString;
+  VerbW: string;
+begin
+  Result := False;
+  if (AMenu = nil) or (APop = 0) or (AVerb = '') then
+    Exit;
+  FillChar(ICI, SizeOf(ICI), 0);
+  ICI.cbSize := SizeOf(ICI);
+  ICI.fMask := CMIC_MASK_UNICODE or CMIC_MASK_FLAG_NO_UI;
+  ICI.nShow := SW_HIDE;
+  Id := 0;
+  if AById then
+    Id := VerbCommandId(AMenu, APop, AVerb);
+  if Id <> 0 then
+  begin
+    ICI.lpVerb := MakeIntResourceA(Id - 1);
+    ICI.lpVerbW := MakeIntResource(Id - 1);
+  end
+  else if not AById then
+  begin
+    VerbA := AnsiString(AVerb);
+    VerbW := AVerb;
+    ICI.lpVerb := PAnsiChar(VerbA);
+    ICI.lpVerbW := PWideChar(VerbW);
+  end
+  else
+    Exit;
+  Result := Succeeded(AMenu.InvokeCommand(PCMInvokeCommandInfo(@ICI)^));
+end;
+
+function InvokeHomeVerbs(const AMenu: IContextMenu; AAllowRemove: Boolean): Boolean;
+var
+  Pop: HMENU;
+begin
+  Result := False;
+  if AMenu = nil then
+    Exit;
+  Pop := CreatePopupMenu;
+  if Pop = 0 then
+    Exit;
+  try
+    if Failed(AMenu.QueryContextMenu(Pop, 0, 1, $7FFF,
+         CMF_NORMAL or CMF_EXPLORE or CMF_ITEMMENU or CMF_EXTENDEDVERBS)) then
+      Exit;
+    if InvokeMenuVerb(AMenu, Pop, 'unpinfromhome', True) then
+      Exit(True);
+    if AAllowRemove and InvokeMenuVerb(AMenu, Pop, 'removefromhome', True) then
+      Exit(True);
+    if InvokeMenuVerb(AMenu, Pop, 'unpinfromhome', False) then
+      Exit(True);
+    if AAllowRemove then
+      Result := InvokeMenuVerb(AMenu, Pop, 'removefromhome', False);
+  finally
+    DestroyMenu(Pop);
+  end;
+end;
+
+function InvokeHomeUnpin(const AFolder: IShellFolder; AChild: PItemIDList): Boolean;
+var
+  Menu: IContextMenu;
+begin
+  Result := False;
+  if (AFolder = nil) or (AChild = nil) then
+    Exit;
+  // Меню самой папки содержит только «Закрепить». «Открепить» и «Удалить
+  // с панели» живут у дочернего элемента Быстрого доступа.
+  if Failed(AFolder.GetUIObjectOf(0, 1, AChild, IID_IContextMenu, nil, Menu)) or
+     (Menu = nil) then
+    Exit;
+  Result := InvokeHomeVerbs(Menu, True);
+end;
+
+function HomeChildMatches(const AItem: IShellItem; const AKey: string): Boolean;
+var
+  Path, Fs: string;
+begin
+  Result := False;
+  if (AItem = nil) or (AKey = '') then
+    Exit;
+  Path := ItemFilePath(AItem);
+  if SameText(ExtractFileExt(Path), '.lnk') then
+    Path := RawLinkTarget(Path);
+  if HomeKey(Path) = AKey then
+    Exit(True);
+  Fs := NormalizeHomePath(ShellText(AItem, SIGDN_FILESYSPATH));
+  if SameText(ExtractFileExt(Fs), '.lnk') then
+    Fs := RawLinkTarget(Fs);
+  Result := HomeKey(Fs) = AKey;
+end;
+
+function FindHomeChild(const APath: string; out AFolder: IShellFolder;
+  out AChild: PItemIDList): Boolean;
+var
+  RootItem: IShellItem;
+  Folder: IShellFolder;
+  ParentPidl, Child: PItemIDList;
+  Enum: IEnumIDList;
+  Fetched: ULONG;
+  Item: IShellItem;
+  Key: string;
+  N: Integer;
+begin
+  Result := False;
+  AFolder := nil;
+  AChild := nil;
+  Key := HomeKey(APath);
+  if (Key = '') or not OpenQuickAccess(RootItem) then
+    Exit;
+  if Failed(RootItem.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, Folder)) or
+     (Folder = nil) then
+    Exit;
+  ParentPidl := nil;
+  if Failed(SHGetIDListFromObject(RootItem, ParentPidl)) or (ParentPidl = nil) then
+    Exit;
+  try
+    if Failed(Folder.EnumObjects(0,
+         SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or SHCONTF_INCLUDEHIDDEN or
+         SHCONTF_FASTITEMS, Enum)) or
+       (Enum = nil) then
+      Exit;
+    N := 0;
+    while N < HOME_ENUM_CAP do
+    begin
+      Child := nil;
+      Fetched := 0;
+      if Enum.Next(1, Child, Fetched) <> S_OK then
+        Break;
+      if (Fetched = 0) or (Child = nil) then
+      begin
+        if Child <> nil then
+          ILFree(Child);
+        Break;
+      end;
+      Inc(N);
+      try
+        Item := nil;
+        if Failed(SHCreateItemWithParent(ParentPidl, Folder, Child,
+             IID_IShellItem, Item)) or (Item = nil) then
+          Continue;
+        if not HomeChildMatches(Item, Key) then
+          Continue;
+        AFolder := Folder;
+        AChild := ILClone(Child);
+        Result := AChild <> nil;
+        Exit;
+      finally
+        ILFree(Child);
+      end;
+    end;
+  finally
+    ILFree(ParentPidl);
+  end;
+end;
+{$ENDIF}
+
+function UnpinHomePlace(const APath: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Folder: IShellFolder;
+  Child: PItemIDList;
+  Item: IShellItem;
+  Menu: IContextMenu;
+{$ENDIF}
+begin
+  Result := False;
+  {$IFDEF MSWINDOWS}
+  Folder := nil;
+  Child := nil;
+  if FindHomeChild(APath, Folder, Child) then
+  try
+    Result := InvokeHomeUnpin(Folder, Child);
+  finally
+    ILFree(Child);
+  end;
+  if Result then
+    Exit;
+  Item := nil;
+  if Failed(SHCreateItemFromParsingName(PChar(NormalizeHomePath(APath)), nil,
+       IID_IShellItem, Item)) or (Item = nil) then
+    Exit;
+  if Failed(Item.BindToHandler(nil, BHID_SFUIObject, IID_IContextMenu, Menu)) or
+     (Menu = nil) then
+    Exit;
+  Result := InvokeHomeVerbs(Menu, False);
+  {$ENDIF}
+end;
+
+function ReadExplorerHome: TExplorerHome;
+{$IFDEF MSWINDOWS}
+var
+  RawFreq: TArray<THomePlace>;
+  Seen: TDictionary<string, Byte>;
+  I: Integer;
+  Ok: Boolean;
+{$ENDIF}
+begin
+  SetLength(Result.Pinned, 0);
+  SetLength(Result.Frequent, 0);
+  {$IFDEF MSWINDOWS}
+  SetLength(RawFreq, 0);
+  try
+    Ok := EnumQuickAccess(Result.Pinned, RawFreq);
+    if (not Ok) or (Length(Result.Pinned) = 0) then
+    begin
+      SetLength(Result.Pinned, 0);
+      AppendKnownFolders(Result.Pinned);
+    end;
+    Seen := TDictionary<string, Byte>.Create;
+    try
+      for I := 0 to High(Result.Pinned) do
+        Seen.AddOrSetValue(HomeKey(Result.Pinned[I].Path), 1);
+      for I := 0 to High(RawFreq) do
+      begin
+        if Length(Result.Frequent) >= HOME_FREQUENT_MAX then
+          Break;
+        TryAddPlace(Result.Frequent, Seen, RawFreq[I], HOME_FREQUENT_MAX);
+      end;
+    finally
+      Seen.Free;
+    end;
+  except
+    SetLength(Result.Pinned, 0);
+    SetLength(Result.Frequent, 0);
+    try
+      AppendKnownFolders(Result.Pinned);
+    except
+      SetLength(Result.Pinned, 0);
+    end;
+  end;
+  {$ENDIF}
+end;
+
+procedure SeedDockIfNeeded(ASettings: TAppSettings);
+var
+  Home: TExplorerHome;
+  Paths, Caps: TArray<string>;
+  I, N: Integer;
+begin
+  if (ASettings = nil) or not ASettings.DockSeedPending then
+    Exit;
+  Home := ReadExplorerHome;
+  N := Length(Home.Pinned);
+  SetLength(Paths, N);
+  SetLength(Caps, N);
+  for I := 0 to N - 1 do
+  begin
+    Paths[I] := Home.Pinned[I].Path;
+    Caps[I] := Home.Pinned[I].Caption;
+  end;
+  ASettings.CommitDockSeed(Paths, Caps);
+end;
 
 end.

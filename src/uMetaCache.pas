@@ -2,7 +2,8 @@
 
 {
   Для плиток: размер картинки (1200×1600) и длительность медиа (00:15).
-  Чтение в фоне через IPropertyStore / заголовок файла, UI не блокируется.
+  Чтение в фоне через заголовок файла, SVG/Lottie/EMF/WMF/PDF/AI и IPropertyStore.
+  UI не блокируется.
 }
 
 interface
@@ -19,6 +20,14 @@ function ProbeMediaDuration(const APath: string): Double;
 function BuildWavePeaks(const APath: string; ACount: Integer): TArray<Single>;
 function ExportMediaClip(const ASrc, ADst: string; AStart, AEnd: Double;
   AVideo: Boolean; out AError: string): Boolean;
+function ExportVideoFrame(const ASrc, ADst: string; ASeconds: Double;
+  AQuality: Integer; out AError: string): Boolean;
+function ExportAudioOnly(const ASrc, ADst: string; AStart, AEnd: Double;
+  ABitrate: Integer; out AError: string): Boolean;
+function ExportClipCopy(const ASrc, ADst: string; AStart, AEnd: Double;
+  out AError: string): Boolean;
+function ExportClipEncode(const ASrc, ADst: string; AStart, AEnd: Double;
+  ACrf: Integer; out AError: string): Boolean;
 function FindFfmpeg: string;
 
 type
@@ -42,6 +51,7 @@ type
     function Generation: Integer;
     procedure Invalidate(const APath: string);
     procedure Shutdown;
+    function Quiescent: Boolean;
   end;
 
 var
@@ -50,7 +60,8 @@ var
 implementation
 
 uses
-  System.IOUtils, System.Math, System.StrUtils
+  System.IOUtils, System.Math, System.StrUtils, uLang, uThumbCache, uVecPreview,
+  uPdfium
   {$IFDEF MSWINDOWS}, Winapi.Windows, Winapi.ActiveX, Winapi.ShlObj{$ENDIF};
 
 const
@@ -98,6 +109,41 @@ end;
 function IsMediaMetaExt(const AExt: string): Boolean;
 begin
   Result := IsAudioMetaExt(AExt) or IsVideoMetaExt(AExt);
+end;
+
+function IsFrameMetaExt(const AExt: string): Boolean;
+begin
+  Result := MatchText(AExt, ['.svg', '.svgz', '.emf', '.wmf', '.ai', '.pdf',
+    '.tgs', '.lottie', '.json']);
+end;
+
+function FrameMetaText(const APath, AExt: string): string;
+var
+  W, H: Integer;
+  Ok: Boolean;
+begin
+  Result := '';
+  W := 0;
+  H := 0;
+  Ok := False;
+  if (AExt = '.svg') or (AExt = '.svgz') then
+    Ok := TrySvgImageSize(APath, W, H)
+  else if (AExt = '.emf') or (AExt = '.wmf') then
+    Ok := TryMetaImageSize(APath, W, H)
+  else if AExt = '.pdf' then
+    Ok := TryPdfPrintSize(APath, W, H)
+  else if AExt = '.ai' then
+  begin
+    Ok := TryPdfPrintSize(APath, W, H);
+    if not Ok then
+      Ok := TrySvgImageSize(APath, W, H);
+    if not Ok then
+      Ok := TryPsPointSize(APath, W, H);
+  end
+  else if (AExt = '.tgs') or (AExt = '.lottie') or (AExt = '.json') then
+    Ok := TryLottieImageSize(APath, W, H);
+  if Ok and (W > 0) and (H > 0) then
+    Result := Lf('meta.dim', [W, H]);
 end;
 
 function ReadU16BE(FS: TStream): Word;
@@ -221,13 +267,34 @@ begin
       begin
         FS.Position := 12;
         FS.ReadBuffer(Sig, 4);
-        if (Sig[0] = Ord('V')) and (Sig[1] = Ord('P')) and (Sig[2] = Ord('8')) and
-           (Sig[3] = Ord('X')) then
+        if (Sig[0] = Ord('V')) and (Sig[1] = Ord('P')) and (Sig[2] = Ord('8')) then
         begin
-          FS.Position := 24;
-          W := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
-          H := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
-          Result := (W > 0) and (H > 0);
+          if Sig[3] = Ord('X') then
+          begin
+            FS.Position := 24;
+            W := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
+            H := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
+            Result := (W > 0) and (H > 0);
+          end
+          else if Sig[3] = Ord('L') then
+          begin
+            FS.Position := 20;
+            if FS.Read(Sig, 1) <> 1 then
+              Exit;
+            if Sig[0] <> $2F then
+              Exit;
+            W := Integer(ReadU32LE(FS));
+            H := ((W shr 14) and $3FFF) + 1;
+            W := (W and $3FFF) + 1;
+            Result := (W > 0) and (H > 0);
+          end
+          else if Sig[3] = Ord(' ') then
+          begin
+            FS.Position := 26;
+            W := ReadU16LE(FS) and $3FFF;
+            H := ReadU16LE(FS) and $3FFF;
+            Result := (W > 0) and (H > 0);
+          end;
         end;
       end;
     finally
@@ -377,7 +444,7 @@ begin
   begin
     if PropUInt(Store, PKEY_ImageW, W) and PropUInt(Store, PKEY_ImageH, H) and
        (W > 0) and (H > 0) then
-      Result := Format('%dх%d', [W, H]);
+      Result := Lf('meta.dim', [W, H]);
   end
   else if IsMediaMetaExt(Ext) then
   begin
@@ -386,7 +453,7 @@ begin
     if (Result = '') and IsVideoMetaExt(Ext) then
       if PropUInt(Store, PKEY_VideoW, W) and PropUInt(Store, PKEY_VideoH, H) and
          (W > 0) and (H > 0) then
-        Result := Format('%dх%d', [W, H]);
+        Result := Lf('meta.dim', [W, H]);
   end;
 end;
 {$ENDIF}
@@ -401,11 +468,19 @@ begin
   if IsImageMetaExt(Ext) then
   begin
     if TryReadImageSize(APath, W, H) then
-      Exit(Format('%dх%d', [W, H]));
+      Exit(Lf('meta.dim', [W, H]));
+    if IsFrameMetaExt(Ext) then
+    begin
+      Result := FrameMetaText(APath, Ext);
+      if Result <> '' then
+        Exit;
+    end;
 {$IFDEF MSWINDOWS}
     Result := ShellMetaText(APath);
 {$ENDIF}
   end
+  else if IsFrameMetaExt(Ext) then
+    Result := FrameMetaText(APath, Ext)
   else if IsMediaMetaExt(Ext) then
   begin
 {$IFDEF MSWINDOWS}
@@ -895,7 +970,7 @@ begin
     InF := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
     if InF.Size < 44 then
     begin
-      AError := 'короткий wav';
+      AError := L('meta.wavshort');
       Exit;
     end;
     InF.ReadBuffer(Id, 4);
@@ -978,7 +1053,7 @@ begin
     end;
     if (Rate <= 0) or (Ch <= 0) or (Bits <= 0) or (DataSz <= 0) then
     begin
-      AError := 'битый wav';
+      AError := L('meta.wavbad');
       Exit;
     end;
     if Align < 1 then
@@ -1045,7 +1120,7 @@ begin
   try
     if not OpenPcmReader(ASrc, Reader, Rate, Ch, Bits, True) then
     begin
-      AError := 'нет декодера аудио';
+      AError := L('meta.nodecoder');
       Exit;
     end;
     if AEnd <= AStart then
@@ -1109,7 +1184,7 @@ begin
     WriteWavHeader(FS, DataSize, Rate, Ch, Bits);
     Result := DataSize > 0;
     if not Result then
-      AError := 'пустой фрагмент';
+      AError := L('meta.emptyfrag');
   finally
     FS.Free;
     Reader := nil;
@@ -1212,12 +1287,12 @@ begin
   Dst := ADst;
   if (ASrc = '') or (Dst = '') or not FileExists(ASrc) then
   begin
-    AError := 'нет файла';
+    AError := L('meta.nofile');
     Exit;
   end;
   if SameText(ExpandFileName(ASrc), ExpandFileName(Dst)) then
   begin
-    AError := 'нельзя перезаписать исходный файл';
+    AError := L('meta.nooverwrite');
     Exit;
   end;
   if AEnd <= AStart then
@@ -1248,7 +1323,7 @@ begin
     if Result then
     begin
       if not SameText(Dst, ADst) then
-        AError := 'Сохранено WAV: ' + Dst;
+        AError := Lf('meta.savedwav', [Dst]);
       Exit;
     end;
     if ExtS = '.wav' then
@@ -1260,10 +1335,204 @@ begin
   end;
 
   if FindFfmpeg = '' then
-    AError := 'Нет ffmpeg.exe — клип в исходном формате недоступен.' + sLineBreak +
-      'Положите ffmpeg.exe рядом с программой (essentials с gyan.dev).'
+    AError := L('meta.noff.clip') + sLineBreak + L('meta.noff.cliphint')
   else
-    AError := 'Не удалось вырезать фрагмент. Попробуйте WAV или положите другой ffmpeg.';
+    AError := L('meta.clipfail');
+end;
+
+function ExportVideoFrame(const ASrc, ADst: string; ASeconds: Double;
+  AQuality: Integer; out AError: string): Boolean;
+var
+  Exe, Params, Ext, Qs: string;
+  QScale: Integer;
+begin
+  Result := False;
+  AError := '';
+  if (ASrc = '') or (ADst = '') or not FileExists(ASrc) then
+  begin
+    AError := L('meta.nofile');
+    Exit;
+  end;
+  Exe := FindFfmpeg;
+  if Exe = '' then
+  begin
+    AError := L('meta.noff.frame') + sLineBreak + L('meta.noff.near');
+    Exit;
+  end;
+  if ASeconds < 0 then
+    ASeconds := 0;
+  if AQuality < 1 then
+    AQuality := 90;
+  if AQuality > 100 then
+    AQuality := 100;
+  Ext := LowerCase(ExtractFileExt(ADst));
+  if FileExists(ADst) then
+  try
+    TFile.Delete(ADst);
+  except
+  end;
+  if Ext = '.jpg' then
+  begin
+    QScale := 2 + Round((100 - AQuality) * 29 / 99);
+    Qs := Format(' -q:v %d', [QScale]);
+  end
+  else if Ext = '.webp' then
+    Qs := Format(' -c:v libwebp -quality %d', [AQuality])
+  else
+    Qs := '';
+  Params := Format(
+    '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -frames:v 1%s "%s"',
+    [FfNum(ASeconds), ASrc, Qs, ADst]);
+  Result := RunHidden(Exe, Params) and FileExists(ADst) and (TFile.GetSize(ADst) > 32);
+  if not Result then
+    AError := L('meta.framefail');
+end;
+
+function ExportAudioOnly(const ASrc, ADst: string; AStart, AEnd: Double;
+  ABitrate: Integer; out AError: string): Boolean;
+var
+  Exe, Params, Dst, Ext, Codec: string;
+  Dur: Double;
+begin
+  Result := False;
+  AError := '';
+  Dst := ADst;
+  if (ASrc = '') or (Dst = '') or not FileExists(ASrc) then
+  begin
+    AError := L('meta.nofile');
+    Exit;
+  end;
+  if SameText(ExpandFileName(ASrc), ExpandFileName(Dst)) then
+  begin
+    AError := L('meta.nooverwrite');
+    Exit;
+  end;
+  Exe := FindFfmpeg;
+  if Exe = '' then
+  begin
+    AError := L('meta.noff.audio') + sLineBreak + L('meta.noff.near');
+    Exit;
+  end;
+  if AEnd <= AStart then
+    AEnd := AStart + 0.2;
+  if ABitrate < 64 then
+    ABitrate := 64;
+  if ABitrate > 320 then
+    ABitrate := 320;
+  Dur := Max(0.05, AEnd - AStart);
+  Ext := LowerCase(ExtractFileExt(Dst));
+  if Ext = '.mp3' then
+    Codec := Format('-acodec libmp3lame -b:a %dk', [ABitrate])
+  else if Ext = '.wav' then
+    Codec := '-acodec pcm_s16le'
+  else if Ext = '.flac' then
+    Codec := '-acodec flac'
+  else
+  begin
+    if Ext <> '.m4a' then
+      Dst := ChangeFileExt(Dst, '.m4a');
+    Codec := Format('-acodec aac -b:a %dk', [ABitrate]);
+  end;
+  if FileExists(Dst) then
+  try
+    TFile.Delete(Dst);
+  except
+  end;
+  Params := Format(
+    '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -t %s -vn %s "%s"',
+    [FfNum(Max(0, AStart)), ASrc, FfNum(Dur), Codec, Dst]);
+  Result := RunHidden(Exe, Params) and FileExists(Dst) and (TFile.GetSize(Dst) > 32);
+  if not Result then
+    AError := L('meta.audiofail');
+end;
+
+function ExportClipCopy(const ASrc, ADst: string; AStart, AEnd: Double;
+  out AError: string): Boolean;
+var
+  Exe, Params: string;
+  Dur: Double;
+begin
+  Result := False;
+  AError := '';
+  if (ASrc = '') or (ADst = '') or not FileExists(ASrc) then
+  begin
+    AError := L('meta.nofile');
+    Exit;
+  end;
+  if SameText(ExpandFileName(ASrc), ExpandFileName(ADst)) then
+  begin
+    AError := L('meta.nooverwrite');
+    Exit;
+  end;
+  Exe := FindFfmpeg;
+  if Exe = '' then
+  begin
+    AError := L('meta.noff.frag') + sLineBreak + L('meta.noff.near');
+    Exit;
+  end;
+  if AEnd <= AStart then
+    AEnd := AStart + 0.2;
+  Dur := Max(0.05, AEnd - AStart);
+  if FileExists(ADst) then
+  try
+    TFile.Delete(ADst);
+  except
+  end;
+  Params := Format(
+    '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -t %s -c copy -map 0 -avoid_negative_ts make_zero "%s"',
+    [FfNum(Max(0, AStart)), ASrc, FfNum(Dur), ADst]);
+  Result := RunHidden(Exe, Params) and FileExists(ADst) and (TFile.GetSize(ADst) > 0);
+  if not Result then
+    AError := L('meta.copyfail');
+end;
+
+function ExportClipEncode(const ASrc, ADst: string; AStart, AEnd: Double;
+  ACrf: Integer; out AError: string): Boolean;
+var
+  Exe, Params, Ext, VCodec: string;
+  Dur: Double;
+begin
+  Result := False;
+  AError := '';
+  if (ASrc = '') or (ADst = '') or not FileExists(ASrc) then
+  begin
+    AError := L('meta.nofile');
+    Exit;
+  end;
+  if SameText(ExpandFileName(ASrc), ExpandFileName(ADst)) then
+  begin
+    AError := L('meta.nooverwrite');
+    Exit;
+  end;
+  Exe := FindFfmpeg;
+  if Exe = '' then
+  begin
+    AError := L('meta.noff.frag') + sLineBreak + L('meta.noff.near');
+    Exit;
+  end;
+  if AEnd <= AStart then
+    AEnd := AStart + 0.2;
+  if ACrf < 18 then
+    ACrf := 18;
+  if ACrf > 32 then
+    ACrf := 32;
+  Dur := Max(0.05, AEnd - AStart);
+  Ext := LowerCase(ExtractFileExt(ADst));
+  if Ext = '.webm' then
+    VCodec := Format('-c:v libvpx-vp9 -crf %d -b:v 0 -c:a libopus -b:a 128k', [ACrf])
+  else
+    VCodec := Format('-c:v libx264 -preset veryfast -crf %d -c:a aac -b:a 192k -movflags +faststart', [ACrf]);
+  if FileExists(ADst) then
+  try
+    TFile.Delete(ADst);
+  except
+  end;
+  Params := Format(
+    '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -t %s %s "%s"',
+    [FfNum(Max(0, AStart)), ASrc, FfNum(Dur), VCodec, ADst]);
+  Result := RunHidden(Exe, Params) and FileExists(ADst) and (TFile.GetSize(ADst) > 0);
+  if not Result then
+    AError := L('meta.encodefail');
 end;
 {$ENDIF}
 
@@ -1287,8 +1556,6 @@ begin
 end;
 
 procedure TMetaCache.Shutdown;
-var
-  Guard: Integer;
 begin
   FShuttingDown := True;
   FLock.Enter;
@@ -1298,12 +1565,11 @@ begin
   finally
     FLock.Leave;
   end;
-  Guard := 0;
-  while (FBusy > 0) and (Guard < 12) do
-  begin
-    Sleep(15);
-    Inc(Guard);
-  end;
+end;
+
+function TMetaCache.Quiescent: Boolean;
+begin
+  Result := FBusy = 0;
 end;
 
 function TMetaCache.TryGet(const APath: string; out AText: string): Boolean;
@@ -1328,7 +1594,7 @@ begin
   if FShuttingDown or (APath = '') then
     Exit;
   Ext := LowerCase(ExtractFileExt(APath));
-  if not (IsImageMetaExt(Ext) or IsMediaMetaExt(Ext)) then
+  if not (IsImageMetaExt(Ext) or IsMediaMetaExt(Ext) or IsFrameMetaExt(Ext)) then
     Exit;
   Key := LowerCase(APath);
   FLock.Enter;
@@ -1361,12 +1627,16 @@ begin
 end;
 
 procedure TMetaCache.Invalidate(const APath: string);
+var
+  Key: string;
 begin
   if APath = '' then
     Exit;
+  Key := LowerCase(APath);
   FLock.Enter;
   try
-    FItems.Remove(LowerCase(APath));
+    FItems.Remove(Key);
+    FPending.Remove(Key);
   finally
     FLock.Leave;
   end;
@@ -1379,6 +1649,7 @@ begin
     procedure
     var
       Text, Key: string;
+      Gen: Integer;
     begin
       try
 {$IFDEF MSWINDOWS}
@@ -1386,7 +1657,12 @@ begin
 {$ENDIF}
         try
           if not FShuttingDown then
+          begin
+            Gen := FGeneration;
             Text := ReadMetaText(APath);
+            if (not FShuttingDown) and (FGeneration <> Gen) then
+              Text := ReadMetaText(APath);
+          end;
         finally
 {$IFDEF MSWINDOWS}
           CoUninitialize;
@@ -1444,8 +1720,11 @@ initialization
 
 finalization
   if Assigned(GlobalMetaCache) then
+  begin
     GlobalMetaCache.Shutdown;
-  FreeAndNil(GlobalMetaCache);
+    if GlobalMetaCache.Quiescent then
+      FreeAndNil(GlobalMetaCache);
+  end;
 
 end.
 

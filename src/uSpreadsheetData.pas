@@ -101,7 +101,7 @@ implementation
 
 uses
   System.Zip, System.IOUtils, System.StrUtils, System.DateUtils,
-  uAppSettings, uThemeManager;
+  uAppSettings, uThemeManager, uLang;
 
 function LenientCodePage(const ABytes: TBytes; AFrom: Integer;
   ACodePage: Cardinal): string;
@@ -185,7 +185,7 @@ begin
   N := Length(ABytes);
   if N = 0 then
   begin
-    AEncodingLabel := 'пусто';
+    AEncodingLabel := L('enc.empty');
     Exit('');
   end;
 
@@ -235,7 +235,7 @@ begin
     Exit;
   end;
 
-  AEncodingLabel := 'с заменой';
+  AEncodingLabel := L('enc.replaced');
   Result := LenientCodePage(ABytes, Bom, 65001);
 end;
 
@@ -1705,7 +1705,7 @@ begin
       if Result.Sheets.Count = 0 then
       begin
         FreeAndNil(Result);
-        AError := 'В книге нет листов';
+        AError := L('sheet.nosheets');
       end;
     except
       on E: Exception do
@@ -1736,12 +1736,12 @@ begin
   AError := '';
   if (APath = '') or not TFile.Exists(APath) then
   begin
-    AError := 'Файл не найден';
+    AError := L('sheet.notfound');
     Exit;
   end;
   if not IsSpreadsheetFile(APath) then
   begin
-    AError := 'Формат не поддерживается';
+    AError := L('sheet.badformat');
     Exit;
   end;
   try
@@ -1751,7 +1751,7 @@ begin
   end;
   if Sz > SpreadQVMaxBytes then
   begin
-    AError := 'Файл слишком большой для просмотра';
+    AError := L('sheet.toobig');
     Exit;
   end;
   if MaxRows < 1 then
@@ -1764,7 +1764,7 @@ begin
   else if MatchText(Ext, ['.xlsx', '.xlsm']) then
     Result := LoadXlsx(APath, MaxRows, MaxCols, AError)
   else
-    AError := 'Формат не поддерживается';
+    AError := L('sheet.badformat');
 end;
 
 procedure DrawEllipsis(ACanvas: TCanvas; const ARect: TRectF; const AText: string;

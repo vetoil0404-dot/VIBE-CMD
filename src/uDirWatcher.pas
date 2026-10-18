@@ -44,6 +44,7 @@ type
     procedure Execute; override;
   public
     constructor Create(AOwner: TDirWatcher; const APath: string; AStopEvent: THandle);
+    procedure Detach;
   end;
 
 constructor TDirWatchThread.Create(AOwner: TDirWatcher; const APath: string;
@@ -54,6 +55,12 @@ begin
   FOwner := AOwner;
   FPath := APath;
   FStopEvent := AStopEvent;
+end;
+
+procedure TDirWatchThread.Detach;
+begin
+  FOwner := nil;
+  Terminate;
 end;
 
 procedure TDirWatchThread.Execute;
@@ -116,7 +123,6 @@ destructor TDirWatcher.Destroy;
 begin
   FOnChange := nil;
   Stop;
-  CheckSynchronize;
   FStopEvent.Free;
   inherited;
 end;
@@ -124,7 +130,6 @@ end;
 procedure TDirWatcher.StopThread;
 var
   T: TThread;
-  N: Integer;
   Remote: Boolean;
 begin
   if FThread = nil then
@@ -132,24 +137,28 @@ begin
   T := FThread;
   FThread := nil;
   Remote := FRemote;
-  T.Terminate;
-  FStopEvent.SetEvent;
+  TDirWatchThread(T).Detach;
+  if Assigned(FStopEvent) then
+    FStopEvent.SetEvent;
   if not Remote then
   begin
     T.WaitFor;
     T.Free;
+    if Assigned(FStopEvent) then
+      FStopEvent.ResetEvent;
     Exit;
   end;
-  N := 0;
-  while (not T.Finished) and (N < 8) do
-  begin
-    Sleep(30);
-    Inc(N);
-  end;
   if T.Finished then
-    T.Free
-  else
-    T.FreeOnTerminate := True;
+  begin
+    T.Free;
+    if Assigned(FStopEvent) then
+      FStopEvent.ResetEvent;
+    Exit;
+  end;
+  { FindFirstChangeNotification по сети может не вернуться. Поток держит
+    старый хэндл события, новый — для следующего Watch. }
+  T.FreeOnTerminate := True;
+  FStopEvent := TEvent.Create(nil, True, False, '');
 end;
 
 procedure TDirWatcher.Stop;

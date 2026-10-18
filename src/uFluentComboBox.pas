@@ -1,4 +1,4 @@
-unit uFluentComboBox;
+﻿unit uFluentComboBox;
 
 {
   Fluent-комбо: капсула TFluentEdit, шеврон и свой список.
@@ -31,6 +31,15 @@ type
     FHi: Integer;
     FScroll: Integer;
     FMaxVisible: Integer;
+    FBar: TLayout;
+    FThumb: TRectangle;
+    FBarTimer: TTimer;
+    FBarDrag: Boolean;
+    FBarDragY: Single;
+    FBarDragScroll: Integer;
+    FBarThick: Single;
+    FBarTrack: Single;
+    FBarBusy: Boolean;
     FDropListOnly: Boolean;
     FSuggest: Boolean;
     FSilence: Boolean;
@@ -44,6 +53,8 @@ type
     FOnDrop: TNotifyEvent;
     FOnEscape: TNotifyEvent;
     FOnFooter: TNotifyEvent;
+    FOnClosedWheel: TMouseWheelEvent;
+    FOnEditorKey: TKeyEvent;
     FCloseTick: TTimer;
     procedure CloseTick(Sender: TObject);
     procedure ItemsChanged(Sender: TObject);
@@ -77,6 +88,16 @@ type
     procedure RebuildDrop;
     procedure PaintRows;
     procedure ScrollToHi;
+    procedure ApplyListY;
+    procedure PlaceListBar;
+    procedure ListHostResize(Sender: TObject);
+    procedure BarMouseDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure ThumbMouseDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure ThumbMouseEnter(Sender: TObject);
+    procedure ThumbMouseLeave(Sender: TObject);
+    procedure BarTick(Sender: TObject);
     procedure CloseDrop;
     procedure AcceptSource(ASource: Integer);
     function RowCount: Integer;
@@ -89,6 +110,8 @@ type
     destructor Destroy; override;
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure OpenDrop;
+    procedure CloseList;
+    function IsDropOpen: Boolean;
     procedure FocusEditor;
     function EditorFocused: Boolean;
     property Text: string read GetText write SetText;
@@ -107,16 +130,35 @@ type
     property OnDrop: TNotifyEvent read FOnDrop write FOnDrop;
     property OnEscape: TNotifyEvent read FOnEscape write FOnEscape;
     property OnFooter: TNotifyEvent read FOnFooter write FOnFooter;
+    property OnClosedWheel: TMouseWheelEvent read FOnClosedWheel write FOnClosedWheel;
+    property OnEditorKey: TKeyEvent read FOnEditorKey write FOnEditorKey;
   end;
 
 implementation
 
+uses
+  FMX.Forms, Winapi.Windows;
+
 const
   RowH = 28;
+  BarW = 10;
   DropShadowL = 14;
   DropShadowT = 10;
   DropShadowR = 14;
   DropShadowB = 16;
+
+type
+  TComboDropPopup = class(TPopup)
+  protected
+    procedure ApplyStyle; override;
+  end;
+
+procedure TComboDropPopup.ApplyStyle;
+begin
+  inherited;
+  { Стиль попапа подставляет Padding фона и сдвигает список. }
+  Padding.Rect := TRectF.Create(0, 0, 0, 0);
+end;
 
 constructor TFluentComboBox.Create(AOwner: TComponent);
 begin
@@ -206,9 +248,12 @@ begin
   FCloseTick.Enabled := False;
   FCloseTick.OnTimer := CloseTick;
 
-  FPopup := TPopup.Create(Self);
+  FPopup := TComboDropPopup.Create(Self);
   FPopup.Parent := Self;
   FPopup.Padding.Rect := TRectF.Create(0, 0, 0, 0);
+  FPopup.BorderWidth := 0;
+  { Поле тени слева. Без сдвига карточка стоит правее поля. }
+  FPopup.HorizontalOffset := -DropShadowL;
   FPopup.PlacementTarget := Self;
   FPopup.Placement := TPlacement.Bottom;
   FPopup.DragWithParent := True;
@@ -241,12 +286,50 @@ begin
   FList.Align := TAlignLayout.None;
   FList.HitTest := True;
 
+  { Дорожка справа от строк. Не ребёнок FList: иначе уедет вместе со списком. }
+  FBar := TLayout.Create(Self);
+  FBar.Parent := FListHost;
+  FBar.Align := TAlignLayout.Right;
+  FBar.Width := BarW;
+  FBar.HitTest := True;
+  FBar.Visible := False;
+  FBar.ClipChildren := True;
+  FBar.OnMouseDown := BarMouseDown;
+
+  FThumb := TRectangle.Create(Self);
+  FThumb.Parent := FBar;
+  FThumb.Align := TAlignLayout.None;
+  FThumb.HitTest := True;
+  FThumb.Visible := False;
+  FThumb.Stroke.Kind := TBrushKind.None;
+  FThumb.Fill.Kind := TBrushKind.Solid;
+  FThumb.XRadius := 2.5;
+  FThumb.YRadius := 2.5;
+  FThumb.Cursor := crSizeNS;
+  FThumb.OnMouseDown := ThumbMouseDown;
+  FThumb.OnMouseEnter := ThumbMouseEnter;
+  FThumb.OnMouseLeave := ThumbMouseLeave;
+
+  FBarThick := 5;
+  FBarTimer := TTimer.Create(Self);
+  FBarTimer.Interval := 10;
+  FBarTimer.Enabled := False;
+  FBarTimer.OnTimer := BarTick;
+
+  FListHost.OnResize := ListHostResize;
+
   ApplyTheme(FColors);
   SyncPrompt;
 end;
 
 destructor TFluentComboBox.Destroy;
 begin
+  FBarDrag := False;
+  if Assigned(FBarTimer) then
+  begin
+    FBarTimer.Enabled := False;
+    FBarTimer.OnTimer := nil;
+  end;
   FItems.OnChange := nil;
   FEdit.OnChange := nil;
   FEdit.OnSubmit := nil;
@@ -269,7 +352,10 @@ begin
   FListHost.Stroke.Color := AColors.CardStroke;
   ApplyFluentShadow(FShadow, AColors.IsDark);
   if FPopup.IsOpen then
+  begin
     PaintRows;
+    PlaceListBar;
+  end;
   Repaint;
 end;
 
@@ -405,10 +491,15 @@ begin
 end;
 
 procedure TFluentComboBox.EditSubmit(Sender: TObject);
+var
+  Src: Integer;
 begin
   if FPopup.IsOpen and (FHi >= 0) and (FHi < RowCount) then
   begin
-    AcceptSource(RowSource(FHi));
+    Src := RowSource(FHi);
+    AcceptSource(Src);
+    if (Src >= 0) and Assigned(FOnSubmit) then
+      FOnSubmit(Self);
     Exit;
   end;
   CloseDrop;
@@ -428,6 +519,14 @@ begin
     Exit;
   end;
 
+  { Page Up/Down редактор не ест. Отдаём владельцу, пока фокус в поле. }
+  if ((Key = vkPrior) or (Key = vkNext)) and Assigned(FOnEditorKey) then
+  begin
+    FOnEditorKey(Self, Key, KeyChar, Shift);
+    if Key = 0 then
+      Exit;
+  end;
+
   if Key = vkDown then
   begin
     if not FPopup.IsOpen then
@@ -435,6 +534,10 @@ begin
     else if FHi < RowCount - 1 then
     begin
       Inc(FHi);
+      while (FHi < RowCount) and (RowSource(FHi) = -3) do
+        Inc(FHi);
+      if FHi >= RowCount then
+        FHi := RowCount - 1;
       ScrollToHi;
       PaintRows;
     end;
@@ -448,6 +551,8 @@ begin
     if FPopup.IsOpen and (FHi > 0) then
     begin
       Dec(FHi);
+      while (FHi > 0) and (RowSource(FHi) = -3) do
+        Dec(FHi);
       ScrollToHi;
       PaintRows;
     end;
@@ -517,7 +622,8 @@ begin
   end
   else if FScroll < Max(0, RowCount - FMaxVisible) then
     Inc(FScroll);
-  FList.Position.Y := 0 - FScroll * RowH;
+  ApplyListY;
+  PlaceListBar;
   Handled := True;
 end;
 
@@ -525,7 +631,9 @@ procedure TFluentComboBox.MouseWheel(Shift: TShiftState; WheelDelta: Integer;
   var Handled: Boolean);
 begin
   if FPopup.IsOpen then
-    EditMouseWheel(Self, Shift, WheelDelta, Handled);
+    EditMouseWheel(Self, Shift, WheelDelta, Handled)
+  else if Assigned(FOnClosedWheel) then
+    FOnClosedWheel(Self, Shift, WheelDelta, Handled);
   if not Handled then
     inherited;
 end;
@@ -593,6 +701,175 @@ begin
   end;
 end;
 
+procedure TFluentComboBox.ApplyListY;
+begin
+  FList.Position.Y := 0 - FScroll * RowH;
+end;
+
+procedure TFluentComboBox.PlaceListBar;
+var
+  I, N, MaxScroll, Vis: Integer;
+  Need: Boolean;
+  RowW, TrackH, ThumbLen, Travel, Off, Thick: Single;
+begin
+  if FBarBusy or (FBar = nil) or (FThumb = nil) or (FList = nil) then
+    Exit;
+  FBarBusy := True;
+  try
+    N := RowCount;
+    Vis := Max(1, FMaxVisible);
+    Need := N > FMaxVisible;
+    if Need and not FBar.Visible then
+      FBar.BringToFront;
+    FBar.Visible := Need;
+    if Need then
+      RowW := Max(40, Width - 8 - BarW)
+    else
+      RowW := Max(40, Width - 8);
+    if not SameValue(FList.Width, RowW, 0.5) then
+    begin
+      FList.Width := RowW;
+      for I := 0 to N - 1 do
+        if (FList.Controls[I] is TControl) and (FList.Controls[I].Tag <> -3) then
+          TControl(FList.Controls[I]).Width := RowW;
+    end;
+    if not Need then
+    begin
+      FThumb.Visible := False;
+      Exit;
+    end;
+    TrackH := FBar.Height;
+    if TrackH < RowH then
+      TrackH := Min(N, Vis) * RowH;
+    FBarTrack := TrackH;
+    ThumbLen := TrackH * Vis / N;
+    if ThumbLen < 18 then
+      ThumbLen := 18;
+    if ThumbLen > TrackH then
+      ThumbLen := TrackH;
+    MaxScroll := Max(0, N - FMaxVisible);
+    if FScroll > MaxScroll then
+      FScroll := MaxScroll;
+    if FScroll < 0 then
+      FScroll := 0;
+    Travel := TrackH - ThumbLen;
+    if (MaxScroll > 0) and (Travel > 0) then
+      Off := (FScroll / MaxScroll) * Travel
+    else
+      Off := 0;
+    Thick := FBarThick;
+    if Thick < 5 then
+      Thick := 5;
+    if Thick > BarW then
+      Thick := BarW;
+    FThumb.Visible := True;
+    if not (SameValue(FThumb.Position.X, (BarW - Thick) / 2, 0.4) and
+            SameValue(FThumb.Position.Y, Off, 0.4) and
+            SameValue(FThumb.Width, Thick, 0.4) and
+            SameValue(FThumb.Height, ThumbLen, 0.4)) then
+      FThumb.SetBounds((BarW - Thick) / 2, Off, Thick, ThumbLen);
+    if FColors.IsDark then
+      FThumb.Fill.Color := $72FFFFFF
+    else
+      FThumb.Fill.Color := $66000000;
+    ApplyListY;
+  finally
+    FBarBusy := False;
+  end;
+end;
+
+procedure TFluentComboBox.ListHostResize(Sender: TObject);
+begin
+  if Assigned(FPopup) and FPopup.IsOpen then
+    PlaceListBar;
+end;
+
+procedure TFluentComboBox.ThumbMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  FBarDrag := True;
+  FBarDragY := Screen.MousePos.Y;
+  FBarDragScroll := FScroll;
+  FBarThick := 8;
+  if Assigned(FBarTimer) then
+    FBarTimer.Enabled := True;
+  PlaceListBar;
+end;
+
+procedure TFluentComboBox.BarMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+var
+  MaxScroll: Integer;
+begin
+  if (Button <> TMouseButton.mbLeft) or (FThumb = nil) then
+    Exit;
+  if FThumb.Visible and (Y >= FThumb.Position.Y) and
+     (Y <= FThumb.Position.Y + FThumb.Height) then
+  begin
+    ThumbMouseDown(Sender, Button, Shift, X, Y);
+    Exit;
+  end;
+  MaxScroll := Max(0, RowCount - FMaxVisible);
+  if Y < FThumb.Position.Y then
+    FScroll := Max(0, FScroll - Max(1, FMaxVisible))
+  else
+    FScroll := Min(MaxScroll, FScroll + Max(1, FMaxVisible));
+  PlaceListBar;
+end;
+
+procedure TFluentComboBox.ThumbMouseEnter(Sender: TObject);
+begin
+  FBarThick := 8;
+  PlaceListBar;
+end;
+
+procedure TFluentComboBox.ThumbMouseLeave(Sender: TObject);
+begin
+  if FBarDrag then
+    Exit;
+  FBarThick := 5;
+  PlaceListBar;
+end;
+
+procedure TFluentComboBox.BarTick(Sender: TObject);
+var
+  N, MaxScroll: Integer;
+  ThumbLen, Travel, Delta: Single;
+begin
+  if (csDestroying in ComponentState) or not FBarDrag then
+  begin
+    FBarDrag := False;
+    if Assigned(FBarTimer) then
+      FBarTimer.Enabled := False;
+    Exit;
+  end;
+  if (GetAsyncKeyState(VK_LBUTTON) and $8000) = 0 then
+  begin
+    FBarDrag := False;
+    FBarTimer.Enabled := False;
+    FBarThick := 5;
+    PlaceListBar;
+    Exit;
+  end;
+  N := RowCount;
+  if N <= FMaxVisible then
+    Exit;
+  MaxScroll := N - FMaxVisible;
+  ThumbLen := FBarTrack * Max(1, FMaxVisible) / N;
+  if ThumbLen < 18 then
+    ThumbLen := 18;
+  if ThumbLen > FBarTrack then
+    ThumbLen := FBarTrack;
+  Travel := FBarTrack - ThumbLen;
+  if (Travel <= 0) or (MaxScroll <= 0) then
+    Exit;
+  Delta := Screen.MousePos.Y - FBarDragY;
+  FScroll := EnsureRange(Round(FBarDragScroll + Delta / Travel * MaxScroll), 0, MaxScroll);
+  PlaceListBar;
+end;
+
 procedure TFluentComboBox.ScrollToHi;
 var
   MaxScroll: Integer;
@@ -603,7 +880,8 @@ begin
     FScroll := FHi - FMaxVisible + 1;
   MaxScroll := Max(0, RowCount - FMaxVisible);
   FScroll := EnsureRange(FScroll, 0, MaxScroll);
-  FList.Position.Y := 0 - FScroll * RowH;
+  ApplyListY;
+  PlaceListBar;
 end;
 
 procedure TFluentComboBox.RebuildDrop;
@@ -613,6 +891,22 @@ var
   Row: TRectangle;
   Cap: TText;
   Take: Boolean;
+
+  procedure AddSep;
+  var
+    Line: TRectangle;
+  begin
+    Line := TRectangle.Create(Self);
+    Line.Align := TAlignLayout.None;
+    Line.Parent := FList;
+    Line.SetBounds(10, Shown * RowH + (RowH - 1) / 2, Max(40, Width - 28), 1);
+    Line.Stroke.Kind := TBrushKind.None;
+    Line.Fill.Kind := TBrushKind.Solid;
+    Line.Fill.Color := FColors.DividerColor;
+    Line.HitTest := False;
+    Line.Tag := -3;
+    Inc(Shown);
+  end;
 
   procedure AddRow(const ACaption: string; ASource: Integer);
   begin
@@ -655,6 +949,11 @@ begin
     Q := AnsiLowerCase(FEdit.Text);
   for I := 0 to FItems.Count - 1 do
   begin
+    if (Q = '') and (FItems[I] = '-') then
+    begin
+      AddSep;
+      Continue;
+    end;
     Take := True;
     if Q <> '' then
       Take := Pos(Q, AnsiLowerCase(FItems[I])) > 0;
@@ -678,6 +977,10 @@ begin
       FHi := I;
   if (FHi < 0) and (N > 0) then
     FHi := 0;
+  while (FHi < N) and (RowSource(FHi) = -3) do
+    Inc(FHi);
+  if FHi >= N then
+    FHi := 0;
   FScroll := 0;
   ScrollToHi;
   PaintRows;
@@ -693,8 +996,22 @@ end;
 
 procedure TFluentComboBox.CloseDrop;
 begin
+  FBarDrag := False;
+  if Assigned(FBarTimer) then
+    FBarTimer.Enabled := False;
+  FBarThick := 5;
   FPopup.IsOpen := False;
   FDropBtn.Fill.Color := TAlphaColors.Null;
+end;
+
+procedure TFluentComboBox.CloseList;
+begin
+  CloseDrop;
+end;
+
+function TFluentComboBox.IsDropOpen: Boolean;
+begin
+  Result := Assigned(FPopup) and FPopup.IsOpen;
 end;
 
 procedure TFluentComboBox.OpenDrop;
@@ -708,11 +1025,14 @@ begin
     Exit;
   end;
   FPopup.IsOpen := True;
+  PlaceListBar;
   PaintRows;
 end;
 
 procedure TFluentComboBox.AcceptSource(ASource: Integer);
 begin
+  if ASource = -3 then
+    Exit;
   CloseDrop;
   if ASource = -2 then
   begin

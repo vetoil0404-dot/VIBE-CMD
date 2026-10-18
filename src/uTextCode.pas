@@ -51,7 +51,7 @@ implementation
 
 uses
   System.IOUtils, System.Math, System.IniFiles, System.StrUtils, System.Character,
-  uDocumentData;
+  uDocumentData, uLang;
 
 const
   ListedExt: array[0..50] of string = (
@@ -99,7 +99,7 @@ begin
   if E = '.json' then
     Exit(tlJson);
   if MatchText(E, ['.xml', '.html', '.htm', '.xhtml', '.shtml', '.vue',
-    '.asp', '.aspx']) then
+    '.asp', '.aspx', '.svg', '.svgz']) then
     Exit(tlXml);
   if MatchText(E, ['.md', '.markdown']) then
     Exit(tlMd);
@@ -155,8 +155,8 @@ function TextFileLooksLike(const APath: string): Boolean;
 var
   FS: TFileStream;
   Buf: TBytes;
-  I, N, Good: Integer;
-  B: Byte;
+  I, N, Good, Zeros, Pairs, UtfGood: Integer;
+  B, Lo, Hi: Byte;
 begin
   Result := False;
   if (APath = '') or not TFile.Exists(APath) then
@@ -175,16 +175,35 @@ begin
   except
     Exit(False);
   end;
+  if (N >= 2) and (((Buf[0] = $FF) and (Buf[1] = $FE)) or
+     ((Buf[0] = $FE) and (Buf[1] = $FF))) then
+    Exit(True);
   Good := 0;
+  Zeros := 0;
   for I := 0 to N - 1 do
   begin
     B := Buf[I];
     if B = 0 then
-      Exit(False);
-    if (B = 9) or (B = 10) or (B = 13) or (B >= 32) then
+      Inc(Zeros)
+    else if (B = 9) or (B = 10) or (B = 13) or (B >= 32) then
       Inc(Good);
   end;
-  Result := Good / N >= 0.85;
+  if Zeros = 0 then
+    Exit(Good / N >= 0.85);
+  Pairs := N div 2;
+  if Pairs < 4 then
+    Exit(False);
+  UtfGood := 0;
+  for I := 0 to Pairs - 1 do
+  begin
+    Lo := Buf[I * 2];
+    Hi := Buf[I * 2 + 1];
+    if (Hi = 0) and ((Lo = 9) or (Lo = 10) or (Lo = 13) or (Lo >= 32)) then
+      Inc(UtfGood)
+    else if (Lo = 0) and ((Hi = 9) or (Hi = 10) or (Hi = 13) or (Hi >= 32)) then
+      Inc(UtfGood);
+  end;
+  Result := UtfGood / Pairs >= 0.85;
 end;
 
 function MbTake(const ABytes: TBytes; AFrom: Integer; ACodePage, AFlags: Cardinal;
@@ -245,7 +264,7 @@ begin
   N := Length(ABytes);
   if N = 0 then
   begin
-    ALabel := 'пусто';
+    ALabel := L('enc.empty');
     Exit('');
   end;
   Bom := 0;
