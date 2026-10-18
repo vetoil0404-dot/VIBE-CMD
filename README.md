@@ -13,11 +13,14 @@ Also: [Українською](README.ua.md) ·
 
 **Public beta** — current build:
 
-[**VibeCmdBeta.zip**](VibeCmdBeta.zip)
+[**VibeCmdBeta.zip**](https://github.com/vetoil0404-dot/VIBE-CMD/raw/refs/heads/main/VibeCmdBeta.zip)
 
 Unzip anywhere and run `VibeCmd.exe`. No installer. Settings are stored next to the program in `VibeSetting.ini`.
 
-> Place `pdfium.dll` next to the executable for full PDF/AI rendering. 7-Zip must be installed on the system for 7Z, RAR, CAB and ISO.
+>For 7Z, RAR, CAB, and ISO archives, [7-Zip](https://www.7-zip.org/) must be installed on your system.
+>
+>Additionally, place [ffmpeg.exe](https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-essentials.7z) in the same folder as the application to enable audio and video conversion.
+>
 
 \---
 
