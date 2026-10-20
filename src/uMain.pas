@@ -238,6 +238,7 @@ type
     procedure PinDockPath(Sender: TObject; const APath: string);
     procedure DockEmptyBin(Sender: TObject);
     procedure RefreshAfterBin;
+    procedure UndoLastBinDelete;
     procedure RefreshBinIcons;
     procedure BinRefreshTick(Sender: TObject);
     procedure OnBtnNewFolderClick(Sender: TObject);
@@ -5132,6 +5133,23 @@ begin
     FCmdEmpty.Visible := InBin and HasItems;
 end;
 
+procedure TMainForm.UndoLastBinDelete;
+var
+  Err: string;
+begin
+  if not UndoLastDelete(Err) then
+  begin
+    if (Err <> '') and Assigned(FActivePanel) then
+      FActivePanel.ShowNotice(Err);
+    Exit;
+  end;
+  RefreshAfterBin;
+  if Assigned(FLeftPanel) and not IsRecycleBinPath(FLeftPanel.CurrentPath) then
+    FLeftPanel.Refresh;
+  if Assigned(FRightPanel) and not IsRecycleBinPath(FRightPanel.CurrentPath) then
+    FRightPanel.Refresh;
+end;
+
 procedure TMainForm.RefreshBinIcons;
 var
   Items, Bytes: Int64;
@@ -5706,6 +5724,17 @@ begin
     inherited;
     Key := 0;
     KeyChar := #0;
+    Exit;
+  end;
+  if (Key = vkZ) and (ssCtrl in Shift) and not (ssAlt in Shift) and
+     not (ssShift in Shift) and
+     not (Assigned(FActivePanel) and
+       (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+     not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    UndoLastBinDelete;
     Exit;
   end;
   var ShiftStr := '';

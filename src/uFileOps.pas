@@ -77,6 +77,7 @@ procedure SetFileOpOwnerWnd(AWnd: NativeUInt);
 function QueryRecycleBin(out AItems, ABytes: Int64): Boolean;
 function RestoreRecycleItems(const APaths: TArray<string>; out AError: string): Boolean;
 function EmptyRecycleBin(out AError: string): Boolean;
+function UndoLastDelete(out AError: string): Boolean;
 procedure NotifyRecycleBinChanged;
 
 implementation
@@ -84,12 +85,21 @@ implementation
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
   uFileOpEngine, uArchiveEngine, uConflictDialog, uLang
-  {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.ActiveX{$ENDIF};
+  {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.PropSys, Winapi.ActiveX{$ENDIF};
+
+type
+  TUndoDelete = record
+    Sources: TArray<string>;
+    Mark: Int64;
+  end;
 
 procedure CopyDirRecursive(const ASrc, ADst: string); forward;
 procedure DeletePathCore(const APath: string; APermanent: Boolean); forward;
 procedure ArchivePathsCore(const ASources: TArray<string>; const AZipFile: string); forward;
 procedure CopyPathCore(const ASource, ADestDir: string); forward;
+procedure RememberRecycleUndo(const ASources: TArray<string>); forward;
+procedure ClearRecycleUndo; forward;
+function CollectRecycleUndo(const ABatch: TUndoDelete): TArray<string>; forward;
 function StartOpTrack(AKind: TFileOpKind; const ASources: TArray<string>;
   const ADest: string; AQueued: Boolean): Integer; forward;
 
@@ -102,6 +112,8 @@ var
   GFileOpHubChanged: TNotifyEvent;
   GVibeLaunch: TVibeLaunchProc;
   GVibeRestore: TFunc<Integer, Boolean>;
+  GUndoLock: TCriticalSection;
+  GUndo: TList<TUndoDelete>;
 
 procedure SetVibeHooks(ALaunch: TVibeLaunchProc; ARestore: TFunc<Integer, Boolean>);
 begin
@@ -1606,8 +1618,19 @@ var
   Ok: Boolean;
   ErrMsg: string;
   TrackId: Integer;
+  Caller: TFileOpDoneProc;
 begin
   Snapshot := Copy(APaths);
+  Caller := AOnDone;
+  if not APermanent then
+    AOnDone :=
+      procedure(Success: Boolean; const ErrorMsg: string)
+      begin
+        if Success then
+          RememberRecycleUndo(Snapshot);
+        if Assigned(Caller) then
+          Caller(Success, ErrorMsg);
+      end;
   if GFileOpMode = fomVibe then
   begin
     LaunchVibe(okDelete, Snapshot, '', AOnDone, APermanent);
@@ -1854,6 +1877,7 @@ begin
   {$IFDEF MSWINDOWS}
   if Succeeded(SHEmptyRecycleBinW(0, nil, 1)) then
   begin
+    ClearRecycleUndo;
     NotifyRecycleBinChanged;
     Exit(True);
   end;
@@ -1861,6 +1885,228 @@ begin
   {$ELSE}
   AError := L('bin.fail');
   {$ENDIF}
+end;
+
+procedure ClearRecycleUndo;
+begin
+  if GUndoLock = nil then
+    Exit;
+  GUndoLock.Enter;
+  try
+    if GUndo <> nil then
+      GUndo.Clear;
+  finally
+    GUndoLock.Leave;
+  end;
+end;
+
+procedure PushRecycleUndo(const AItems: TArray<string>);
+const
+  MaxUndo = 16;
+var
+  Batch: TUndoDelete;
+  Mark: TFileTime;
+begin
+  if (Length(AItems) = 0) or (GUndoLock = nil) then
+    Exit;
+  FillChar(Mark, SizeOf(Mark), 0);
+  GetSystemTimeAsFileTime(Mark);
+  Batch.Sources := Copy(AItems);
+  Batch.Mark := Int64(Mark.dwLowDateTime) or (Int64(Mark.dwHighDateTime) shl 32);
+  GUndoLock.Enter;
+  try
+    if GUndo = nil then
+      GUndo := TList<TUndoDelete>.Create;
+    GUndo.Add(Batch);
+    while GUndo.Count > MaxUndo do
+      GUndo.Delete(0);
+  finally
+    GUndoLock.Leave;
+  end;
+end;
+
+function PopRecycleUndo: TUndoDelete;
+begin
+  Result.Sources := nil;
+  Result.Mark := 0;
+  if GUndoLock = nil then
+    Exit;
+  GUndoLock.Enter;
+  try
+    if (GUndo = nil) or (GUndo.Count = 0) then
+      Exit;
+    Result := GUndo[GUndo.Count - 1];
+    GUndo.Delete(GUndo.Count - 1);
+  finally
+    GUndoLock.Leave;
+  end;
+end;
+
+function CollectRecycleUndo(const ABatch: TUndoDelete): TArray<string>;
+{$IFDEF MSWINDOWS}
+const
+  KeyFrom: TPropertyKey = (
+    fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 2);
+  KeyWhen: TPropertyKey = (
+    fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 3);
+  Tick30s = Int64(30) * 10000000;
+var
+  WantPath, WantName: TDictionary<string, Byte>;
+  Hits: TList<string>;
+  Bin: IShellItem;
+  Folder: IShellFolder;
+  Enum: IEnumIDList;
+  Child: PItemIDList;
+  Fetched: ULONG;
+  ChildItem: IShellItem;
+  ParentPidl: PItemIDList;
+  Origin, Parse, Name, S: string;
+  Item2: IShellItem2;
+  P: PWideChar;
+  FT: TFileTime;
+  Stamp, Floor: Int64;
+  I: Integer;
+{$ENDIF}
+begin
+  SetLength(Result, 0);
+  {$IFDEF MSWINDOWS}
+  if Length(ABatch.Sources) = 0 then
+    Exit;
+  WantPath := TDictionary<string, Byte>.Create;
+  WantName := TDictionary<string, Byte>.Create;
+  Hits := TList<string>.Create;
+  ParentPidl := nil;
+  try
+    for S in ABatch.Sources do
+    begin
+      Origin := UpperCase(ExcludeTrailingPathDelimiter(Trim(S)));
+      if Origin = '' then
+        Continue;
+      WantPath.AddOrSetValue(Origin, 0);
+      Name := UpperCase(ExtractFileName(Origin));
+      if Name <> '' then
+        WantName.AddOrSetValue(Name, 0);
+    end;
+    if (WantPath.Count = 0) or not ShellItemFromPath(RecycleBinPath, Bin) then
+      Exit;
+    if Failed(Bin.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, Folder)) or
+       (Folder = nil) then
+      Exit;
+    SHGetIDListFromObject(Bin, ParentPidl);
+    if Failed(Folder.EnumObjects(0, SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or
+       SHCONTF_INCLUDEHIDDEN or SHCONTF_STORAGE, Enum)) or (Enum = nil) then
+      Exit;
+    Floor := ABatch.Mark - Tick30s;
+    Fetched := 0;
+    while Enum.Next(1, Child, Fetched) = S_OK do
+    try
+      ChildItem := nil;
+      if Failed(SHCreateItemWithParent(ParentPidl, Folder, Child, IID_IShellItem,
+         ChildItem)) or (ChildItem = nil) then
+        Continue;
+      Origin := '';
+      Name := '';
+      Stamp := 0;
+      Item2 := nil;
+      if Supports(ChildItem, IShellItem2, Item2) then
+      begin
+        P := nil;
+        if Succeeded(Item2.GetString(KeyFrom, P)) and (P <> nil) then
+        begin
+          Origin := UpperCase(ExcludeTrailingPathDelimiter(Trim(string(P))));
+          CoTaskMemFree(P);
+        end;
+        FillChar(FT, SizeOf(FT), 0);
+        if Succeeded(Item2.GetFileTime(KeyWhen, FT)) then
+          Stamp := Int64(FT.dwLowDateTime) or (Int64(FT.dwHighDateTime) shl 32);
+      end;
+      P := nil;
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_NORMALDISPLAY, P)) and
+         (P <> nil) then
+      begin
+        Name := UpperCase(ExtractFileName(StringReplace(string(P), '/', '\',
+          [rfReplaceAll])));
+        CoTaskMemFree(P);
+      end;
+      if (Stamp <> 0) and (Stamp < Floor) then
+        Continue;
+      if (Origin = '') or not WantPath.ContainsKey(Origin) then
+      begin
+        if (Name = '') or not WantName.ContainsKey(Name) or (Stamp = 0) then
+          Continue;
+      end;
+      P := nil;
+      Parse := '';
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, P)) and
+         (P <> nil) then
+      begin
+        Parse := string(P);
+        CoTaskMemFree(P);
+      end;
+      if Parse <> '' then
+        Hits.Add(Parse);
+    finally
+      CoTaskMemFree(Child);
+    end;
+    SetLength(Result, Hits.Count);
+    for I := 0 to Hits.Count - 1 do
+      Result[I] := Hits[I];
+  finally
+    if Assigned(ParentPidl) then
+      CoTaskMemFree(ParentPidl);
+    WantPath.Free;
+    WantName.Free;
+    Hits.Free;
+  end;
+  {$ENDIF}
+end;
+
+procedure RememberRecycleUndo(const ASources: TArray<string>);
+begin
+  PushRecycleUndo(ASources);
+end;
+
+function UndoLastDelete(out AError: string): Boolean;
+var
+  Batch: TUndoDelete;
+  Found: TArray<string>;
+  TryN: Integer;
+begin
+  AError := '';
+  Batch := PopRecycleUndo;
+  if Length(Batch.Sources) = 0 then
+  begin
+    AError := L('bin.noundo');
+    Exit(False);
+  end;
+  SetLength(Found, 0);
+  for TryN := 1 to 4 do
+  begin
+    Found := CollectRecycleUndo(Batch);
+    if Length(Found) > 0 then
+      Break;
+    if TryN < 4 then
+      Sleep(150);
+  end;
+  if Length(Found) = 0 then
+  begin
+    if GUndoLock <> nil then
+    begin
+      GUndoLock.Enter;
+      try
+        if GUndo = nil then
+          GUndo := TList<TUndoDelete>.Create;
+        GUndo.Add(Batch);
+      finally
+        GUndoLock.Leave;
+      end;
+    end;
+    AError := L('bin.fail');
+    Exit(False);
+  end;
+  Result := RestoreRecycleItems(Found, AError);
+  if not Result and (AError = '') then
+    AError := L('bin.fail');
 end;
 
 procedure NotifyRecycleBinChanged;
@@ -1871,11 +2117,14 @@ begin
 end;
 
 initialization
+  GUndoLock := TCriticalSection.Create;
 
 finalization
   GVibeLaunch := nil;
   GVibeRestore := nil;
   GFileOpHubChanged := nil;
+  FreeAndNil(GUndo);
+  FreeAndNil(GUndoLock);
   if GQuietWait <> nil then
   begin
     while GQuietWait.Count > 0 do
