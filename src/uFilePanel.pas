@@ -37,6 +37,8 @@ type
   TStatusViewEvent = procedure(Sender: TObject; AMode: TPanelViewMode) of object;
   TMouseModeEvent = procedure(Sender: TObject; AExplorer: Boolean) of object;
   TPathChangedEvent = procedure(Sender: TObject; const APath: string) of object;
+  TRecycleActEvent = procedure(Sender: TObject; AEmpty: Boolean) of object;
+  TPinDockEvent = procedure(Sender: TObject; const APath: string) of object;
   TPanelCopyMoveEvent = procedure(Sender: TObject; const ADest: string;
     const ASources: TArray<string>; AMove: Boolean; ASourcePanel: TFilePanel) of object;
 
@@ -187,6 +189,8 @@ type
     FKeepSelFocus: string;
     FOnQuickView: TQuickViewEvent;
     FOnPathChanged: TPathChangedEvent;
+    FOnRecycleAct: TRecycleActEvent;
+    FOnPinDock: TPinDockEvent;
     FOnActivate: TNotifyEvent;
     FOnCursorChange: TNotifyEvent;
     FOnStatusView: TStatusViewEvent;
@@ -463,6 +467,8 @@ type
     procedure HomeUnpinLeave(Sender: TObject);
     procedure HomeUnpinMouseUp(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
+    procedure HomePinMouseUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
     procedure StyleHomeGlyph;
     function TabPathStillAvailable(const APath: string;
       const APlaces: TArray<TDriveInfo>): Boolean;
@@ -589,6 +595,8 @@ type
     function CanDropTo(const ADest: string; const ASources: TArray<string>): Boolean;
     procedure Navigate(const APath: string; const ASelectPath: string = '');
     procedure Refresh(const ASelectPath: string = ''; AKeepSelection: Boolean = False);
+    procedure ReloadRecycleTabs;
+    procedure RefreshRecycleHomeIcon;
     procedure InvalidateFolderSizes;
     function PreviewEditKey(var Key: Word; Shift: TShiftState): Boolean;
     procedure InvalidateView;
@@ -645,6 +653,7 @@ type
     function ToggleDriveHome: Boolean;
     procedure CloseDriveHome;
     function DriveHomeIsOpen: Boolean;
+    function HitRecycleHome(const AScreen: TPointF): Boolean;
     function CollectDragPaths: TArray<string>;
     function FocusPathAfterRemove(const ARemoved: TArray<string>): string;
     procedure CaptureTabs(out AState: TSideState);
@@ -666,6 +675,8 @@ type
     property OnActivate: TNotifyEvent read FOnActivate write FOnActivate;
     property OnQuickView: TQuickViewEvent read FOnQuickView write FOnQuickView;
     property OnPathChanged: TPathChangedEvent read FOnPathChanged write FOnPathChanged;
+    property OnRecycleAct: TRecycleActEvent read FOnRecycleAct write FOnRecycleAct;
+    property OnPinDock: TPinDockEvent read FOnPinDock write FOnPinDock;
     property OnCursorChange: TNotifyEvent read FOnCursorChange write FOnCursorChange;
     property OnStatusView: TStatusViewEvent read FOnStatusView write FOnStatusView;
     property OnMouseModePick: TMouseModeEvent read FOnMouseModePick write FOnMouseModePick;
@@ -1864,7 +1875,7 @@ begin
   if Assigned(FOnQuickView) then
   begin
     if GetFocusedEntry(FocusedEntry) then
-      FOnQuickView(Self, FocusedEntry.FullPath)
+      FOnQuickView(Self, EntryViewPath(FocusedEntry))
     else
       FOnQuickView(Self, GetCurrentPathImpl);
   end;
@@ -2621,6 +2632,13 @@ var
   Name: string;
 begin
   Result := nil;
+  if IsRecycleBinPath(APath) then
+  begin
+    GetFileIconBitmap(APath, True, Result);
+    if Assigned(Result) and (Result.Width > 0) then
+      Exit;
+    FreeAndNil(Result);
+  end;
   if (APath = '') or not Assigned(GlobalIconCache) then
     Exit;
   Entry := Default(TFileEntry);
@@ -2756,6 +2774,13 @@ begin
   XCap.TextSettings.FontColor := FColors.SubTextColor;
   XCap.TextSettings.HorzAlign := TTextAlign.Center;
   XCap.TextSettings.VertAlign := TTextAlign.Center;
+  if AKind = 3 then
+  begin
+    XBtn.Tag := 8;
+    XBtn.OnMouseUp := HomePinMouseUp;
+    TrHint(XBtn, 'bin.pin');
+    XCap.Text := #$E718;
+  end;
 
   Icon := TImage.Create(Row);
   Icon.Parent := Row;
@@ -2767,6 +2792,22 @@ begin
   Bmp := HomeFolderBitmap(APath);
   if Assigned(Bmp) and (Bmp.Width > 0) then
     Icon.Bitmap.Assign(Bmp)
+  else if AKind = 3 then
+  begin
+    Icon.Visible := False;
+    var Glyph := TText.Create(Row);
+    Glyph.Parent := Row;
+    Glyph.Align := TAlignLayout.Left;
+    Glyph.Width := 22;
+    Glyph.Margins.Rect := TRectF.Create(8, 0, 4, 0);
+    Glyph.Text := #$E74D;
+    Glyph.HitTest := False;
+    Glyph.TextSettings.Font.Family := FluentIconFamily;
+    Glyph.TextSettings.Font.Size := 16;
+    Glyph.TextSettings.FontColor := FColors.TextColor;
+    Glyph.TextSettings.HorzAlign := TTextAlign.Center;
+    Glyph.TextSettings.VertAlign := TTextAlign.Center;
+  end
   else
     Icon.Visible := False;
   AY := AY + RowH;
@@ -2802,16 +2843,19 @@ begin
   N := FDriveBar.PlaceCount;
   Home := ReadExplorerHome;
   RowsH := N * RowH;
+  RowsH := RowsH + 13;
   if (Length(Home.Pinned) > 0) or (Length(Home.Frequent) > 0) then
   begin
-    RowsH := RowsH + 13 + Length(Home.Pinned) * RowH;
+    RowsH := RowsH + Length(Home.Pinned) * RowH;
     if Length(Home.Frequent) > 0 then
     begin
       if Length(Home.Pinned) > 0 then
         RowsH := RowsH + 13;
       RowsH := RowsH + Length(Home.Frequent) * RowH;
     end;
+    RowsH := RowsH + 13;
   end;
+  RowsH := RowsH + RowH;
   MaxBody := DriveHomeMaxBody;
   if RowsH + Pad * 2 > MaxBody then
   begin
@@ -2948,6 +2992,8 @@ begin
         AppendDriveHomeRow(2, Home.Frequent[P].Caption, Home.Frequent[P].Path, Y, RowW);
     end;
   end;
+  AppendDriveHomeRow(0, '', '', Y, RowW);
+  AppendDriveHomeRow(3, L('bin.title'), RecycleBinPath, Y, RowW);
   FHomeList.Height := Y;
   RefreshHomeFolderIcons;
   if Assigned(FThumbTimer) then
@@ -3090,7 +3136,7 @@ begin
   for I := 0 to ARow.ChildrenCount - 1 do
   begin
     C := ARow.Children[I];
-    if (C is TControl) and (TControl(C).Tag = 7) then
+    if (C is TControl) and ((TControl(C).Tag = 7) or (TControl(C).Tag = 8)) then
       TControl(C).Visible := AOn;
   end;
 end;
@@ -3197,6 +3243,43 @@ begin
       if UnpinHomePlace(Path) and DriveHomeIsOpen then
         RebuildDriveHomeList;
     end);
+end;
+
+procedure TFilePanel.HomePinMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  TThread.ForceQueue(nil,
+    procedure
+    begin
+      if FDestroying then
+        Exit;
+      if Assigned(FOnPinDock) then
+        FOnPinDock(Self, RecycleBinPath);
+    end);
+end;
+
+function TFilePanel.HitRecycleHome(const AScreen: TPointF): Boolean;
+var
+  I: Integer;
+  C: TControl;
+  P: TPointF;
+begin
+  Result := False;
+  if not DriveHomeIsOpen or (FHomeList = nil) then
+    Exit;
+  for I := 0 to FHomeList.ControlsCount - 1 do
+  begin
+    if not (FHomeList.Controls[I] is TControl) then
+      Continue;
+    C := TControl(FHomeList.Controls[I]);
+    if not IsRecycleBinPath(C.TagString) then
+      Continue;
+    P := C.ScreenToLocal(AScreen);
+    if C.LocalRect.Contains(P) then
+      Exit(True);
+  end;
 end;
 
 function TFilePanel.TabPathStillAvailable(const APath: string;
@@ -3666,6 +3749,13 @@ begin
     DrawCol(TRectF.Create(NameL - Off, 0, NameR - Off, FHeaderBar.Height), L('panel.col.name'), sfName);
     var TypeCap := L('panel.col.type');
     var SizeCap := L('panel.col.size');
+    var DateCap := L('panel.col.date');
+    var InBin := IsRecycleBinPath(GetCurrentPathImpl);
+    if InBin then
+    begin
+      TypeCap := L('bin.col.from');
+      DateCap := L('bin.col.deleted');
+    end;
     if FColNetMode = 1 then
     begin
       TypeCap := 'IP';
@@ -3685,7 +3775,7 @@ begin
       end;
       if (not IsThisPCPath(GetCurrentPathImpl)) and (FColDateMode <> dcmHidden) and
          (DateR - DateL > 4) then
-        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), L('panel.col.date'), sfDate);
+        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), DateCap, sfDate);
     end
     else
     begin
@@ -3701,7 +3791,7 @@ begin
       end;
       if (FColDateMode <> dcmHidden) and (DateR - DateL > 4) and
          (not IsThisPCPath(GetCurrentPathImpl)) then
-        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), L('panel.col.date'), sfDate);
+        DrawCol(TRectF.Create(DateL - Off, 0, DateR - Off, FHeaderBar.Height), DateCap, sfDate);
     end;
   finally
     Canvas.EndScene;
@@ -3792,14 +3882,18 @@ begin
   if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) then
   begin
     if FTabs[FActiveTabIndex].Loading and
-       IsRemotePath(FTabs[FActiveTabIndex].Path) then
+       (IsRemotePath(FTabs[FActiveTabIndex].Path) or
+        IsRecycleBinPath(FTabs[FActiveTabIndex].Path)) then
     begin
       if Assigned(FStatusText) then
       begin
         var N := FTabs[FActiveTabIndex].LoadSeen;
         if (N <= 0) and Assigned(FTabs[FActiveTabIndex].Entries) then
           N := FTabs[FActiveTabIndex].Entries.Count;
-        FStatusText.Text := Lf('panel.status.netread', [N]);
+        if IsRecycleBinPath(FTabs[FActiveTabIndex].Path) then
+          FStatusText.Text := Lf('bin.reading', [N])
+        else
+          FStatusText.Text := Lf('panel.status.netread', [N]);
       end;
       Exit;
     end;
@@ -4699,6 +4793,19 @@ begin
   NameR := FirstMeta - Gap;
   if NameR < NameL + 40 then
     NameR := ER - 6;
+  if IsRecycleBinPath(GetCurrentPathImpl) and FColShowType and (TypeR > TypeL + 40) then
+  begin
+    var NameCap := FColMinName;
+    if NameCap < 160 then
+      NameCap := 160;
+    if NameCap > 220 then
+      NameCap := 220;
+    if NameL + NameCap < TypeR - 80 then
+    begin
+      NameR := NameL + NameCap;
+      TypeL := NameR + Gap;
+    end;
+  end;
 end;
 
 procedure TFilePanel.GetHeaderColumnBounds(AContentWidth: Single;
@@ -4867,6 +4974,8 @@ begin
       begin
         FCrumbPaths.Insert(0, Acc);
         Name := DisplayNameForPath(Acc);
+        if IsRecycleBinPath(Acc) then
+          Name := L('bin.title');
         if Name = '' then
           Name := L('drive.device');
         Names.Insert(0, Name);
@@ -5129,6 +5238,11 @@ var
   I: Integer;
   Arc, Inner, LocalDir: string;
 begin
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+  begin
+    ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   Paths := CollectDragPaths;
   if Length(Paths) = 0 then
     Exit;
@@ -5407,6 +5521,8 @@ begin
     Target := 'C:\';
 
   TabName := DisplayNameForPath(Target);
+  if IsRecycleBinPath(Target) then
+    TabName := L('bin.title');
 
   ContainerLayout := TLayout.Create(Self);
   if Assigned(FCard) then
@@ -6167,10 +6283,13 @@ begin
       Tab.CursorPath := ASelectPath
     else
       Tab.CursorPath := '';
-    if (not SameDir) and IsRemotePath(TargetPath) and Assigned(Tab.Entries) then
+    if (not SameDir) and Assigned(Tab.Entries) and
+       (IsRemotePath(TargetPath) or IsRecycleBinPath(TargetPath)) then
       Tab.Entries.Clear;
     FTabs[FActiveTabIndex] := Tab;
     var TabCaption := DisplayNameForPath(TargetPath);
+    if IsRecycleBinPath(TargetPath) then
+      TabCaption := L('bin.title');
     FTabsBar.SetTabInfo(FActiveTabIndex, TabCaption, TargetPath);
   end;
 
@@ -6268,6 +6387,69 @@ begin
     FPendingCursorIndex := 0;
 
   StartDirLoad(Path, ASelectPath, AKeepSelection);
+end;
+
+procedure TFilePanel.ReloadRecycleTabs;
+var
+  I: Integer;
+  Tab: TFileTab;
+begin
+  if FDestroying then
+    Exit;
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    if not IsRecycleBinPath(FTabs[I].Path) then
+      Continue;
+    AbandonTabLoad(I);
+    Tab := FTabs[I];
+    if Assigned(Tab.Entries) then
+      Tab.Entries.Clear;
+    Tab.Loaded := False;
+    Tab.LoadSeen := 0;
+    Tab.LoadSeenWatch := 0;
+    FTabs[I] := Tab;
+    if I = FActiveTabIndex then
+    begin
+      UpdateStatusText;
+      RebuildContent;
+      InvalidateView;
+    end;
+    StartDirLoadAt(I, FTabs[I].Path, '', False);
+  end;
+end;
+
+procedure TFilePanel.RefreshRecycleHomeIcon;
+var
+  I, J: Integer;
+  Row: TFmxObject;
+  Img: TImage;
+  Bmp: FMX.Graphics.TBitmap;
+begin
+  if not Assigned(FHomeList) then
+    Exit;
+  for I := 0 to FHomeList.ControlsCount - 1 do
+  begin
+    Row := FHomeList.Controls[I];
+    if not (Row is TRectangle) or (TRectangle(Row).Tag <> 2) then
+      Continue;
+    if not IsRecycleBinPath(TRectangle(Row).TagString) then
+      Continue;
+    Img := nil;
+    for J := 0 to Row.ChildrenCount - 1 do
+      if Row.Children[J] is TImage then
+      begin
+        Img := TImage(Row.Children[J]);
+        Break;
+      end;
+    if Img = nil then
+      Continue;
+    Bmp := HomeFolderBitmap(TRectangle(Row).TagString);
+    if Assigned(Bmp) and (Bmp.Width > 0) then
+    begin
+      Img.Bitmap.Assign(Bmp);
+      Img.Visible := True;
+    end;
+  end;
 end;
 
 procedure TFilePanel.ApplyCursorAfterLoad(AList: uFileModel.TFileEntryList;
@@ -6446,7 +6628,8 @@ begin
   AnyRemote := False;
   for I := 0 to FTabs.Count - 1 do
   begin
-    Busy := FTabs[I].Loading and IsRemotePath(FTabs[I].Path);
+    Busy := FTabs[I].Loading and
+      (IsRemotePath(FTabs[I].Path) or IsRecycleBinPath(FTabs[I].Path));
     if Assigned(FTabsBar) then
       FTabsBar.SetTabBusy(I, Busy);
     if Busy then
@@ -6457,7 +6640,8 @@ begin
   if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
     Exit;
   Tab := FTabs[FActiveTabIndex];
-  if Tab.Loading and IsRemotePath(Tab.Path) then
+  if Tab.Loading and
+     (IsRemotePath(Tab.Path) or IsRecycleBinPath(Tab.Path)) then
     UpdateStatusText;
   if Assigned(FNetPulseTimer) then
     FNetPulseTimer.Enabled := IsRemotePath(Tab.Path) and (not Tab.Loading);
@@ -6641,7 +6825,9 @@ begin
       end
       else
         SortEntries(Tab.Entries, Tab.SortField, Tab.SortAsc);
-    end;
+    end
+    else if IsRecycleBinPath(Tab.Path) and Assigned(Tab.Entries) then
+      SortEntries(Tab.Entries, Tab.SortField, Tab.SortAsc);
     FTabs[AIndex] := Tab;
     if AIndex = FActiveTabIndex then
     begin
@@ -6864,11 +7050,11 @@ begin
   end;
   if (ActiveLoadCount >= 3) and (Tab.LoadThread = nil) then
   begin
-    Tab.Loading := Remote;
+    Tab.Loading := Remote or IsRecycleBinPath(Path);
     Tab.LoadQueued := True;
     Tab.LoadError := '';
     FTabs[ATabIndex] := Tab;
-    if Remote then
+    if Remote or IsRecycleBinPath(Path) then
       UpdateLoadChrome;
     Exit;
   end;
@@ -6878,7 +7064,7 @@ begin
   FHistoryClearSel := False;
 
   Inc(Tab.LoadGen);
-  Tab.Loading := Remote;
+  Tab.Loading := Remote or IsRecycleBinPath(Path);
   Tab.LoadQueued := False;
   Tab.LoadError := '';
   Tab.Partial := False;
@@ -6893,7 +7079,21 @@ begin
   Gen := Tab.LoadGen;
   TabIdx := ATabIndex;
   FTabs[ATabIndex] := Tab;
-  if Remote then
+  if IsRecycleBinPath(Path) then
+  begin
+    Tab := FTabs[ATabIndex];
+    if Assigned(Tab.Entries) then
+      Tab.Entries.Clear;
+    Tab.Loaded := False;
+    Tab.LoadSeen := 0;
+    FTabs[ATabIndex] := Tab;
+    if ATabIndex = FActiveTabIndex then
+    begin
+      UpdateStatusText;
+      RebuildContent;
+    end;
+  end;
+  if Remote or IsRecycleBinPath(Path) then
     UpdateLoadChrome;
 
   CapturedPaths := TStringList.Create;
@@ -6946,7 +7146,7 @@ begin
         begin
           Cur.LoadThread := nil;
           Cur.Loading := False;
-          if Remote then
+          if Remote or IsRecycleBinPath(Path) then
           begin
             Cur.Partial := False;
             Cur.Offline := False;
@@ -6955,11 +7155,20 @@ begin
               SortEntries(Cur.Entries, Cur.SortField, Cur.SortAsc);
           end;
           FTabs[TabIdx] := Cur;
-          if Remote and (TabIdx = FActiveTabIndex) then
+          if (Remote or IsRecycleBinPath(Path)) and (TabIdx = FActiveTabIndex) then
           begin
+            if IsRecycleBinPath(Path) and Assigned(Cur.Entries) then
+            begin
+              if KeepSel then
+                RestoreTabSelection(TabIdx, Cur.Entries, CapturedPaths, CapturedFocus, True)
+              else if ASelectPath <> '' then
+                ApplyCursorAfterLoad(Cur.Entries, ASelectPath, False);
+            end;
             UpdateStatusText;
             RebuildContent;
             UpdateLoadChrome;
+            if IsRecycleBinPath(Path) then
+              RefreshThumbs;
           end;
           ContinueAfterLoad(TabIdx);
           Exit;
@@ -7309,6 +7518,9 @@ begin
 
         Entry := Entries[ActualIndex];
         var RowOp := EntryRowOpacity(Entry);
+        var TypeText := Entry.DisplayType;
+        if Entry.Origin <> '' then
+          TypeText := Entry.Origin;
 
         var IconRect := TRectF.Create(R.Left + 14, IconTop, R.Left + 14 + DetailsIconSize, IconTop + DetailsIconSize);
         DrawEntryIcon(Canvas, Entry, IconRect, RowOp);
@@ -7321,7 +7533,7 @@ begin
           Canvas.Fill.Color := FColors.SubTextColor;
           if TypeR - TypeL > 4 then
             DrawTrimmedText(Canvas, TRectF.Create(TypeL, MetaTop, TypeR, R.Bottom),
-              Entry.DisplayType, FColors.SubTextColor, RowOp, TTextAlign.Leading, MetaFs);
+              TypeText, FColors.SubTextColor, RowOp, TTextAlign.Leading, MetaFs);
           if SizeR - SizeL > 4 then
             DrawTrimmedText(Canvas, TRectF.Create(SizeL, MetaTop, SizeR, R.Bottom),
               EntrySizeText(Entry), FColors.SubTextColor, RowOp, TTextAlign.Trailing, MetaFs);
@@ -7339,7 +7551,7 @@ begin
             Canvas.Fill.Color := FColors.SubTextColor;
           if FColShowType then
             DrawTrimmedText(Canvas, TRectF.Create(TypeL, R.Top, TypeR, R.Bottom),
-              Entry.DisplayType, Canvas.Fill.Color, RowOp, TTextAlign.Leading, MetaFs);
+              TypeText, Canvas.Fill.Color, RowOp, TTextAlign.Leading, MetaFs);
           if FColShowSize then
           begin
             var SizeAlign := TTextAlign.Trailing;
@@ -7416,7 +7628,7 @@ begin
         var Thumb: FMX.Graphics.TBitmap;
 
         if Assigned(GlobalThumbCache) and
-           GlobalThumbCache.TryGet(Entry.FullPath, Thumb) and Assigned(Thumb) then
+           GlobalThumbCache.TryGet(EntryViewPath(Entry), Thumb) and Assigned(Thumb) then
         begin
           var TargetW := ThumbRect.Width;
           var TargetH := ThumbRect.Height;
@@ -7455,7 +7667,9 @@ begin
         end;
 
         var ExtStr: string;
-        if Entry.IsDirectory then
+        if IsRecycleBinPath(GetCurrentPathImpl) then
+          ExtStr := Entry.DisplayType
+        else if Entry.IsDirectory then
           ExtStr := ''
         else
           ExtStr := Entry.DisplayType;
@@ -8773,7 +8987,11 @@ var
   BaseLen: Integer;
 begin
   CancelLongClick;
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+    Exit;
   if not VisualToEntry(AVisualIdx, Entry) then
+    Exit;
+  if IsRecycleItemPath(Entry.FullPath) then
     Exit;
   if not GetInlineRenameRect(AVisualIdx, R) then
     Exit;
@@ -8902,7 +9120,20 @@ begin
     if SameText(Verb, 'rename') then
       BeginInlineRename(AVisualIdx)
     else if SameText(Verb, 'paste') then
-      HandlePaste;
+      HandlePaste
+    else if SameText(Verb, 'vibe-restore') then
+    begin
+      if Assigned(FOnRecycleAct) then
+        FOnRecycleAct(Self, False);
+    end
+    else if SameText(Verb, 'vibe-empty') then
+    begin
+      if Assigned(FOnRecycleAct) then
+        FOnRecycleAct(Self, True);
+    end
+    else if SameText(Verb, 'undelete') or SameText(Verb, 'delete') or
+            SameText(Verb, 'empty') then
+      Refresh('');
   end;
 end;
 {$ELSE}
@@ -8954,6 +9185,14 @@ begin
   end;
   Entries := GetCurrentEntries;
   if not Assigned(Entries) or not Assigned(FSelectionManager) then Exit;
+
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+  begin
+    DropNavGesture;
+    if Assigned(FOnRecycleAct) then
+      FOnRecycleAct(Self, False);
+    Exit;
+  end;
 
   FocusIdx := FSelectionManager.CurrentIndex;
   // Двойной щелчок открывает строку под курсором мыши. Enter передаёт nil
@@ -9479,6 +9718,8 @@ end;
 
 procedure TFilePanel.StartInlineRename;
 begin
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+    Exit;
   if Assigned(FSelectionManager) then
     BeginInlineRename(FSelectionManager.CurrentIndex);
 end;
@@ -9532,6 +9773,11 @@ procedure TFilePanel.CreateNewFolderInPlace;
 var
   Created: string;
 begin
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+  begin
+    ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   Created := CreateNewFolder(GetCurrentPathImpl, L('panel.newfolder'));
   if Created = '' then
     Exit;
@@ -9779,6 +10025,8 @@ var
   Path, Arc, Inner: string;
 begin
   if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
+    Exit;
+  if IsRecycleBinPath(GetCurrentPathImpl) then
     Exit;
   if IsPathEditing or IsInlineRenaming then
     Exit;
@@ -10426,9 +10674,9 @@ begin
         Entry := Entries[Actual];
         if Entry.FullPath = '' then
           Continue;
-        if not IsThumbCandidate(Entry.FullPath, Entry.IsDirectory, Entry.Name) then
+        if not IsThumbCandidate(EntryViewPath(Entry), Entry.IsDirectory, Entry.Name) then
           Continue;
-        Paths.Add(Entry.FullPath);
+        Paths.Add(EntryViewPath(Entry));
         Hints.Add(Entry.Name);
         Inc(Added);
       end;
@@ -11457,7 +11705,9 @@ begin
   Tab.Stale := True;
   FTabs[AIndex] := Tab;
 
-  Caption := ExtractFileName(ExcludeTrailingPathDelimiter(AState.Path));
+  Caption := DisplayNameForPath(AState.Path);
+  if IsRecycleBinPath(AState.Path) then
+    Caption := L('bin.title');
   if Caption = '' then
     Caption := AState.Path;
   if Assigned(FTabsBar) then

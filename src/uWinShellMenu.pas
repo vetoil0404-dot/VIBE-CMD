@@ -23,7 +23,7 @@ implementation
 
 uses
   Winapi.Messages, Winapi.ShlObj, Winapi.ActiveX, Winapi.DwmApi,
-  System.SysUtils;
+  System.SysUtils, uFileModel, uLang;
 
 const
   CShellMenuClass = 'TCClone.ShellMenuHost';
@@ -318,12 +318,35 @@ begin
     if Failed(Menu.QueryContextMenu(Pop, 0, 1, $7FFF, Flags)) then
       Exit;
 
+    var At: UINT;
+    At := 0;
+    if IsRecycleItemPath(Path) then
+    begin
+      InsertMenu(Pop, At, MF_BYPOSITION or MF_STRING, $8001, PChar(L('bin.restore')));
+      Inc(At);
+    end;
+    if IsRecycleBinPath(Path) or IsRecycleItemPath(Path) then
+      InsertMenu(Pop, At, MF_BYPOSITION or MF_STRING, $8002, PChar(L('bin.empty')));
+
     Cmd := UINT(TrackPopupMenuEx(Pop,
       TPM_RETURNCMD or TPM_RIGHTBUTTON or TPM_HORIZONTAL or TPM_VERTICAL,
       AX, AY, Host, nil));
     ReleaseCapture;
     if Cmd = 0 then
       Exit;
+
+    if Cmd = $8001 then
+    begin
+      AVerb := 'vibe-restore';
+      Result := True;
+      Exit;
+    end;
+    if Cmd = $8002 then
+    begin
+      AVerb := 'vibe-empty';
+      Result := True;
+      Exit;
+    end;
 
     AVerb := ReadMenuVerb(Menu, Cmd);
     if SameText(AVerb, 'rename') or

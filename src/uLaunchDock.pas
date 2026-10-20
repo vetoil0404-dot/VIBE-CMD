@@ -69,6 +69,7 @@ type
     FOnStatus: TDockStatusEvent;
     FOnChanged: TNotifyEvent;
     FOnCopyToFolder: TDockCopyFilesEvent;
+    FOnEmptyBin: TNotifyEvent;
     FIconQueue: TList<Integer>;
     FIconLock: TObject;
     FLocalBusy: Integer;
@@ -104,6 +105,7 @@ type
     procedure MenuResetPictureClick(Sender: TObject);
     procedure MenuGoToClick(Sender: TObject);
     procedure MenuRemoveClick(Sender: TObject);
+    procedure MenuEmptyBinClick(Sender: TObject);
     procedure MenuAddSepClick(Sender: TObject);
     procedure MenuAlignLeftClick(Sender: TObject);
     procedure MenuAlignCenterClick(Sender: TObject);
@@ -167,6 +169,8 @@ type
     procedure NotifyDevicesChanged;
     function CollectPaths: TArray<string>;
     function TryAcceptExternalDrop(const AScreen: TPointF; const APaths: TArray<string>): Boolean;
+    function PinPath(const APath: string): Boolean;
+    procedure RefreshRecycleIcons;
     property AlignMode: TDockAlign read FAlignMode write SetAlignMode;
     property ShowSeparators: Boolean read FShowSeps;
     property OnOpenFolder: TDockOpenFolderEvent read FOnOpenFolder write FOnOpenFolder;
@@ -174,6 +178,7 @@ type
     property OnStatus: TDockStatusEvent read FOnStatus write FOnStatus;
     property OnChanged: TNotifyEvent read FOnChanged write FOnChanged;
     property OnCopyToFolder: TDockCopyFilesEvent read FOnCopyToFolder write FOnCopyToFolder;
+    property OnEmptyBin: TNotifyEvent read FOnEmptyBin write FOnEmptyBin;
   end;
 
 implementation
@@ -403,6 +408,8 @@ end;
 
 function MakeDockCaption(const APath: string): string;
 begin
+  if IsRecycleBinPath(APath) then
+    Exit(L('bin.title'));
   Result := ExtractFileName(ExcludeTrailingPathDelimiter(APath));
   if Result = '' then
     Result := APath;
@@ -593,7 +600,11 @@ begin
     Exit;
   end;
   case Kind of
-    dkFolder: Fallback.Text := '';
+    dkFolder:
+      if IsRecycleBinPath(ItemPath) then
+        Fallback.Text := #$E74D
+      else
+        Fallback.Text := '';
     dkApp:    Fallback.Text := '';
   else
     Fallback.Text := '';
@@ -810,14 +821,22 @@ begin
     Flags := MF_STRING;
     if not CanEdit then
       Flags := Flags or MF_GRAYED;
-    if not Tile.IsSep then
-      AppendMenu(Pop, Flags, 1, PChar(L('dock.change')));
-    if not Tile.IsSep then
-      AppendMenu(Pop, MF_STRING, 2, PChar(L('dock.picture')));
-    if (not Tile.IsSep) and ((Tile.IconFile <> '') or Tile.IconLocked) then
-      AppendMenu(Pop, MF_STRING, 3, PChar(L('dock.resetpic')));
-    AppendMenu(Pop, Flags, 4, PChar(L('dock.goto')));
-    AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.remove')));
+    if IsRecycleBinPath(Tile.ItemPath) then
+    begin
+      AppendMenu(Pop, MF_STRING, 6, PChar(L('bin.empty')));
+      AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.remove')));
+    end
+    else
+    begin
+      if not Tile.IsSep then
+        AppendMenu(Pop, Flags, 1, PChar(L('dock.change')));
+      if not Tile.IsSep then
+        AppendMenu(Pop, MF_STRING, 2, PChar(L('dock.picture')));
+      if (not Tile.IsSep) and ((Tile.IconFile <> '') or Tile.IconLocked) then
+        AppendMenu(Pop, MF_STRING, 3, PChar(L('dock.resetpic')));
+      AppendMenu(Pop, Flags, 4, PChar(L('dock.goto')));
+      AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.remove')));
+    end;
     GetCursorPos(Pt);
     Cmd := UINT(TrackPopupMenuEx(Pop,
       TPM_RETURNCMD or TPM_RIGHTBUTTON or TPM_LEFTALIGN or TPM_TOPALIGN,
@@ -832,6 +851,7 @@ begin
     3: MenuResetPictureClick(nil);
     4: MenuGoToClick(nil);
     5: MenuRemoveClick(nil);
+    6: MenuEmptyBinClick(nil);
   end;
   {$ENDIF}
 end;
@@ -1530,7 +1550,9 @@ begin
         try
           Local := not Job.Remote;
           { Локально — быстрый Exists; сеть — extract сам отработает/упадёт. }
-          if Local then
+          if IsRecycleBinPath(Job.Path) then
+            Ok := True
+          else if Local then
             Ok := TFile.Exists(Job.Path) or TDirectory.Exists(Job.Path)
           else
             Ok := True;
@@ -1549,7 +1571,9 @@ begin
           else
           begin
             { Extract не дал картинку }
-            if Local then
+            if IsRecycleBinPath(Job.Path) then
+              Job.Broken := False
+            else if Local then
               Job.Broken := not Ok
             else
               Job.Broken := True;
@@ -2011,6 +2035,12 @@ begin
     DropOnTile(Hit, APaths);
     Exit;
   end;
+  if (Length(APaths) > 0) and IsRecycleItemPath(APaths[0]) then
+  begin
+    if Assigned(FOnCopyToFolder) then
+      FOnCopyToFolder(Self, '', APaths);
+    Exit;
+  end;
   Added := False;
   for S in APaths do
     if AddOne(S, IndexFromStripX(StripPt.X), True, StripPt.X) then
@@ -2277,6 +2307,42 @@ begin
   HideTip;
 end;
 
+function TLaunchDock.PinPath(const APath: string): Boolean;
+begin
+  Result := AddOne(APath, -1, True);
+  if Result then
+    ScheduleNotifyChanged;
+end;
+
+procedure TLaunchDock.RefreshRecycleIcons;
+var
+  I: Integer;
+  Tile: TDockTile;
+  Fn: string;
+begin
+  for I := 0 to FTiles.Count - 1 do
+  begin
+    Tile := TileOf(FTiles[I]);
+    if (Tile = nil) or Tile.IsSep or Tile.Removing or
+       not IsRecycleBinPath(Tile.ItemPath) then
+      Continue;
+    Fn := '';
+    if Tile.IconFile <> '' then
+      Fn := DockCachePath(Tile.IconFile)
+    else
+      Fn := DockCachePath(DockCacheName(Tile.ItemPath));
+    if (Fn <> '') and TFile.Exists(Fn) then
+      System.SysUtils.DeleteFile(Fn);
+    Tile.IconFile := '';
+    Tile.IconLocked := False;
+    Tile.FailCount := 0;
+    if Tile.Icon.Bitmap <> nil then
+      Tile.Icon.Bitmap.SetSize(0, 0);
+    ApplyGlyph(Tile);
+    EnqueueIcon(Tile, True);
+  end;
+end;
+
 procedure TLaunchDock.DropOnTile(ATile: TFmxObject; const AFiles: TArray<string>);
 var
   Tile: TDockTile;
@@ -2288,6 +2354,18 @@ begin
   case Tile.Kind of
     dkFolder:
       begin
+        if IsRecycleBinPath(Tile.ItemPath) then
+        begin
+          if Assigned(FOnCopyToFolder) then
+            FOnCopyToFolder(Self, Tile.ItemPath, AFiles);
+          Exit;
+        end;
+        if IsRecycleItemPath(AFiles[0]) then
+        begin
+          if Assigned(FOnCopyToFolder) then
+            FOnCopyToFolder(Self, '', AFiles);
+          Exit;
+        end;
         if Assigned(FOnCopyToFolder) then
           FOnCopyToFolder(Self, Tile.ItemPath, AFiles)
         else
@@ -2515,6 +2593,12 @@ end;
 procedure TLaunchDock.MenuGoToClick(Sender: TObject);
 begin
   GoToItem(FMenuTile);
+end;
+
+procedure TLaunchDock.MenuEmptyBinClick(Sender: TObject);
+begin
+  if Assigned(FOnEmptyBin) then
+    FOnEmptyBin(Self);
 end;
 
 procedure TLaunchDock.MenuRemoveClick(Sender: TObject);

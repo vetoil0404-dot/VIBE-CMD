@@ -16,6 +16,9 @@ function IsVirtualShellPath(const APath: string): Boolean;
 function IsPortableDevicePath(const APath: string): Boolean;
 function IsDeviceNamespacePath(const APath: string): Boolean;
 function IsThisPCPath(const APath: string): Boolean;
+function IsRecycleBinPath(const APath: string): Boolean;
+function IsRecycleItemPath(const APath: string): Boolean;
+function RecycleBinPath: string;
 function TryBindShellItem(const APath: string; out AItem: IUnknown): Boolean;
 function IsDriveRoot(const APath: string): Boolean;
 function DriveMemoryKey(const APath: string): string;
@@ -83,6 +86,10 @@ type
     DisplayType: string;
     DisplaySize: string;
     DisplayDate: string;
+    { Корзина: исходный путь. Пусто у обычных файлов. }
+    Origin: string;
+    { Реальный файл внутри Корзины, если оболочка его отдала. Для превью. }
+    ContentPath: string;
     function IsDimmed: Boolean;
     class function FromPath(const APath: string): TFileEntry; static;
     class function FromSearchRec(const APath: string; const ASearchRec: TSearchRec): TFileEntry; static;
@@ -119,6 +126,7 @@ type
   end;
 
 procedure SortEntries(List: TFileEntryList; Field: TSortField; Ascending: Boolean);
+function EntryViewPath(const AEntry: TFileEntry): string;
 procedure PrepareFileEntry(var AEntry: TFileEntry);
 function IsCompatibilityJunction(AAttr: Integer): Boolean;
 function FormatFileSize(Size: Int64): string;
@@ -390,6 +398,50 @@ begin
   if I <= 0 then
     Exit(False);
   Result := Trim(Copy(P, I + Length(CLSID_ThisPC), MaxInt)) = '';
+end;
+
+function RecycleBinPath: string;
+begin
+  Result := 'shell:RecycleBinFolder';
+end;
+
+function EntryViewPath(const AEntry: TFileEntry): string;
+begin
+  if AEntry.ContentPath <> '' then
+    Result := AEntry.ContentPath
+  else
+    Result := AEntry.FullPath;
+end;
+
+function IsRecycleBinPath(const APath: string): Boolean;
+const
+  CLSID_RecycleBin = '645FF040-5081-101B-9F08-00AA002F954E';
+var
+  U, Rest: string;
+  I: Integer;
+begin
+  U := UpperCase(Trim(APath));
+  if U = '' then
+    Exit(False);
+  if (U = 'SHELL:RECYCLEBINFOLDER') or
+     (U = '::{' + CLSID_RecycleBin + '}') or
+     (U = 'SHELL:::{' + CLSID_RecycleBin + '}') then
+    Exit(True);
+  if Pos(CLSID_RecycleBin, U) <= 0 then
+    Exit(False);
+  I := Pos('}', APath);
+  if I <= 0 then
+    Exit(True);
+  Rest := Trim(Copy(APath, I + 1, MaxInt));
+  Result := (Rest = '') or (Rest = '\');
+end;
+
+function IsRecycleItemPath(const APath: string): Boolean;
+const
+  CLSID_RecycleBin = '645FF040-5081-101B-9F08-00AA002F954E';
+begin
+  Result := (Pos(CLSID_RecycleBin, UpperCase(APath)) > 0) and
+    not IsRecycleBinPath(APath);
 end;
 
 function ExtractWpdId(const APath: string): string; forward;
@@ -821,6 +873,40 @@ begin
   if Succeeded(Item2.GetFileTime(PKEY_ItemDateModified, FT)) then
     AEntry.Modified := FileTimeToLocalDT(FT);
 end;
+
+procedure ApplyRecycleProps(const AItem: IShellItem; var AEntry: TFileEntry);
+const
+  PKEY_DeletedFrom: TPropertyKey = (
+    fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 2);
+  PKEY_DateDeleted: TPropertyKey = (
+    fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 3);
+  PKEY_FileAttributes: TPropertyKey = (
+    fmtid: '{B725F130-47EF-101A-A5F1-02608C9EEBAC}'; pid: 13);
+var
+  Item2: IShellItem2;
+  P: PWideChar;
+  FT: TFileTime;
+  Attr: Cardinal;
+begin
+  if not Supports(AItem, IShellItem2, Item2) then
+    Exit;
+  P := nil;
+  if Succeeded(Item2.GetString(PKEY_DeletedFrom, P)) and (P <> nil) then
+  begin
+    AEntry.Origin := string(P);
+    CoTaskMemFree(P);
+  end;
+  FillChar(FT, SizeOf(FT), 0);
+  if Succeeded(Item2.GetFileTime(PKEY_DateDeleted, FT)) then
+    AEntry.Modified := FileTimeToLocalDT(FT);
+  Attr := 0;
+  if Succeeded(Item2.GetUInt32(PKEY_FileAttributes, Attr)) and
+     ((Attr and FILE_ATTRIBUTE_DIRECTORY) <> 0) then
+  begin
+    AEntry.IsDirectory := True;
+    AEntry.Extension := '';
+  end;
+end;
 {$ENDIF}
 
 function DisplayNameForPath(const APath: string): string;
@@ -840,6 +926,8 @@ begin
   end;
   if IsThisPCPath(APath) then
     Exit(L('drive.thispc'));
+  if IsRecycleBinPath(APath) then
+    Exit(L('bin.title'));
   if SameText(APath, '\\') or SameText(APath, 'Network') or
      (IsUncPath(APath) and (Length(ExcludeTrailingPathDelimiter(APath)) <= 2)) then
     Exit(L('drive.network'));
@@ -1236,6 +1324,11 @@ var
 begin
   Result := ExtractFileDir(ExcludeTrailingPathDelimiter(APath));
   if IsThisPCPath(APath) then
+  begin
+    Result := '';
+    Exit;
+  end;
+  if IsRecycleBinPath(APath) then
   begin
     Result := '';
     Exit;
@@ -1857,7 +1950,7 @@ begin
 end;
 
 function AddEntryFromShellItem(const AItem: IShellItem; const AFallbackPath: string;
-  AList: TFileEntryList; AShowHidden: Boolean): Boolean;
+  AList: TFileEntryList; AShowHidden: Boolean; ARecycle: Boolean = False): Boolean;
 var
   Entry: TFileEntry;
   Disp, Fs, AbsParse: string;
@@ -1873,6 +1966,12 @@ begin
   Fs := ShellItemName(AItem, SIGDN_FILESYSPATH);
   if Disp = '' then
     Exit;
+  if ARecycle then
+  begin
+    Disp := StringReplace(Disp, '/', '\', [rfReplaceAll]);
+    if (Pos('\', Disp) > 0) or ((Length(Disp) > 2) and (Disp[2] = ':')) then
+      Disp := ExtractFileName(Disp);
+  end;
   Entry := Default(TFileEntry);
   Entry.Name := Disp;
   if IsWin32FsPath(Fs) and (TDirectory.Exists(Fs) or TFile.Exists(Fs)) then
@@ -1883,6 +1982,11 @@ begin
     Entry.FullPath := Fs
   else
     Entry.FullPath := AFallbackPath;
+  if ARecycle and (AbsParse <> '') then
+    Entry.FullPath := AbsParse;
+  if ARecycle and IsWin32FsPath(Fs) and
+     (TFile.Exists(Fs) or TDirectory.Exists(Fs)) then
+    Entry.ContentPath := Fs;
   Attr := SFGAO_FOLDER or SFGAO_STREAM or SFGAO_HIDDEN or SFGAO_FILESYSTEM;
   if Failed(AItem.GetAttributes(Attr, Attr)) then
     Attr := SFGAO_FOLDER;
@@ -1898,13 +2002,24 @@ begin
   if not Entry.IsDirectory then
     Entry.Extension := TPath.GetExtension(Entry.Name);
   FillShellEntryProps(AItem, Entry);
+  {$IFDEF MSWINDOWS}
+  if ARecycle then
+    ApplyRecycleProps(AItem, Entry);
+  if ARecycle and (Entry.ContentPath <> '') and TDirectory.Exists(Entry.ContentPath) then
+  begin
+    Entry.IsDirectory := True;
+    Entry.Extension := '';
+  end;
+  {$ENDIF}
   PrepareFileEntry(Entry);
+  if ARecycle and (Entry.Size > 0) and (Entry.DisplaySize = '') then
+    Entry.DisplaySize := FormatFileSize(Entry.Size);
   AList.Add(Entry);
   Result := True;
 end;
 
 function TryListEnumItems(const AItem: IShellItem; AList: TFileEntryList;
-  AShowHidden: Boolean): Boolean;
+  AShowHidden: Boolean; ARecycle: Boolean = False; AOnBatch: TProc = nil): Boolean;
 var
   Enum: IEnumShellItems;
   Child: IShellItem;
@@ -1922,8 +2037,12 @@ begin
   Fetched := 0;
   while Enum.Next(1, Child, @Fetched) = S_OK do
   begin
-    if AddEntryFromShellItem(Child, '', AList, AShowHidden) then
+    if AddEntryFromShellItem(Child, '', AList, AShowHidden, ARecycle) then
+    begin
       Inc(N);
+      if Assigned(AOnBatch) and (N mod 40 = 0) then
+        AOnBatch();
+    end;
     Child := nil;
   end;
   if N = 0 then
@@ -1931,7 +2050,7 @@ begin
 end;
 
 function TryListShellFolder(const APath: string; AList: TFileEntryList;
-  AShowHidden: Boolean = False): Boolean;
+  AShowHidden: Boolean = False; AOnBatch: TProc = nil): Boolean;
 {$IFDEF MSWINDOWS}
 const
   EnumFlags = SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or
@@ -1955,7 +2074,9 @@ begin
   if IsNet then
     Parse := NetworkFolderPath
   else if IsThisPCPath(Parse) then
-    Parse := ThisPCParsingName;
+    Parse := ThisPCParsingName
+  else if IsRecycleBinPath(Parse) then
+    Parse := RecycleBinPath;
 
   if not TryCreateShellItem(Parse, Item) then
   begin
@@ -1967,7 +2088,8 @@ begin
   end;
 
   RememberShellItem(Item);
-  if TryListEnumItems(Item, AList, AShowHidden or IsPortableDevicePath(Parse)) then
+  if TryListEnumItems(Item, AList, AShowHidden or IsPortableDevicePath(Parse),
+     IsRecycleBinPath(APath), AOnBatch) then
     Exit(True);
 
   ParentPidl := nil;
@@ -2014,7 +2136,9 @@ begin
       Continue;
     AddEntryFromShellItem(ChildItem, IncludeTrailingPathDelimiter(Parse) +
       ShellItemName(ChildItem, SIGDN_NORMALDISPLAY), AList,
-      AShowHidden or IsPortableDevicePath(Parse));
+      AShowHidden or IsPortableDevicePath(Parse), IsRecycleBinPath(APath));
+    if Assigned(AOnBatch) and (AList.Count mod 40 = 0) then
+      AOnBatch();
   finally
     CoTaskMemFree(Child);
   end;
@@ -2817,7 +2941,11 @@ begin
 
       case Field of
         sfName: Result := CompareText(A.Name, B.Name);
-        sfExt:  Result := CompareText(A.Extension, B.Extension);
+        sfExt:
+          if (A.Origin <> '') or (B.Origin <> '') then
+            Result := CompareText(A.Origin, B.Origin)
+          else
+            Result := CompareText(A.Extension, B.Extension);
         sfSize:
           begin
             SizeCmp := CompareValue(EntrySortSize(A), EntrySortSize(B));
@@ -3057,6 +3185,7 @@ var
   Remote: Boolean;
   RC, LastChunk, ErrCode: Integer;
   LastEmit: Cardinal;
+  Batch: TProc;
 begin
   Remote := IsRemotePath(FPath);
 {$IFDEF MSWINDOWS}
@@ -3066,6 +3195,19 @@ begin
 {$ENDIF}
   Entries := TFileEntryList.Create;
   LastChunk := 0;
+  Batch := nil;
+  if IsRecycleBinPath(FPath) and Assigned(FOnChunk) then
+    Batch :=
+      procedure
+      begin
+        if Terminated or (Entries = nil) then
+          Exit;
+        if Entries.Count - LastChunk < 40 then
+          Exit;
+        EmitSlice(Entries, LastChunk, False);
+        NoteProgress(Entries.Count);
+        LastChunk := Entries.Count;
+      end;
   try
     try
       if FBranch then
@@ -3176,7 +3318,7 @@ begin
         if (not Remote) and (Entries.Count = 0) then
           TryListShellFolder(FPath, Entries, FShowHidden);
       end
-      else if not TryListShellFolder(FPath, Entries, FShowHidden) then
+      else if not TryListShellFolder(FPath, Entries, FShowHidden, Batch) then
       begin
         if not IsVirtualShellPath(FPath) then
           raise Exception.Create(Lf('model.open.path', [FPath]));
@@ -3184,11 +3326,30 @@ begin
 
       if Terminated then
       begin
-        if Remote and (Entries.Count > LastChunk) then
+        if IsRecycleBinPath(FPath) and Assigned(FOnChunk) then
+        begin
+          EmitSlice(Entries, LastChunk, True);
+          NoteProgress(Entries.Count);
+        end
+        else if Remote and (Entries.Count > LastChunk) then
         begin
           EmitSlice(Entries, LastChunk, False);
           NoteProgress(Entries.Count);
         end;
+        FreeAndNil(Entries);
+        Queue(
+          procedure
+          begin
+            if Assigned(FOnDone) then
+              FOnDone(nil);
+          end);
+        Exit;
+      end;
+
+      if IsRecycleBinPath(FPath) and Assigned(FOnChunk) then
+      begin
+        EmitSlice(Entries, LastChunk, True);
+        NoteProgress(Entries.Count);
         FreeAndNil(Entries);
         Queue(
           procedure

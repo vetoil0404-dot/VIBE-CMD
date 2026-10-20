@@ -32,6 +32,7 @@ type
     FOnDone: TFileOpDoneProc;
     FTimer: TTimer;
     FBackground: Boolean;
+    FArmedWait: Boolean;
     FFinished: Boolean;
 
     FRoot: TRectangle;
@@ -162,6 +163,8 @@ type
     Form: TFileOpProgressForm;
     State: TFileOpJobState;
     Background: Boolean;
+    Confirmed: Boolean;
+    Yielded: Boolean;
     Vols: TArray<string>;
     ErrorMsg: string;
     Progress: TFileOpProgress;
@@ -223,7 +226,7 @@ end;
 
 function HubHoldsSlot(J: TFileOpJob): Boolean;
 begin
-  Result := Assigned(J) and
+  Result := Assigned(J) and not J.Yielded and
     (J.State in [jsRunning, jsPaused, jsNeedAnswer, jsBackground]);
 end;
 
@@ -309,7 +312,9 @@ begin
   end;
 end;
 
-procedure HubLaunch(J: TFileOpJob); forward;
+procedure HubPresent(J: TFileOpJob); forward;
+procedure HubBeginIO(J: TFileOpJob); forward;
+procedure HubResumeYielded(J: TFileOpJob); forward;
 procedure HubPromote; forward;
 
 procedure HubPromote;
@@ -322,8 +327,16 @@ begin
   begin
     if HubActiveCount >= 2 then
       Exit;
-    if (GJobs[I].State = jsQueued) and HubVolumesFree(GJobs[I]) then
-      HubLaunch(GJobs[I]);
+    if GJobs[I].Yielded and HubVolumesFree(GJobs[I]) then
+      HubResumeYielded(GJobs[I]);
+  end;
+  for I := 0 to GJobs.Count - 1 do
+  begin
+    if HubActiveCount >= 2 then
+      Exit;
+    if (GJobs[I].State = jsQueued) and GJobs[I].Confirmed and
+       not GJobs[I].Yielded and HubVolumesFree(GJobs[I]) then
+      HubBeginIO(GJobs[I]);
   end;
 end;
 
@@ -359,7 +372,7 @@ begin
     Cb(AOk, AErr);
 end;
 
-procedure HubLaunch(J: TFileOpJob);
+procedure HubPresent(J: TFileOpJob);
 var
   Eng: TFileOpEngine;
   Frm: TFileOpProgressForm;
@@ -367,12 +380,10 @@ var
   Kind: TFileOpKind;
   Perm: Boolean;
 begin
-  if (J = nil) or (J.State <> jsQueued) then
+  if (J = nil) or (J.State <> jsQueued) or (J.Form <> nil) then
     Exit;
   Kind := J.Kind;
   Perm := J.Permanent;
-  J.State := jsRunning;
-  J.Background := False;
   Colors := GetThemeColors(ActiveAppTheme);
   Eng := TFileOpEngine.Create(Kind, J.Sources, J.Dest, Perm);
   Eng.OnItemDone := J.OnItemDone;
@@ -398,6 +409,170 @@ begin
   Frm.Show;
 end;
 
+procedure HubBeginIO(J: TFileOpJob);
+begin
+  if (J = nil) or (J.Engine = nil) or not J.Confirmed then
+    Exit;
+  if J.State <> jsQueued then
+    Exit;
+  if J.Form <> nil then
+    J.Form.FArmedWait := False;
+  if (J.Form <> nil) and J.Form.Visible and not J.Form.FBackground then
+  begin
+    J.Background := False;
+    J.State := jsRunning;
+  end
+  else
+  begin
+    J.Background := True;
+    J.State := jsBackground;
+    if J.Form <> nil then
+      J.Form.FBackground := True;
+  end;
+  J.Engine.ScanAsync;
+  J.Engine.Start;
+  HubTouch;
+end;
+
+procedure HubResumeYielded(J: TFileOpJob);
+begin
+  if (J = nil) or (J.Engine = nil) or not J.Yielded then
+    Exit;
+  J.Yielded := False;
+  if J.Form <> nil then
+    J.Form.FArmedWait := False;
+  if (J.Form <> nil) and J.Form.Visible and not J.Form.FBackground then
+  begin
+    J.Background := False;
+    J.State := jsRunning;
+  end
+  else
+  begin
+    J.Background := True;
+    J.State := jsBackground;
+    if J.Form <> nil then
+      J.Form.FBackground := True;
+  end;
+  J.Engine.Resume;
+  HubTouch;
+end;
+
+function HubCanYield(Other: TFileOpJob): Boolean;
+begin
+  Result := Assigned(Other) and (not Other.Yielded) and Other.Background and
+    (Other.State = jsBackground) and
+    ((Other.Engine = nil) or not Other.Engine.WaitingConflict) and
+    ((Other.Form = nil) or (Other.Form.FConflict = nil) or
+     not Other.Form.FConflict.Visible);
+end;
+
+function HubPreemptFor(J: TFileOpJob): Boolean;
+var
+  Hit: TList<TFileOpJob>;
+  I, K, Left: Integer;
+  Other: TFileOpJob;
+begin
+  Result := False;
+  if (GJobs = nil) or (J = nil) then
+    Exit;
+  Hit := TList<TFileOpJob>.Create;
+  try
+    for I := 0 to GJobs.Count - 1 do
+    begin
+      Other := GJobs[I];
+      if (Other = J) or not HubHoldsSlot(Other) then
+        Continue;
+      for K := 0 to High(J.Vols) do
+        if HubHasVol(Other, J.Vols[K]) then
+        begin
+          Hit.Add(Other);
+          Break;
+        end;
+    end;
+    if Hit.Count = 0 then
+      Exit;
+    for I := 0 to Hit.Count - 1 do
+      if not HubCanYield(Hit[I]) then
+        Exit;
+    Left := HubActiveCount - Hit.Count;
+    if Left >= 2 then
+      Exit;
+    for I := 0 to Hit.Count - 1 do
+    begin
+      Other := Hit[I];
+      Other.Yielded := True;
+      Other.Background := True;
+      Other.State := jsPaused;
+      if Other.Engine <> nil then
+        Other.Engine.Pause;
+      if Other.Form <> nil then
+      begin
+        Other.Form.FArmedWait := True;
+        Other.Form.FBackground := True;
+        Other.Form.Hide;
+      end;
+    end;
+    Result := True;
+  finally
+    Hit.Free;
+  end;
+end;
+
+procedure HubArm(AId: Integer; AToBackground: Boolean);
+var
+  J: TFileOpJob;
+begin
+  J := HubFind(AId);
+  if (J = nil) or J.Confirmed then
+    Exit;
+  J.Confirmed := True;
+  J.Background := AToBackground;
+  if J.Form <> nil then
+    J.Form.FBackground := AToBackground;
+  if (HubActiveCount < 2) and HubVolumesFree(J) then
+  begin
+    if AToBackground and (J.Form <> nil) then
+      J.Form.Hide;
+    HubBeginIO(J);
+    Exit;
+  end;
+  if (not AToBackground) and HubPreemptFor(J) then
+  begin
+    J.Background := False;
+    if J.Form <> nil then
+      J.Form.FBackground := False;
+    HubBeginIO(J);
+    Exit;
+  end;
+  if J.Form <> nil then
+  begin
+    J.Form.FArmedWait := True;
+    if AToBackground then
+    begin
+      J.Background := True;
+      J.Form.FBackground := True;
+      J.Form.Hide;
+    end
+    else
+    begin
+      J.Background := False;
+      J.Form.FBackground := False;
+    end;
+  end;
+  HubTouch;
+end;
+
+procedure HubTryStart(AId: Integer);
+var
+  J: TFileOpJob;
+begin
+  J := HubFind(AId);
+  if (J = nil) or not J.Confirmed or (J.State <> jsQueued) then
+    Exit;
+  if (HubActiveCount < 2) and HubVolumesFree(J) then
+    HubBeginIO(J);
+end;
+
 function JobPercent(const P: TFileOpProgress; out AIndet: Boolean): Integer;
 begin
   AIndet := False;
@@ -416,8 +591,12 @@ function JobDetailText(J: TFileOpJob): string;
 var
   NamePart, DestPart: string;
 begin
-  if J.State = jsQueued then
+  if J.Yielded or (J.State = jsQueued) then
+  begin
+    if Length(J.Vols) > 0 then
+      Exit(L('op.wait') + '  ' + J.Vols[0]);
     Exit(L('op.wait'));
+  end;
   if J.State = jsFailed then
   begin
     if J.ErrorMsg <> '' then
@@ -455,6 +634,9 @@ end;
 
 function JobTitleText(J: TFileOpJob): string;
 begin
+  if J.Yielded or (J.State = jsQueued) then
+    Result := L('op.queued')
+  else
   case J.State of
     jsQueued: Result := L('op.queued');
     jsNeedAnswer: Result := L('op.needanswer');
@@ -519,7 +701,7 @@ begin
   Result.Indeterminate := Indet and
     (J.State in [jsRunning, jsPaused, jsBackground, jsNeedAnswer]);
   Result.Danger := J.State in [jsNeedAnswer, jsFailed];
-  if J.State = jsQueued then
+  if J.Yielded or (J.State = jsQueued) then
     Result.PercentText := L('op.wait')
   else if J.State = jsDone then
     Result.PercentText := ''
@@ -549,6 +731,8 @@ begin
     Успех в фоне ещё 2.5 с, ошибка в фоне — пока не закроют. }
   Result := Assigned(J) and
     ((J.State = jsBackground) or
+     J.Yielded or
+     (J.Confirmed and (J.State = jsQueued)) or
      ((J.State = jsDone) and (J.DoneAt > 0)) or
      ((J.State = jsFailed) and J.Background));
 end;
@@ -648,7 +832,20 @@ var
   Phase: TFileOpPhase;
 begin
   J := HubFind(AId);
-  if (J = nil) or (J.State = jsQueued) or (J.Form = nil) then
+  if (J = nil) or (J.Form = nil) then
+    Exit;
+  if J.Yielded or ((J.State = jsQueued) and J.Confirmed) then
+  begin
+    J.Form.WindowState := TWindowState.wsNormal;
+    if not J.Form.Visible then
+      J.Form.Show;
+    J.Form.BringToFront;
+    J.Form.Activate;
+    J.Form.ApplyNativeChrome;
+    HubTouch;
+    Exit;
+  end;
+  if J.State = jsQueued then
     Exit;
   J.Background := False;
   J.Form.FBackground := False;
@@ -688,6 +885,11 @@ begin
   end;
   if J.State = jsQueued then
   begin
+    if Assigned(J.Form) and not (csDestroying in J.Form.ComponentState) then
+    begin
+      J.Form.Close;
+      Exit;
+    end;
     FireJobDone(J, False, L('op.cancelled'));
     GJobs.Remove(J);
     HubPromote;
@@ -780,6 +982,11 @@ begin
   if J = nil then
     Exit;
   J.Background := True;
+  if J.State = jsQueued then
+  begin
+    HubTouch;
+    Exit;
+  end;
   if J.State <> jsNeedAnswer then
     J.State := jsBackground;
   HubTouch;
@@ -907,7 +1114,7 @@ begin
   J.Background := False;
   HubFillVolumes(J);
   GJobs.Add(J);
-  HubPromote;
+  HubPresent(J);
   HubTouch;
 end;
 
@@ -944,7 +1151,7 @@ begin
   FTimer.Interval := 80;
   FTimer.OnTimer := Tick;
   FTimer.Enabled := True;
-  FEngine.ScanAsync;
+  ShowConfirm(FEngine.GetProgress);
 end;
 
 destructor TFileOpProgressForm.Destroy;
@@ -1462,7 +1669,7 @@ begin
   Ready := P.Phase = opReady;
   Running := P.Phase = opRun;
   Paused := P.Phase = opPaused;
-  FBtnGo.Enabled := (Ready or Paused) and
+  FBtnGo.Enabled := (not FArmedWait) and (Ready or Paused) and
     not (Assigned(FConfirm) and FConfirm.Visible);
   FBtnGo.HitTest := FBtnGo.Enabled;
   if FBtnGo.Enabled then FBtnGo.Opacity := 1 else FBtnGo.Opacity := 0.4;
@@ -1476,8 +1683,7 @@ begin
   if Assigned(FBtnBg) then
   begin
     FBtnBg.Enabled := (not FFinished) and (not FKeepOpen) and
-      not (Assigned(FConflict) and FConflict.Visible) and
-      not (Assigned(FConfirm) and FConfirm.Visible);
+      not (Assigned(FConflict) and FConflict.Visible);
     FBtnBg.HitTest := FBtnBg.Enabled;
     if FBtnBg.Enabled then
       FBtnBg.Opacity := 1
@@ -1536,6 +1742,8 @@ begin
     FStats.Text := FStats.Text + Lf('op.unchanged', [P.Unchanged]);
   if P.Errors > 0 then
     FStats.Text := FStats.Text + Lf('op.errorsn', [P.Errors]);
+  if FArmedWait and (P.Phase in [opIdle, opPaused]) then
+    FStatus.Text := L('op.queued');
   PaintBars(P);
   SyncButtons(P);
   if (P.Phase = opReady) and not FDeleteAsked and not FKeepOpen then
@@ -1565,6 +1773,11 @@ begin
     FileOpHubDismiss(FJobId);
     Exit;
   end;
+  if FArmedWait then
+  begin
+    HubTryStart(FJobId);
+    Exit;
+  end;
   if FEngine = nil then
     Exit;
   if FConfirm.Visible then
@@ -1592,9 +1805,18 @@ begin
 end;
 
 procedure TFileOpProgressForm.CancelClick(Sender: TObject);
+var
+  P: TFileOpProgress;
 begin
-  if Assigned(FEngine) then
-    FEngine.Cancel;
+  if FEngine = nil then
+  begin
+    Close;
+    Exit;
+  end;
+  P := FEngine.GetProgress;
+  FEngine.Cancel;
+  if not (P.Phase in [opScan, opRun, opPaused]) then
+    Close;
 end;
 
 procedure TFileOpProgressForm.BgClick(Sender: TObject);
@@ -1606,7 +1828,13 @@ begin
   if Assigned(FConflict) and FConflict.Visible then
     Exit;
   if Assigned(FConfirm) and FConfirm.Visible then
+  begin
+    FDeleteAsked := True;
+    HideDeleteConfirm;
+    FBackground := True;
+    HubArm(FJobId, True);
     Exit;
+  end;
   if Assigned(FEngine) then
   begin
     P := FEngine.GetProgress;
@@ -2192,11 +2420,7 @@ procedure TFileOpProgressForm.ConfirmYesClick(Sender: TObject);
 begin
   FDeleteAsked := True;
   HideDeleteConfirm;
-  if Assigned(FEngine) then
-  begin
-    FEngine.Start;
-    SyncButtons(FEngine.GetProgress);
-  end;
+  HubArm(FJobId, False);
   SyncKeyFocus;
 end;
 
@@ -2204,8 +2428,7 @@ procedure TFileOpProgressForm.ConfirmNoClick(Sender: TObject);
 begin
   FDeleteAsked := True;
   HideDeleteConfirm;
-  if Assigned(FEngine) then
-    FEngine.Cancel;
+  Close;
 end;
 
 procedure TFileOpProgressForm.ConfClick(Sender: TObject);

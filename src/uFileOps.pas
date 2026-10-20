@@ -74,12 +74,17 @@ procedure DeletePathSync(const APath: string; APermanent: Boolean = False);
 procedure SetFileOpMode(AMode: TFileOpMode);
 function GetFileOpMode: TFileOpMode;
 procedure SetFileOpOwnerWnd(AWnd: NativeUInt);
+function QueryRecycleBin(out AItems, ABytes: Int64): Boolean;
+function RestoreRecycleItems(const APaths: TArray<string>; out AError: string): Boolean;
+function EmptyRecycleBin(out AError: string): Boolean;
+procedure NotifyRecycleBinChanged;
 
 implementation
 
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
-  uFileOpEngine, uArchiveEngine, uConflictDialog, uLang;
+  uFileOpEngine, uArchiveEngine, uConflictDialog, uLang
+  {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.ActiveX{$ENDIF};
 
 procedure CopyDirRecursive(const ASrc, ADst: string); forward;
 procedure DeletePathCore(const APath: string; APermanent: Boolean); forward;
@@ -1698,6 +1703,171 @@ begin
             AOnDone(Fine, Err);
         end);
     end).Start;
+end;
+
+{$IFDEF MSWINDOWS}
+type
+  { shell32 пишет Int64 вплотную к cbSize. Без packed читаем на 4 байта мимо. }
+  TSHQueryRBInfo = packed record
+    cbSize: DWORD;
+    i64Size: Int64;
+    i64NumItems: Int64;
+  end;
+
+function SHQueryRecycleBinW(pszRootPath: PWideChar; var Info: TSHQueryRBInfo): HRESULT;
+  stdcall; external 'shell32.dll' name 'SHQueryRecycleBinW';
+function SHEmptyRecycleBinW(Wnd: HWND; pszRootPath: PWideChar; dwFlags: DWORD): HRESULT;
+  stdcall; external 'shell32.dll' name 'SHEmptyRecycleBinW';
+procedure SHUpdateRecycleBinIcon; stdcall; external 'shell32.dll' name 'SHUpdateRecycleBinIcon';
+
+function ShellItemFromPath(const APath: string; out AItem: IShellItem): Boolean;
+begin
+  AItem := nil;
+  Result := (Trim(APath) <> '') and
+    Succeeded(SHCreateItemFromParsingName(PChar(APath), nil, IID_IShellItem, AItem)) and
+    Assigned(AItem);
+end;
+
+function RestoreOneItem(const APath: string): Boolean;
+var
+  Item: IShellItem;
+  Menu: IContextMenu;
+  ICI: TCMInvokeCommandInfo;
+begin
+  Result := False;
+  if not ShellItemFromPath(APath, Item) then
+    Exit;
+  if Failed(Item.BindToHandler(nil, BHID_SFUIObject, IID_IContextMenu, Menu)) or
+     (Menu = nil) then
+    Exit;
+  FillChar(ICI, SizeOf(ICI), 0);
+  ICI.cbSize := SizeOf(ICI);
+  ICI.fMask := 0;
+  ICI.lpVerb := PAnsiChar(AnsiString('undelete'));
+  ICI.nShow := SW_SHOWNORMAL;
+  Result := Succeeded(Menu.InvokeCommand(ICI));
+end;
+
+function RestoreBatch(const APaths: TArray<string>): Boolean;
+var
+  Bin: IShellItem;
+  Folder: IShellFolder;
+  Item: IShellItem;
+  AbsPidl, RelPidl: PItemIDList;
+  Rel: TArray<PItemIDList>;
+  Menu: IContextMenu;
+  ICI: TCMInvokeCommandInfo;
+  I, N: Integer;
+begin
+  Result := False;
+  if not ShellItemFromPath(RecycleBinPath, Bin) then
+    Exit;
+  if Failed(Bin.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, Folder)) or
+     (Folder = nil) then
+    Exit;
+  SetLength(Rel, Length(APaths));
+  N := 0;
+  for I := 0 to High(APaths) do
+  begin
+    AbsPidl := nil;
+    Item := nil;
+    if not ShellItemFromPath(APaths[I], Item) then
+      Continue;
+    if Failed(SHGetIDListFromObject(Item, AbsPidl)) or (AbsPidl = nil) then
+      Continue;
+    RelPidl := ILClone(ILFindLastID(AbsPidl));
+    CoTaskMemFree(AbsPidl);
+    if RelPidl = nil then
+      Continue;
+    Rel[N] := RelPidl;
+    Inc(N);
+  end;
+  if N = 0 then
+    Exit;
+  try
+    if Failed(Folder.GetUIObjectOf(0, N, Rel[0], IID_IContextMenu, nil, Menu)) or
+       (Menu = nil) then
+      Exit;
+    FillChar(ICI, SizeOf(ICI), 0);
+    ICI.cbSize := SizeOf(ICI);
+    ICI.lpVerb := PAnsiChar(AnsiString('undelete'));
+    ICI.nShow := SW_SHOWNORMAL;
+    Result := Succeeded(Menu.InvokeCommand(ICI));
+  finally
+    for I := 0 to N - 1 do
+      ILFree(Rel[I]);
+  end;
+end;
+{$ENDIF}
+
+function QueryRecycleBin(out AItems, ABytes: Int64): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Info: TSHQueryRBInfo;
+{$ENDIF}
+begin
+  AItems := 0;
+  ABytes := 0;
+  Result := False;
+  {$IFDEF MSWINDOWS}
+  FillChar(Info, SizeOf(Info), 0);
+  Info.cbSize := SizeOf(Info);
+  if Failed(SHQueryRecycleBinW(nil, Info)) then
+    Exit;
+  AItems := Info.i64NumItems;
+  ABytes := Info.i64Size;
+  Result := True;
+  {$ENDIF}
+end;
+
+function RestoreRecycleItems(const APaths: TArray<string>; out AError: string): Boolean;
+var
+  I: Integer;
+  Any: Boolean;
+begin
+  AError := '';
+  Result := False;
+  if Length(APaths) = 0 then
+  begin
+    AError := L('bin.norestore');
+    Exit;
+  end;
+  {$IFDEF MSWINDOWS}
+  if RestoreBatch(APaths) then
+    Exit(True);
+  Any := False;
+  for I := 0 to High(APaths) do
+    if RestoreOneItem(APaths[I]) then
+      Any := True;
+  Result := Any;
+  if not Result then
+    AError := L('bin.fail');
+  {$ELSE}
+  AError := L('bin.fail');
+  {$ENDIF}
+end;
+
+function EmptyRecycleBin(out AError: string): Boolean;
+begin
+  AError := '';
+  Result := False;
+  {$IFDEF MSWINDOWS}
+  if Succeeded(SHEmptyRecycleBinW(0, nil, 1)) then
+  begin
+    NotifyRecycleBinChanged;
+    Exit(True);
+  end;
+  AError := L('bin.fail');
+  {$ELSE}
+  AError := L('bin.fail');
+  {$ENDIF}
+end;
+
+procedure NotifyRecycleBinChanged;
+begin
+  {$IFDEF MSWINDOWS}
+  SHUpdateRecycleBinIcon;
+  {$ENDIF}
 end;
 
 initialization

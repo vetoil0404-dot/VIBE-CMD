@@ -4,7 +4,7 @@ interface
 
 uses
 Winapi.Windows, Winapi.Messages, Winapi.DwmApi, Winapi.UxTheme,
-  Winapi.ShlObj, System.Win.ComObj, FMX.Platform.Win,
+  Winapi.ShlObj, Winapi.CommCtrl, System.Win.ComObj, FMX.Platform.Win,
   System.SysUtils, System.Classes, System.UITypes, System.IOUtils, System.Types,
   System.Generics.Collections,
   FMX.Forms, FMX.Types, FMX.Layouts, FMX.StdCtrls, FMX.Objects,
@@ -48,6 +48,8 @@ type
     FCmdQuickView: TFluentButton;
     FCmdCopy: TFluentButton;
     FCmdMove: TFluentButton;
+    FCmdRestore: TFluentButton;
+    FCmdEmpty: TFluentButton;
     FCmdDelete: TFluentButton;
     FCmdNewFolder: TFluentButton;
     FCmdRename: TFluentButton;
@@ -125,6 +127,9 @@ type
     FIdlePlusTimer: TTimer;
     FStaleTimer: TTimer;
     FPreviewDebounce: TTimer;
+    FBinRefreshTimer: TTimer;
+    FBinIconKnown: Boolean;
+    FBinIconFull: Boolean;
     FPreviewPending: string;
     FPreviewWindowPending: string;
     FFadeStart: UInt64;
@@ -226,6 +231,15 @@ type
       const AFiles: TArray<string>);
     function PanelForPaths(const APaths: TArray<string>): TFilePanel;
     procedure OnBtnDeleteClick(Sender: TObject);
+    procedure OnBtnRestoreClick(Sender: TObject);
+    procedure OnBtnEmptyClick(Sender: TObject);
+    procedure SyncRecycleCommands;
+    procedure RecycleAct(Sender: TObject; AEmpty: Boolean);
+    procedure PinDockPath(Sender: TObject; const APath: string);
+    procedure DockEmptyBin(Sender: TObject);
+    procedure RefreshAfterBin;
+    procedure RefreshBinIcons;
+    procedure BinRefreshTick(Sender: TObject);
     procedure OnBtnNewFolderClick(Sender: TObject);
     procedure OnBtnRefreshClick(Sender: TObject);
     procedure OnBtnViewDetailsClick(Sender: TObject);
@@ -2078,6 +2092,7 @@ begin
       FLeftPanel.SetActive(False);
   end;
   UpdateViewButtons;
+  SyncRecycleCommands;
   if AFocus and APanel.CanFocus then
     APanel.SetFocus;
   SyncCmdPath;
@@ -2283,6 +2298,7 @@ begin
   FDock.OnStatus := DockStatus;
   FDock.OnChanged := DockChanged;
   FDock.OnCopyToFolder := DockCopyToFolder;
+  FDock.OnEmptyBin := DockEmptyBin;
   FDock.ApplyDockOptions(FSettings.DockAlign, FSettings.DockShowSeparators);
   FDock.Margins.Top:=6;
 
@@ -3234,6 +3250,14 @@ begin
   PlaceBtn(FCmdCopy);
   FCmdMove := MakeMidButton('', L('cmd.move'), OnBtnMoveClick);
   PlaceBtn(FCmdMove);
+  FCmdRestore := MakeMidButton(#$E7A7, L('bin.restore'), OnBtnRestoreClick);
+  FCmdRestore.Visible := False;
+  FCmdRestore.SetBounds(FCmdCopy.Position.X, FCmdCopy.Position.Y,
+    FCmdCopy.Width, FCmdCopy.Height);
+  FCmdEmpty := MakeMidButton(#$EA99, L('bin.empty'), OnBtnEmptyClick);
+  FCmdEmpty.Visible := False;
+  FCmdEmpty.SetBounds(FCmdMove.Position.X, FCmdMove.Position.Y,
+    FCmdMove.Width, FCmdMove.Height);
 
   FCmdRename := MakeMidButton('', L('cmd.rename'), OnBtnRenameClick);
   PlaceBtn(FCmdRename);
@@ -3397,6 +3421,8 @@ begin
   FLeftPanel.OnCursorChange := PanelCursorChanged;
   FLeftPanel.OnStatusView := PanelStatusView;
   FLeftPanel.OnMouseModePick := PanelMouseModePick;
+  FLeftPanel.OnRecycleAct := RecycleAct;
+  FLeftPanel.OnPinDock := PinDockPath;
 
   FRightPanel := TFilePanel.Create(Self);
   FRightPanel.Parent := FWorkArea;
@@ -3406,6 +3432,8 @@ begin
   FRightPanel.OnCursorChange := PanelCursorChanged;
   FRightPanel.OnStatusView := PanelStatusView;
   FRightPanel.OnMouseModePick := PanelMouseModePick;
+  FRightPanel.OnRecycleAct := RecycleAct;
+  FRightPanel.OnPinDock := PinDockPath;
 
   FCenterCluster := TLayout.Create(Self);
   FCenterCluster.Parent := FWorkArea;
@@ -3652,6 +3680,27 @@ var
   Local: TPointF;
 begin
   Result := False;
+  if (Length(APaths) > 0) and not IsRecycleItemPath(APaths[0]) then
+  begin
+    if Assigned(FLeftPanel) and FLeftPanel.HitRecycleHome(AScreen) then
+    begin
+      DeletePathsAsync(APaths,
+        procedure(Success: Boolean; const ErrorMsg: string)
+        begin
+          RefreshAfterBin;
+        end, False);
+      Exit(True);
+    end;
+    if Assigned(FRightPanel) and FRightPanel.HitRecycleHome(AScreen) then
+    begin
+      DeletePathsAsync(APaths,
+        procedure(Success: Boolean; const ErrorMsg: string)
+        begin
+          RefreshAfterBin;
+        end, False);
+      Exit(True);
+    end;
+  end;
   if Assigned(FCmdBar) and FCmdBar.Visible and (FCmdBar.Height >= 8) then
   begin
     Local := FCmdBar.ScreenToLocal(AScreen);
@@ -3989,7 +4038,7 @@ begin
   end;
   Path := '';
   if Src.GetFocusedEntry(Entry) then
-    Path := Entry.FullPath
+    Path := EntryViewPath(Entry)
   else
     Path := Src.CurrentPath;
   Dst.ShowPreview(Path);
@@ -4040,7 +4089,7 @@ begin
     FPreviewWindowPending := '';
     Exit;
   end;
-  Path := Entry.FullPath;
+  Path := EntryViewPath(Entry);
   if IsRemotePath(Path) or IsRemotePath(FActivePanel.CurrentPath) then
   begin
     FPreviewWindowPending := Path;
@@ -4099,8 +4148,8 @@ begin
   HasEntry := FActivePanel.GetFocusedEntry(Entry);
   if HasEntry then
   begin
-    ColumnPath := Entry.FullPath;
-    WindowPath := Entry.FullPath;
+    ColumnPath := EntryViewPath(Entry);
+    WindowPath := EntryViewPath(Entry);
   end
   else
   begin
@@ -4671,6 +4720,10 @@ begin
     FCmdCopy.Hint := L('cmd.copy');
   if Assigned(FCmdMove) then
     FCmdMove.Hint := L('cmd.move');
+  if Assigned(FCmdRestore) then
+    FCmdRestore.Hint := L('bin.restore');
+  if Assigned(FCmdEmpty) then
+    FCmdEmpty.Hint := L('bin.empty');
   if Assigned(FCmdRename) then
     FCmdRename.Hint := L('cmd.rename');
   if Assigned(FCmdArchive) then
@@ -4869,6 +4922,26 @@ var
 begin
   if Length(ASources) = 0 then
     Exit;
+  if (Length(ASources) > 0) and IsRecycleItemPath(ASources[0]) then
+  begin
+    var Err: string;
+    if not RestoreRecycleItems(ASources, Err) and (Err <> '') and Assigned(ASrcPanel) then
+      ASrcPanel.ShowNotice(Err);
+    RefreshAfterBin;
+    Exit;
+  end;
+  if IsRecycleBinPath(ADestDir) then
+  begin
+    DeletePathsAsync(ASources,
+      procedure(Success: Boolean; const ErrorMsg: string)
+      begin
+        RefreshAfterBin;
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) and
+           Assigned(ASrcPanel) then
+          ASrcPanel.ShowNotice(ErrorMsg);
+      end, False);
+    Exit;
+  end;
 
   Src := ASrcPanel;
   Dest := ADestPanel;
@@ -4950,6 +5023,28 @@ var
   DestPanel: TFilePanel;
 begin
   Src := PanelForPaths(AFiles);
+  if (Length(AFiles) > 0) and IsRecycleItemPath(AFiles[0]) then
+  begin
+    var Err: string;
+    if not RestoreRecycleItems(AFiles, Err) and (Err <> '') and Assigned(Src) then
+      Src.ShowNotice(Err);
+    RefreshAfterBin;
+    Exit;
+  end;
+  if IsRecycleBinPath(ADest) then
+  begin
+    DeletePathsAsync(AFiles,
+      procedure(Success: Boolean; const ErrorMsg: string)
+      begin
+        RefreshAfterBin;
+        if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) and
+           Assigned(Src) then
+          Src.ShowNotice(ErrorMsg);
+      end, False);
+    Exit;
+  end;
+  if ADest = '' then
+    Exit;
   DestPanel := nil;
   if Assigned(FLeftPanel) and SameText(
        ExcludeTrailingPathDelimiter(FLeftPanel.CurrentPath),
@@ -4968,6 +5063,11 @@ var
   Paths: TArray<string>;
   I: Integer;
 begin
+  if Assigned(FActivePanel) and IsRecycleBinPath(FActivePanel.CurrentPath) then
+  begin
+    FActivePanel.ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
   begin
     OpenBackgroundKind(okCopy);
@@ -4989,6 +5089,11 @@ var
   Paths: TArray<string>;
   I: Integer;
 begin
+  if Assigned(FActivePanel) and IsRecycleBinPath(FActivePanel.CurrentPath) then
+  begin
+    FActivePanel.ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
   begin
     OpenBackgroundKind(okMove);
@@ -5002,6 +5107,203 @@ begin
     Paths[I] := Entries[I].FullPath;
   RunCopyMove(Paths, OtherPanel(FActivePanel).CurrentPath, True,
     FActivePanel, OtherPanel(FActivePanel));
+end;
+
+procedure TMainForm.SyncRecycleCommands;
+var
+  InBin, HasItems: Boolean;
+  Items, Bytes: Int64;
+begin
+  InBin := Assigned(FActivePanel) and IsRecycleBinPath(FActivePanel.CurrentPath);
+  HasItems := True;
+  if InBin and QueryRecycleBin(Items, Bytes) then
+    HasItems := Items > 0;
+  if Assigned(FCmdCopy) then
+    FCmdCopy.Visible := not InBin;
+  if Assigned(FCmdMove) then
+    FCmdMove.Visible := not InBin;
+  if Assigned(FCmdRename) then
+    FCmdRename.Visible := not InBin;
+  if Assigned(FCmdArchive) then
+    FCmdArchive.Visible := not InBin;
+  if Assigned(FCmdRestore) then
+    FCmdRestore.Visible := InBin and HasItems;
+  if Assigned(FCmdEmpty) then
+    FCmdEmpty.Visible := InBin and HasItems;
+end;
+
+procedure TMainForm.RefreshBinIcons;
+var
+  Items, Bytes: Int64;
+  Full: Boolean;
+begin
+  if not QueryRecycleBin(Items, Bytes) then
+    Exit;
+  Full := Items > 0;
+  if FBinIconKnown and (Full = FBinIconFull) then
+    Exit;
+  FBinIconKnown := True;
+  FBinIconFull := Full;
+  if Assigned(FDock) then
+    FDock.RefreshRecycleIcons;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.RefreshRecycleHomeIcon;
+  if Assigned(FRightPanel) then
+    FRightPanel.RefreshRecycleHomeIcon;
+end;
+
+procedure TMainForm.RefreshAfterBin;
+begin
+  NotifyRecycleBinChanged;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.ReloadRecycleTabs;
+  if Assigned(FRightPanel) then
+    FRightPanel.ReloadRecycleTabs;
+  RefreshBinIcons;
+  SyncRecycleCommands;
+  { Оболочка меняет значок пусто/полно с задержкой. Проверяем ещё раз. }
+  if FBinRefreshTimer = nil then
+  begin
+    FBinRefreshTimer := TTimer.Create(Self);
+    FBinRefreshTimer.Interval := 600;
+    FBinRefreshTimer.OnTimer := BinRefreshTick;
+  end;
+  FBinRefreshTimer.Enabled := False;
+  FBinRefreshTimer.Enabled := True;
+end;
+
+procedure TMainForm.BinRefreshTick(Sender: TObject);
+begin
+  if Assigned(FBinRefreshTimer) then
+    FBinRefreshTimer.Enabled := False;
+  NotifyRecycleBinChanged;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.ReloadRecycleTabs;
+  if Assigned(FRightPanel) then
+    FRightPanel.ReloadRecycleTabs;
+  RefreshBinIcons;
+  SyncRecycleCommands;
+end;
+
+function BinConfirm(AOwner: TCommonCustomForm; const AText: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Cfg: TTaskDialogConfig;
+  Btn: Integer;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  FillChar(Cfg, SizeOf(Cfg), 0);
+  Cfg.cbSize := SizeOf(Cfg);
+  if AOwner <> nil then
+    Cfg.hwndParent := FormToHWND(AOwner);
+  Cfg.dwFlags := TDF_ALLOW_DIALOG_CANCELLATION or TDF_POSITION_RELATIVE_TO_WINDOW;
+  Cfg.pszWindowTitle := PChar(L('bin.title'));
+  Cfg.pszMainInstruction := PChar(AText);
+  Cfg.dwCommonButtons := TDCBF_YES_BUTTON or TDCBF_NO_BUTTON;
+  Cfg.nDefaultButton := IDNO;
+  Result := Succeeded(TaskDialogIndirect(Cfg, @Btn, nil, nil)) and (Btn = IDYES);
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
+procedure TMainForm.RecycleAct(Sender: TObject; AEmpty: Boolean);
+var
+  Panel: TFilePanel;
+  Entries: TArray<TFileEntry>;
+  Paths: TArray<string>;
+  I: Integer;
+  Err: string;
+  Focused: TFileEntry;
+  Ask: string;
+begin
+  if not (Sender is TFilePanel) then
+    Exit;
+  Panel := TFilePanel(Sender);
+  if AEmpty then
+  begin
+    var Items, Bytes: Int64;
+    if QueryRecycleBin(Items, Bytes) then
+      Ask := Lf('bin.ask.empty', [FormatFileSize(Bytes), Items])
+    else
+      Ask := L('bin.ask.empty.plain');
+    if not BinConfirm(Self, Ask) then
+      Exit;
+    if not EmptyRecycleBin(Err) and (Err <> '') then
+      Panel.ShowNotice(Err);
+    RefreshAfterBin;
+    Exit;
+  end;
+  Entries := Panel.SelectedEntries;
+  SetLength(Paths, 0);
+  if Length(Entries) = 0 then
+  begin
+    if Panel.GetFocusedEntry(Focused) and (Focused.FullPath <> '') and
+       not IsRecycleBinPath(Focused.FullPath) then
+    begin
+      SetLength(Paths, 1);
+      Paths[0] := Focused.FullPath;
+    end;
+  end
+  else
+  begin
+    SetLength(Paths, Length(Entries));
+    for I := 0 to High(Entries) do
+      Paths[I] := Entries[I].FullPath;
+  end;
+  if Length(Paths) = 0 then
+  begin
+    Panel.ShowNotice(L('bin.norestore'));
+    Exit;
+  end;
+  Ask := Lf('bin.ask.restore', [Length(Paths)]);
+  if not BinConfirm(Self, Ask) then
+    Exit;
+  if not RestoreRecycleItems(Paths, Err) and (Err <> '') then
+    Panel.ShowNotice(Err);
+  RefreshAfterBin;
+end;
+
+procedure TMainForm.OnBtnRestoreClick(Sender: TObject);
+begin
+  if Assigned(FActivePanel) then
+    RecycleAct(FActivePanel, False);
+end;
+
+procedure TMainForm.OnBtnEmptyClick(Sender: TObject);
+begin
+  if Assigned(FActivePanel) then
+    RecycleAct(FActivePanel, True);
+end;
+
+procedure TMainForm.DockEmptyBin(Sender: TObject);
+var
+  Items, Bytes: Int64;
+  Ask, Err: string;
+begin
+  if QueryRecycleBin(Items, Bytes) then
+    Ask := Lf('bin.ask.empty', [FormatFileSize(Bytes), Items])
+  else
+    Ask := L('bin.ask.empty.plain');
+  if not BinConfirm(Self, Ask) then
+    Exit;
+  if not EmptyRecycleBin(Err) and (Err <> '') and Assigned(FActivePanel) then
+    FActivePanel.ShowNotice(Err);
+  RefreshAfterBin;
+end;
+
+procedure TMainForm.PinDockPath(Sender: TObject; const APath: string);
+begin
+  if not Assigned(FDock) or (APath = '') then
+    Exit;
+  if not FDock.PinPath(APath) then
+  begin
+    if Sender is TFilePanel then
+      TFilePanel(Sender).ShowNotice(L('bin.docked'));
+  end
+  else
+    DockChanged(nil);
 end;
 
 procedure TMainForm.OnBtnDeleteClick(Sender: TObject);
@@ -5028,6 +5330,8 @@ begin
   {$ELSE}
   Permanent := False;
   {$ENDIF}
+  if IsRecycleBinPath(Panel.CurrentPath) then
+    Permanent := True;
   SetLength(Paths, Length(Entries));
   for I := 0 to High(Entries) do
     Paths[I] := Entries[I].FullPath;
@@ -5037,6 +5341,8 @@ begin
     procedure(Success: Boolean; const ErrorMsg: string)
     begin
       Panel.Refresh(FocusPath);
+      if (not Permanent) or IsRecycleBinPath(Panel.CurrentPath) then
+        RefreshAfterBin;
       if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         Panel.ShowNotice(ErrorMsg);
     end, Permanent);
@@ -5073,7 +5379,7 @@ var
   FocusedEntry: TFileEntry;
 begin
   if Assigned(FActivePanel) and FActivePanel.GetFocusedEntry(FocusedEntry) then
-    ShowQuickViewWindow(FocusedEntry.FullPath);
+    ShowQuickViewWindow(EntryViewPath(FocusedEntry));
 end;
 
 procedure TMainForm.OnBtnOpenClick(Sender: TObject);
@@ -5104,6 +5410,8 @@ procedure TMainForm.OnBtnRenameClick(Sender: TObject);
 begin
   if not Assigned(FActivePanel) then
     Exit;
+  if IsRecycleBinPath(FActivePanel.CurrentPath) then
+    Exit;
   if FActivePanel.HasMultiSelection then
     ShowMultiRename
   else
@@ -5118,6 +5426,11 @@ var
   I: Integer;
   Panel: TFilePanel;
 begin
+  if Assigned(FActivePanel) and IsRecycleBinPath(FActivePanel.CurrentPath) then
+  begin
+    FActivePanel.ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   if not Assigned(FActivePanel) or not FActivePanel.HasSelection then
   begin
     OpenBackgroundKind(okArchive);
@@ -5209,6 +5522,11 @@ end;
 
 procedure TMainForm.OnBtnSearchClick(Sender: TObject);
 begin
+  if Assigned(FActivePanel) and IsRecycleBinPath(FActivePanel.CurrentPath) then
+  begin
+    FActivePanel.ShowNotice(L('bin.nocopy'));
+    Exit;
+  end;
   ShowSearch;
 end;
 
