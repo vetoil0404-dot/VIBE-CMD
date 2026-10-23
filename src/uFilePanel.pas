@@ -4,19 +4,19 @@ interface
 
 uses
   {$IFDEF MSWINDOWS}
-  Winapi.Windows, Winapi.ShellAPI, Vcl.Graphics,
+  Winapi.Windows, Winapi.ShellAPI, Winapi.ActiveX, Vcl.Graphics,
   {$ENDIF}
   System.IOUtils, System.SysUtils, System.Classes, System.Types, System.UITypes,
   System.Generics.Collections, System.Math, System.Masks, System.StrUtils,
   System.Rtti, System.SyncObjs,
   FMX.Types, FMX.Controls, FMX.Forms, FMX.Objects, FMX.Layouts,
   FMX.StdCtrls, FMX.Graphics, FMX.Ani, FMX.Surfaces, FMX.Platform,
-  FMX.TextLayout, FMX.Effects,
+  FMX.TextLayout, FMX.Effects, FMX.ListBox,
   uFileModel, uThemeManager, uThumbCache, uIconCache, uMetaCache, uFolderSize,
   uAppSettings, UCoreEngine,
   uCustomScrollbar, uCustomTabs, uFluentChrome, uFluentEdit, uFilePreview,
   FileSelectionManager, uFileOps,
-  uDirWatcher, uDriveBar, uNetworkPanel, uLang, uLangBind
+  uDirWatcher, uDriveBar, uNetworkPanel, uNetworkVfs, uLang, uLangBind
   {$IFDEF MSWINDOWS}, uWinFileDrag, uWinShellMenu, uClipboardImage, FMX.Platform.Win{$ENDIF};
 
 procedure OpenFileWithDefaultApp(const APath: string);
@@ -84,6 +84,8 @@ type
     PendingSelect: string;
     PendingKeepSel: Boolean;
     Offline: Boolean;
+    WaitShared: Boolean;
+    KeepLive: Boolean;
   end;
 
   TFilePanel = class(TLayout, ISelectionAdapter)
@@ -95,6 +97,7 @@ type
     FDriveBar: TDriveBar;
     FNet: TNetworkSession;
     FNetBack: string;
+    FLogonHold: Boolean;
     FSettings: TAppSettings;
     FNetBar: TRectangle;
     FNetSubnet: TFluentEdit;
@@ -103,6 +106,17 @@ type
     FNetStop: TFluentButton;
     FNetHistMenu: TFluentPopupMenu;
     FNetHistPath: string;
+    FNetActPath: string;
+    FNetActAddr: string;
+    FNetActAlso: string;
+    FNetActIp: string;
+    FNetActName: string;
+    FNetActMac: string;
+    FNetActUnc: string;
+    FNetActPage: string;
+    FNetActDock: string;
+    FNetActLetter: string;
+    FNetActRestore: Boolean;
     FPendingNetHistMenu: Boolean;
     FTopBar: TRectangle;
     FBtnBack: TFluentButton;
@@ -182,6 +196,7 @@ type
     FRetryBtn: TFluentButton;
     FParentRetryRect: TRectF;
     FRefreshPending: Boolean;
+    FKeepLiveNext: Boolean;
     FPendingCursorIndex: Integer;
     FPendingRenamePath: string;
     FHistoryClearSel: Boolean;
@@ -237,6 +252,7 @@ type
     FColNetMode: Integer;
     FColIpW: Single;
     FColNetKindW: Single;
+    FColMacW: Single;
     FColShareW: Single;
     FColDateMode: TDateColMode;
     FColMeasure: TTextLayout;
@@ -387,7 +403,8 @@ type
     function FormatRowDate(const AEntry: TFileEntry): string;
     procedure DrawTrimmedText(Canvas: TCanvas; const ARect: TRectF;
       const AText: string; AColor: TAlphaColor; AOpacity: Single;
-      AAlign: TTextAlign; ASize: Single);
+      AAlign: TTextAlign; ASize: Single;
+      ATrim: TTextTrimming = TTextTrimming.Word);
     procedure ScrollBoxResize(Sender: TObject);
     procedure ScrollBoxApplyStyle(Sender: TObject);
     procedure ScrollBoxViewportPositionChange(Sender: TObject; const OldViewportPosition, NewViewportPosition: TPointF; const ContentSizeChanged: Boolean);
@@ -431,9 +448,33 @@ type
     procedure NoteOpenedUnc(const APath: string);
     function NetEntryAt(AVisual: Integer; out AEntry: TFileEntry): Boolean;
     function NetHeadRow(AVisual: Integer): Boolean;
+    function NetRecentHead(AVisual: Integer): Boolean;
     function NetRecentVisual(AVisual: Integer): Boolean;
-    procedure ShowNetRecentMenu(AVisual: Integer);
+    procedure ShowNetClearMenu;
+    function ClassifyNetRow(const AEntry: TFileEntry): Integer;
+    function ShowNetObjectMenu(AVisual: Integer): Boolean;
+    function OpenBareRouter(const AEntry: TFileEntry): Boolean;
+    function AskMapLetter(out ALetter: string; out ARestore: Boolean): Boolean;
+    procedure StartNetJob(AKind: Integer);
+    procedure CopyNetText(const AText: string);
+    procedure NetOpenClick(Sender: TObject);
+    procedure NetOpenUncClick(Sender: TObject);
+    procedure NetPingClick(Sender: TObject);
+    procedure NetCopyIpClick(Sender: TObject);
+    procedure NetCopyNameClick(Sender: TObject);
+    procedure NetCopyMacClick(Sender: TObject);
+    procedure NetCopyPathClick(Sender: TObject);
+    procedure NetDockClick(Sender: TObject);
+    procedure NetMapClick(Sender: TObject);
+    procedure NetUnmapClick(Sender: TObject);
+    procedure NetPageClick(Sender: TObject);
+    procedure NetPrnAddClick(Sender: TObject);
+    procedure NetPrnQueueClick(Sender: TObject);
+    procedure NetPrnDefaultClick(Sender: TObject);
+    procedure NetPrnRemoveClick(Sender: TObject);
     procedure NetHistForgetClick(Sender: TObject);
+    procedure NetHistClearClick(Sender: TObject);
+    procedure ApplyNetHint(AVisual: Integer);
     function NetSkipDrag(AVisual: Integer): Boolean;
     function NetColKind: Integer;
     procedure OpenHomeFolder(const APath: string);
@@ -538,16 +579,23 @@ type
       ASelPaths: TStringList; const AFocus: string; APartial: Boolean = False);
     procedure SetTabOffline(AIndex: Integer; const AMsg: string);
     procedure StopRemoteLoad(AIndex: Integer);
+    procedure HoldInactiveRemote(AIndex: Integer);
     procedure NoteRemoteProgress(AIndex: Integer; ACount: Integer);
     procedure AppendRemoteChunk(AIndex: Integer; ASlice: uFileModel.TFileEntryList;
-      ADone: Boolean);
+      ADone: Boolean; AShare: Boolean = True);
+    procedure SharePathChunk(AOwnerIndex: Integer; const APath: string;
+      ASlice: uFileModel.TFileEntryList; ADone: Boolean; const AError: string);
+    procedure AcceptSharedChunk(AOwner: TFilePanel; AOwnerIndex: Integer;
+      const APath: string; ASlice: uFileModel.TFileEntryList; ADone: Boolean;
+      const AError: string);
+    procedure SeedSharedRead(ATabIndex: Integer; const APath: string);
     procedure ResumeRemoteRead;
     function IndexOfLoadGen(AGen: Integer; const APath: string): Integer;
     function HitParentRetry(const ALocal: TPointF): Boolean;
     procedure ParentRemoteBits(out AStatus, ARetry: string; out AShowRetry: Boolean);
     procedure NetPulseTick(Sender: TObject);
     procedure ApplyNetPulse(ATabIndex: Integer; const APath: string;
-      AWasOff, AOk: Boolean);
+      AWasOff, AOk: Boolean; ACode: DWORD);
     function WantRemoteThumbs: Boolean;
     procedure ProbeArchiveEnter(const APath, ASelectPath: string);
     procedure FinishArchiveEnter(AGen, ATab: Integer; const AFrom, APath, ASelect: string;
@@ -600,7 +648,7 @@ type
     procedure InvalidateFolderSizes;
     function PreviewEditKey(var Key: Word; Shift: TShiftState): Boolean;
     procedure InvalidateView;
-    procedure AddTab(const APath: string = '');
+    procedure AddTab(const APath: string = ''; const ASelectPath: string = '');
     procedure CloseCurrentTab;
     procedure SetViewMode(AMode: TPanelViewMode);
     procedure ApplyTheme(const AColors: TThemeColors);
@@ -625,6 +673,7 @@ type
     function CanHistoryForward: Boolean;
     procedure PanelonResize(Sender: TObject);
     procedure DeselectByPath(const APath: string);
+    procedure ApplyLiveOp(const AInfo: TLiveOpInfo);
     function TryForgetNetworkRecent: Boolean;
 
     function SelectedEntry: TFileEntry;
@@ -661,6 +710,8 @@ type
     procedure CancelPendingIO;
     procedure RestoreTabs(const AState: TSideState);
     procedure LoadActiveTab;
+    { Снять отложенную загрузку вкладок, не перечитывая текущую. }
+    procedure ReleaseDeferredLoad;
     function LoadNextStaleTab: Boolean;
     procedure EnableDirWatch;
     procedure StartDeferredDrives;
@@ -718,6 +769,34 @@ var
   GFileDrag: TInAppFileDrag;
   GFileDragDropHook: TFileDragDropHook;
   GFilePanels: TList<TFilePanel>;
+  GHomeShellIcons: TDictionary<string, FMX.Graphics.TBitmap>;
+
+function HomeShellIcon(const APath: string): FMX.Graphics.TBitmap;
+var
+  Key: string;
+  Pixels: TBytes;
+  W, H: Integer;
+begin
+  Result := nil;
+  if APath = '' then
+    Exit;
+  Key := AnsiLowerCase(ExcludeTrailingPathDelimiter(APath));
+  if Key = '' then
+    Key := AnsiLowerCase(APath);
+  if GHomeShellIcons = nil then
+    GHomeShellIcons := TDictionary<string, FMX.Graphics.TBitmap>.Create;
+  if GHomeShellIcons.TryGetValue(Key, Result) then
+    Exit;
+  Result := nil;
+  { Тот же источник, что у иконок дока: desktop.ini, затем shell. }
+  if not ExtractDockJumboRaw(APath, True, Pixels, W, H) then
+    Exit;
+  RawToFmxBitmap(Pixels, W, H, Result);
+  if Assigned(Result) and (Result.Width > 0) then
+    GHomeShellIcons.Add(Key, Result)
+  else
+    FreeAndNil(Result);
+end;
 
 const
   cThumbKeyIdle = #0;
@@ -729,7 +808,27 @@ type
     TabIdx: Integer;
     WasOff: Boolean;
     Ok: Boolean;
+    Code: DWORD;
     procedure Apply;
+  end;
+
+  TNetUiJob = class
+    Panel: TFilePanel;
+    Kind: Integer;
+    Unc: string;
+    Letter: string;
+    Addr: string;
+    Also: string;
+    Restore: Boolean;
+    Ok: Boolean;
+    Already: Boolean;
+    Err: string;
+    Code: DWORD;
+    Asked: Boolean;
+    procedure AskLogon;
+    procedure Run;
+    procedure Finish;
+    procedure Start;
   end;
 
   TShotSaveJob = class
@@ -1703,7 +1802,7 @@ begin
   FBtnHome.Align := TAlignLayout.Left;
   FBtnHome.Width := 28;
   FBtnHome.Margins.Rect := TRectF.Create(0, 1, 2, 1);
-  TrHint(FBtnHome, 'panel.hint.drives');
+  TrHint(FBtnHome, 'panel.hint.home');
   FBtnHome.Visible := False;
   FBtnHome.ApplyTheme(FColors);
   StyleHomeGlyph;
@@ -2125,17 +2224,35 @@ begin
     Result := ARoot;
 end;
 
+function PanelWindow(APanel: TFilePanel): NativeUInt;
+var
+  Root: TFmxObject;
+begin
+  Result := 0;
+  if APanel = nil then
+    Exit;
+  Root := APanel;
+  while (Root <> nil) and not (Root is TCommonCustomForm) do
+    Root := Root.Parent;
+  {$IFDEF MSWINDOWS}
+  if Root is TCommonCustomForm then
+    Result := NativeUInt(FormToHWND(TCommonCustomForm(Root)));
+  {$ENDIF}
+end;
+
 procedure TFilePanel.EnsureNetSession;
 begin
-  if FNet <> nil then
-    Exit;
-  FNet := TNetworkSession.Create;
-  FNet.OnChange := NetSessionChanged;
-  FNet.OnPrefs := NetPrefsChanged;
-  if FSettings <> nil then
-    FNet.LoadPrefs(FSettings.NetworkLastSubnet, FSettings.NetworkHistory);
-  if Assigned(FNetSubnet) and (FNetSubnet.Text = '') then
-    FNetSubnet.Text := FNet.ResolvedSubnet;
+  if FNet = nil then
+  begin
+    FNet := TNetworkSession.Create;
+    FNet.OnChange := NetSessionChanged;
+    FNet.OnPrefs := NetPrefsChanged;
+    if FSettings <> nil then
+      FNet.LoadPrefs(FSettings.NetworkLastSubnet, FSettings.NetworkHistory);
+    if Assigned(FNetSubnet) and (FNetSubnet.Text = '') then
+      FNetSubnet.Text := FNet.ResolvedSubnet;
+  end;
+  FNet.SetOwnerWindow(PanelWindow(Self));
 end;
 
 procedure TFilePanel.ShowNetBar(AOn: Boolean);
@@ -2254,6 +2371,13 @@ begin
   Result := NetEntryAt(AVisual, E) and SameText(E.IconKey, '#nethead');
 end;
 
+function TFilePanel.NetRecentHead(AVisual: Integer): Boolean;
+var
+  E: TFileEntry;
+begin
+  Result := NetEntryAt(AVisual, E) and SameText(E.FullPath, 'nethead://recent');
+end;
+
 function TFilePanel.NetRecentVisual(AVisual: Integer): Boolean;
 var
   E: TFileEntry;
@@ -2262,33 +2386,74 @@ begin
     NetEntryAt(AVisual, E) and FNet.IsRecentRow(E.FullPath);
 end;
 
-procedure TFilePanel.ShowNetRecentMenu(AVisual: Integer);
-var
-  E: TFileEntry;
+procedure TFilePanel.ShowNetClearMenu;
 begin
-  if not NetRecentVisual(AVisual) or not NetEntryAt(AVisual, E) then
-    Exit;
-  if Assigned(FSelectionManager) and (FSelectionManager.CurrentIndex <> AVisual) then
-  begin
-    FSelectionManager.CurrentIndex := AVisual;
-    NotifyCursorChange;
-  end;
-  FNetHistPath := E.FullPath;
   if FNetHistMenu = nil then
   begin
     FNetHistMenu := TFluentPopupMenu.Create(Self);
     FNetHistMenu.Parent := Self;
   end;
   FNetHistMenu.ClearItems;
-  FNetHistMenu.AddItem(L('panel.net.forget'), '', NetHistForgetClick);
+  FNetHistMenu.AddItem(L('panel.net.clear'), '', NetHistClearClick);
   FNetHistMenu.ApplyTheme(FColors);
   FNetHistMenu.PopupAtCursor;
 end;
 
 procedure TFilePanel.NetHistForgetClick(Sender: TObject);
+var
+  Sel: TArray<TFileEntry>;
+  I: Integer;
+  InSel: Boolean;
 begin
-  if (FNet <> nil) and (FNetHistPath <> '') then
+  if (FNet = nil) or (FNetHistPath = '') then
+    Exit;
+  InSel := False;
+  Sel := SelectedEntries;
+  for I := 0 to High(Sel) do
+    if SameText(Sel[I].FullPath, FNetHistPath) and
+       FNet.IsRecentRow(Sel[I].FullPath) then
+    begin
+      InSel := True;
+      Break;
+    end;
+  if InSel then
+    TryForgetNetworkRecent
+  else
     FNet.Forget(FNetHistPath);
+end;
+
+procedure TFilePanel.NetHistClearClick(Sender: TObject);
+begin
+  if FNet <> nil then
+    FNet.ClearHistory;
+end;
+
+procedure TFilePanel.ApplyNetHint(AVisual: Integer);
+var
+  E: TFileEntry;
+  Lines: string;
+  PB: TPaintBox;
+begin
+  PB := CurrentPaintBox;
+  if PB = nil then
+    Exit;
+  Lines := '';
+  if IsVibeNetworkPath(GetCurrentPathImpl) and NetEntryAt(AVisual, E) and
+     not SameText(E.IconKey, '#nethead') then
+  begin
+    Lines := E.DisplayName;
+    if E.DisplayType <> '' then
+      Lines := Lines + sLineBreak + E.DisplayType;
+    if E.DisplaySize <> '' then
+      Lines := Lines + sLineBreak + E.DisplaySize;
+    if E.DisplayDate <> '' then
+      Lines := Lines + sLineBreak + E.DisplayDate;
+    if (E.FullPath <> '') and not SameText(E.FullPath, E.DisplayName) then
+      Lines := Lines + sLineBreak + E.FullPath;
+  end;
+  if PB.Hint <> Lines then
+    PB.Hint := Lines;
+  PB.ShowHint := Lines <> '';
 end;
 
 function TFilePanel.TryForgetNetworkRecent: Boolean;
@@ -2317,6 +2482,7 @@ begin
     Exit;
   Result := SameText(E.IconKey, '#nethead') or SameText(E.IconKey, '#computer') or
     SameText(E.IconKey, '#router') or SameText(E.IconKey, '#ftp') or
+    (StartsText('#stock:', E.IconKey) and not IsUncPath(E.FullPath)) or
     StartsText('network://', E.FullPath) or StartsText('ftp://', E.FullPath) or
     StartsText('ftps://', E.FullPath) or StartsText('sftp://', E.FullPath) or
     StartsText('http://', E.FullPath) or StartsText('https://', E.FullPath);
@@ -2366,8 +2532,12 @@ begin
      NetEntryAt(FSelectionManager.CurrentIndex, Hit) then
     Saved := Hit.FullPath;
   Entries.Clear;
+  FNet.SetOwnerWindow(PanelWindow(Self));
   if IsVibeNetworkRoot(Path) then
-    FNet.FillRoot(Entries)
+  begin
+    FNet.TouchClassic;
+    FNet.FillRoot(Entries);
+  end
   else
     FNet.FillBrowse(Entries);
   Tab.Loaded := True;
@@ -2405,6 +2575,12 @@ begin
     FOnActivate(Self);
   if ARoot = '' then
     Exit;
+  if IsRemotePath(ARoot) and (not IsUncPath(ARoot)) and
+     (not NetworkDriveConnected(ARoot)) then
+  begin
+    ShowNotice(L('panel.link.lost'));
+    Exit;
+  end;
   if SameText(ARoot, '\\') or SameText(ARoot, 'Network') or SameText(ARoot, 'Сеть') or
      (StartsText('::{', ARoot) and SameText(ARoot, NetworkFolderPath)) then
   begin
@@ -2429,6 +2605,12 @@ begin
     FOnActivate(Self);
   if APath = '' then
     Exit;
+  if IsRemotePath(APath) and (not IsUncPath(APath)) and
+     (not NetworkDriveConnected(APath)) then
+  begin
+    ShowNotice(L('panel.link.lost'));
+    Exit;
+  end;
   if IsListablePath(APath) then
     Navigate(APath)
   else
@@ -2482,11 +2664,7 @@ function DriveHomeTitle(const AInfo: TDriveInfo): string;
 var
   Name: string;
 begin
-  if AInfo.Kind = dkNetHood then
-    Exit(L('drive.network'));
-  Name := Trim(AInfo.VolumeName);
-  if Name = '' then
-    Name := DriveKindCaption(AInfo.Kind);
+  Name := DrivePlaceName(AInfo);
   if AInfo.Letter <> '' then
     Result := AInfo.Letter + ' ' + Name
   else
@@ -2638,6 +2816,28 @@ begin
     if Assigned(Result) and (Result.Width > 0) then
       Exit;
     FreeAndNil(Result);
+  end;
+  if IsVibeNetworkRoot(APath) or SameText(APath, NetworkFolderPath) then
+  begin
+    GetFileIconBitmap(NetworkFolderPath, True, Result);
+    Exit;
+  end;
+  if IsRemotePath(APath) or IsUncPath(APath) then
+  begin
+    if IsDriveRoot(APath) then
+      GetNetworkDriveIconBitmap(Result, NetworkDriveConnected(APath))
+    else
+      GetNetworkFolderIconBitmap(Result);
+    Exit;
+  end;
+  { Windows 10: кэш типов сразу отдаёт обычную папку и запоминает её.
+    В доке те же папки читаются через ExtractDockJumboRaw. }
+  if (APath <> '') and (WindowsVersion < 11) then
+  begin
+    Result := HomeShellIcon(APath);
+    if Assigned(Result) and (Result.Width > 0) then
+      Exit;
+    Result := nil;
   end;
   if (APath = '') or not Assigned(GlobalIconCache) then
     Exit;
@@ -2901,6 +3101,8 @@ begin
     Row.HitTest := True;
     Row.Cursor := crHandPoint;
     Row.TagString := Info.Root;
+    Row.Hint := DrivePlaceHint(Info);
+    Row.ShowHint := Row.Hint <> '';
     Row.OnMouseUp := HomeRowMouseUp;
     Row.OnMouseEnter := HomeRowEnter;
     Row.OnMouseLeave := HomeRowLeave;
@@ -3539,24 +3741,67 @@ var
 begin
   if SameText(AEntry.IconKey, '#nethead') then
     Exit;
-  if SameText(AEntry.IconKey, '#computer') or SameText(AEntry.IconKey, '#router') or
-     SameText(AEntry.IconKey, '#ftp') then
+  Bmp := nil;
+  var StockId := 0;
+  if StartsText('#stock:', AEntry.IconKey) then
+    StockId := StrToIntDef(Copy(AEntry.IconKey, 8, 8), 0)
+  else if SameText(AEntry.IconKey, '#computer') then
+    StockId := 94
+  else if SameText(AEntry.IconKey, '#router') then
+    StockId := 103
+  else if SameText(AEntry.IconKey, '#ftp') then
+    StockId := 51;
+  if StockId > 0 then
+    Bmp := CachedStockIcon(StockId);
+  if (StockId > 0) and (not Assigned(Bmp) or (Bmp.Width <= 0)) then
+    Exit;
+  if StockId > 0 then
   begin
-    Canvas.Fill.Color := FColors.TextColor;
-    Canvas.Font.Family := 'Segoe MDL2 Assets';
-    Canvas.Font.Size := Max(10, ARect.Height * 0.72);
-    if SameText(AEntry.IconKey, '#router') then
-      Canvas.FillText(ARect, #$E968, False, AOpacity, [], TTextAlign.Center,
-        TTextAlign.Center)
-    else if SameText(AEntry.IconKey, '#ftp') then
-      Canvas.FillText(ARect, #$E774, False, AOpacity, [], TTextAlign.Center,
-        TTextAlign.Center)
-    else
-      Canvas.FillText(ARect, #$E7F8, False, AOpacity, [], TTextAlign.Center,
-        TTextAlign.Center);
+    SrcW := Bmp.Width;
+    SrcH := Bmp.Height;
+    Fit := Min(ARect.Width / SrcW, ARect.Height / SrcH);
+    if Fit > 1 then
+      Fit := 1;
+    Dw := SrcW * Fit;
+    Dh := SrcH * Fit;
+    Dest := TRectF.Create(
+      ARect.Left + (ARect.Width - Dw) / 2,
+      ARect.Top + (ARect.Height - Dh) / 2,
+      ARect.Left + (ARect.Width - Dw) / 2 + Dw,
+      ARect.Top + (ARect.Height - Dh) / 2 + Dh);
+    Canvas.DrawBitmap(Bmp, Bmp.Bounds, Dest, AOpacity, False);
     Exit;
   end;
-  Bmp := nil;
+  if StartsText('#shell:', AEntry.IconKey) then
+  begin
+    Target := Max(1, Round(Min(ARect.Width, ARect.Height)));
+    Bucket := SelectIconBucket(Target);
+    if Assigned(GlobalIconCache) then
+      Bmp := GlobalIconCache.GetForPaint(AEntry, Bucket, IconSceneScale);
+    if not Assigned(Bmp) or (Bmp.Width <= 0) then
+    begin
+      StockId := StrToIntDef(Copy(AEntry.IconKey, 8, 6), 17);
+      if StockId <= 0 then
+        StockId := 17;
+      Bmp := CachedStockIcon(StockId);
+    end;
+    if not Assigned(Bmp) or (Bmp.Width <= 0) then
+      Exit;
+    SrcW := Bmp.Width;
+    SrcH := Bmp.Height;
+    Fit := Min(ARect.Width / SrcW, ARect.Height / SrcH);
+    if Fit > 1 then
+      Fit := 1;
+    Dw := SrcW * Fit;
+    Dh := SrcH * Fit;
+    Dest := TRectF.Create(
+      ARect.Left + (ARect.Width - Dw) / 2,
+      ARect.Top + (ARect.Height - Dh) / 2,
+      ARect.Left + (ARect.Width - Dw) / 2 + Dw,
+      ARect.Top + (ARect.Height - Dh) / 2 + Dh);
+    Canvas.DrawBitmap(Bmp, Bmp.Bounds, Dest, AOpacity, False);
+    Exit;
+  end;
   Target := Max(1, Round(Min(ARect.Width, ARect.Height)));
   Bucket := SelectIconBucket(Target);
   if Assigned(GlobalIconCache) then
@@ -3759,7 +4004,8 @@ begin
     if FColNetMode = 1 then
     begin
       TypeCap := 'IP';
-      SizeCap := L('panel.col.type');
+      SizeCap := L('net.col.vendor');
+      DateCap := L('net.col.mac');
     end;
     if (ViewMode = vmDetails) and FColTwoLine then
     begin
@@ -3874,10 +4120,23 @@ var
   SelectedIndicesRef: TList<Integer>;
   RealIdx: Integer;
 begin
+  if Assigned(FDriveBar) and Assigned(FNet) then
+    FDriveBar.SetNetworkLine(FNet.TileLine);
   if IsVibeNetworkPath(GetCurrentPathImpl) and Assigned(FNet) and Assigned(FStatusText) then
   begin
     FStatusText.Text := FNet.StatusText(GetCurrentPathImpl);
+    FStatusText.WordWrap := False;
+    FStatusText.TextSettings.Trimming := TTextTrimming.Word;
+    FStatusText.Hint := FStatusText.Text;
+    FStatusText.ShowHint := FStatusText.Text <> '';
+    FStatusText.HitTest := FStatusText.ShowHint;
     Exit;
+  end;
+  if Assigned(FStatusText) and FStatusText.ShowHint then
+  begin
+    FStatusText.Hint := '';
+    FStatusText.ShowHint := False;
+    FStatusText.HitTest := False;
   end;
   if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) then
   begin
@@ -4524,8 +4783,9 @@ begin
     Max(MeasureColText(L('net.share'), Fs), MeasureColText(L('net.node'), Fs)) + FColPad);
   FColIpW := Keep(FColIpW, MeasureColText('255.255.255.255', Fs) + FColPad);
   FColNetKindW := Keep(FColNetKindW,
-    Max(Max(MeasureColText('SMB · FTP · Web', Fs), MeasureColText(L('panel.col.type'), Fs)),
+    Max(Max(MeasureColText('Raspberry Pi · SMB', Fs), MeasureColText(L('net.col.vendor'), Fs)),
       MeasureColText(L('net.share'), Fs)) + FColPad);
+  FColMacW := Keep(FColMacW, MeasureColText('AA-BB-CC-DD-EE-FF', Fs) + FColPad);
   FColSizeW := Keep(FColSizeW,
     Max(MeasureColText(L('panel.col.size'), Fs), MeasureColText('999.99 Gb', Fs)) + FColPad);
   FColThisPCSizeW := Keep(FColThisPCSizeW,
@@ -4594,8 +4854,12 @@ begin
   FColShowSize := True;
   if NetMode = 1 then
   begin
-    FColDateMode := dcmHidden;
-    FColTwoLine := False;
+    { IP стоит в колонке типа. Узкое имя уходит на вторую строку вместе с MAC. }
+    FColDateMode := dcmFull;
+    Need := Max(80, Round(FColMinName * 0.42));
+    if WasTwo then
+      Need := Need + TwoLineHyst;
+    FColTwoLine := NameRoom(FColMacW, True) - (FColIpW - FColTypeW) < Need;
     Exit;
   end;
   if NetMode = 2 then
@@ -4637,6 +4901,8 @@ end;
 function TFilePanel.FormatRowDate(const AEntry: TFileEntry): string;
 begin
   Result := '';
+  if FColNetMode = 1 then
+    Exit(AEntry.DisplayDate);
   if AEntry.Modified <= 0 then
     Exit;
   case FColDateMode of
@@ -4650,7 +4916,7 @@ end;
 
 procedure TFilePanel.DrawTrimmedText(Canvas: TCanvas; const ARect: TRectF;
   const AText: string; AColor: TAlphaColor; AOpacity: Single;
-  AAlign: TTextAlign; ASize: Single);
+  AAlign: TTextAlign; ASize: Single; ATrim: TTextTrimming);
 begin
   if (AText = '') or (ARect.Width < 4) or (ARect.Height < 4) then
     Exit;
@@ -4671,7 +4937,7 @@ begin
     FNameLayout.Font.Style := [];
     FNameLayout.Color := AColor;
     FNameLayout.WordWrap := False;
-    FNameLayout.Trimming := TTextTrimming.Character;
+    FNameLayout.Trimming := ATrim;
     FNameLayout.HorizontalAlign := AAlign;
     FNameLayout.VerticalAlign := TTextAlign.Center;
     FNameLayout.TopLeft := ARect.TopLeft;
@@ -4737,12 +5003,15 @@ begin
     DateL := DateR
   else
   begin
-    case FColDateMode of
-      dcmMed: DateW := FColDateMedW;
-      dcmShort: DateW := FColDateShortW;
+    if FColNetMode = 1 then
+      DateW := FColMacW
     else
-      DateW := FColDateFullW;
-    end;
+      case FColDateMode of
+        dcmMed: DateW := FColDateMedW;
+        dcmShort: DateW := FColDateShortW;
+      else
+        DateW := FColDateFullW;
+      end;
     DateL := DateR - DateW;
   end;
 
@@ -4815,7 +5084,8 @@ var
   Parts: Single;
 begin
   RecalcColLayout(AContentWidth);
-  if (ViewMode <> vmDetails) or not FColTwoLine then
+  { В корне сети колонки IP / производитель / MAC остаются на своих местах. }
+  if (ViewMode <> vmDetails) or not FColTwoLine or (FColNetMode = 1) then
   begin
     GetColumnBounds(AContentWidth, NameL, NameR, TypeL, TypeR, SizeL, SizeR,
       DateL, DateR);
@@ -5349,7 +5619,8 @@ var
     Dir := GetCurrentPathImpl;
     if IsSearchView or IsOffline or IsThisPCPath(Dir) or IsVirtualShellPath(Dir) or
        IsPortableDevicePath(Dir) or IsDeviceNamespacePath(Dir) or
-       SplitArchivePath(Dir, Arc, Inner) or (not TDirectory.Exists(Dir)) then
+       SplitArchivePath(Dir, Arc, Inner) or
+       ((not UiSkipNetworkTouch(Dir)) and (not TDirectory.Exists(Dir))) then
     begin
       ShowNotice(L('panel.paste.nowhere'));
       Exit;
@@ -5516,7 +5787,7 @@ var
 begin
   Target := APath;
   if Trim(Target) = '' then
-    Target := ExtractFileDrive(ParamStr(0)) + '\';
+    Target := DefaultStartupDrive;
   if (Target = '') or (Target = '\') then
     Target := 'C:\';
 
@@ -5615,6 +5886,8 @@ begin
   Tab.AutoRetryUsed := False;
   Tab.LoadSeen := 0;
   Tab.LoadSeenWatch := 0;
+  Tab.WaitShared := False;
+  Tab.KeepLive := False;
 
   FTabs.Add(Tab);
 
@@ -5629,7 +5902,7 @@ begin
   CustomScrollbar.UpdateThumb;
 end;
 
-procedure TFilePanel.AddTab(const APath: string);
+procedure TFilePanel.AddTab(const APath: string; const ASelectPath: string);
 var
   P: string;
 begin
@@ -5646,7 +5919,7 @@ begin
     P := 'C:\';
 
   DoAddTab(P, True);
-  Navigate(P);
+  Navigate(P, ASelectPath);
 end;
 
 procedure TFilePanel.CloseCurrentTab;
@@ -5698,6 +5971,8 @@ begin
     Exit;
   end;
   NeedLoad := (not Tab.Loaded) or Tab.Stale or not Assigned(Tab.Entries);
+  if IsRemotePath(Tab.Path) and (Tab.Offline or Tab.Partial) and Tab.Loaded then
+    NeedLoad := False;
   if NeedLoad then
   begin
     Tab.Stale := False;
@@ -6335,6 +6610,7 @@ var
   Path: string;
 begin
   if FDestroying then Exit;
+  FLogonHold := False;
   if IsSearchView then
     Exit;
 
@@ -6628,8 +6904,9 @@ begin
   AnyRemote := False;
   for I := 0 to FTabs.Count - 1 do
   begin
-    Busy := FTabs[I].Loading and
-      (IsRemotePath(FTabs[I].Path) or IsRecycleBinPath(FTabs[I].Path));
+    Busy := (I = FActiveTabIndex) and FTabs[I].Loading and
+      (IsRemotePath(FTabs[I].Path) or UiSkipNetworkTouch(FTabs[I].Path) or
+       IsRecycleBinPath(FTabs[I].Path));
     if Assigned(FTabsBar) then
       FTabsBar.SetTabBusy(I, Busy);
     if Busy then
@@ -6679,30 +6956,22 @@ begin
     N := 0;
     if Assigned(Tab.Entries) then
       N := Tab.Entries.Count;
-    StopRemoteLoad(I);
-    Tab := FTabs[I];
     if N = 0 then
     begin
-      Tab.Partial := True;
+      Tab.Partial := False;
       Tab.Offline := True;
-      Tab.LoadError := '';
-      FTabs[I] := Tab;
-      if not Tab.AutoRetryUsed then
-      begin
-        Tab.AutoRetryUsed := True;
-        Tab.Partial := False;
-        Tab.Offline := False;
-        FTabs[I] := Tab;
-        StartDirLoadAt(I, Tab.Path, '', True);
-      end;
+      Tab.LoadError := L('panel.link.lost');
     end
     else
     begin
       Tab.Partial := True;
       Tab.Offline := False;
       Tab.LoadError := '';
-      FTabs[I] := Tab;
     end;
+    Tab.Loading := False;
+    Tab.LoadQueued := False;
+    Tab.RefreshPending := False;
+    FTabs[I] := Tab;
     Changed := True;
   end;
   if Changed then
@@ -6736,6 +7005,28 @@ begin
   T.FreeOnTerminate := True;
 end;
 
+procedure TFilePanel.HoldInactiveRemote(AIndex: Integer);
+var
+  Tab: TFileTab;
+begin
+  if (AIndex < 0) or (AIndex >= FTabs.Count) then
+    Exit;
+  if AIndex = FActiveTabIndex then
+    Exit;
+  Tab := FTabs[AIndex];
+  if not IsRemotePath(Tab.Path) then
+    Exit;
+  Tab.Loading := False;
+  Tab.LoadQueued := False;
+  Tab.RefreshPending := False;
+  Tab.AutoRetryUsed := True;
+  Tab.Loaded := True;
+  Tab.Stale := False;
+  Tab.PendingSelect := '';
+  Tab.PendingKeepSel := False;
+  FTabs[AIndex] := Tab;
+end;
+
 function TFilePanel.IndexOfLoadGen(AGen: Integer; const APath: string): Integer;
 var
   I: Integer;
@@ -6761,8 +7052,137 @@ begin
     UpdateLoadChrome;
 end;
 
+procedure TFilePanel.SharePathChunk(AOwnerIndex: Integer; const APath: string;
+  ASlice: uFileModel.TFileEntryList; ADone: Boolean; const AError: string);
+var
+  I: Integer;
+  P: TFilePanel;
+begin
+  if (GFilePanels = nil) or (APath = '') then
+    Exit;
+  for I := 0 to GFilePanels.Count - 1 do
+  begin
+    P := GFilePanels[I];
+    if (P = nil) or P.FDestroying then
+      Continue;
+    P.AcceptSharedChunk(Self, AOwnerIndex, APath, ASlice, ADone, AError);
+  end;
+end;
+
+procedure TFilePanel.AcceptSharedChunk(AOwner: TFilePanel; AOwnerIndex: Integer;
+  const APath: string; ASlice: uFileModel.TFileEntryList; ADone: Boolean;
+  const AError: string);
+var
+  I, N: Integer;
+  Tab: TFileTab;
+  CopyList: uFileModel.TFileEntryList;
+  E: TFileEntry;
+begin
+  if FDestroying or (APath = '') then
+    Exit;
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    if (AOwner = Self) and (I = AOwnerIndex) then
+      Continue;
+    if not SameDirHistoryPath(FTabs[I].Path, APath) then
+      Continue;
+    Tab := FTabs[I];
+    if not (Tab.WaitShared or Tab.Loading) then
+      Continue;
+    if AError <> '' then
+    begin
+      N := 0;
+      if Assigned(Tab.Entries) then
+        N := Tab.Entries.Count;
+      Tab.Loading := False;
+      Tab.LoadQueued := False;
+      Tab.WaitShared := False;
+      Tab.RefreshPending := False;
+      if NetLogonPlain(AError) = L('op.noaccess') then
+      begin
+        Tab.LoadError := L('op.noaccess');
+        Tab.Partial := True;
+        Tab.Offline := False;
+      end
+      else if N > 0 then
+      begin
+        Tab.Partial := True;
+        Tab.Offline := False;
+        Tab.LoadError := '';
+      end
+      else
+      begin
+        Tab.Partial := False;
+        Tab.Offline := True;
+        Tab.LoadError := L('panel.link.lost');
+      end;
+      FTabs[I] := Tab;
+      if I <> FActiveTabIndex then
+        HoldInactiveRemote(I);
+      if I = FActiveTabIndex then
+      begin
+        UpdateStatusText;
+        UpdateLoadChrome;
+      end;
+      Continue;
+    end;
+    CopyList := nil;
+    if Assigned(ASlice) and (ASlice.Count > 0) then
+    begin
+      CopyList := uFileModel.TFileEntryList.Create;
+      for E in ASlice do
+        CopyList.Add(E);
+    end
+    else if not ADone then
+      Continue;
+    Tab.WaitShared := False;
+    FTabs[I] := Tab;
+    AppendRemoteChunk(I, CopyList, ADone, False);
+  end;
+end;
+
+procedure TFilePanel.SeedSharedRead(ATabIndex: Integer; const APath: string);
+var
+  P: TFilePanel;
+  I: Integer;
+  Src, CopyList: uFileModel.TFileEntryList;
+  E: TFileEntry;
+begin
+  if FDestroying or (GFilePanels = nil) or (APath = '') then
+    Exit;
+  if (ATabIndex < 0) or (ATabIndex >= FTabs.Count) then
+    Exit;
+  Src := nil;
+  for P in GFilePanels do
+  begin
+    if (P = nil) or P.FDestroying or (P.FTabs = nil) then
+      Continue;
+    for I := 0 to P.FTabs.Count - 1 do
+    begin
+      if (P = Self) and (I = ATabIndex) then
+        Continue;
+      if not Assigned(P.FTabs[I].Entries) or (P.FTabs[I].Entries.Count = 0) then
+        Continue;
+      if SameDirHistoryPath(P.FTabs[I].Path, APath) or
+         SameDirHistoryPath(P.FTabs[I].LoadPath, APath) then
+      begin
+        Src := P.FTabs[I].Entries;
+        Break;
+      end;
+    end;
+    if Src <> nil then
+      Break;
+  end;
+  if Src = nil then
+    Exit;
+  CopyList := uFileModel.TFileEntryList.Create;
+  for E in Src do
+    CopyList.Add(E);
+  AppendRemoteChunk(ATabIndex, CopyList, False, False);
+end;
+
 procedure TFilePanel.AppendRemoteChunk(AIndex: Integer; ASlice: uFileModel.TFileEntryList;
-  ADone: Boolean);
+  ADone: Boolean; AShare: Boolean);
 var
   Tab: TFileTab;
   Seen: TDictionary<string, Boolean>;
@@ -6795,6 +7215,7 @@ begin
       finally
         Seen.Free;
       end;
+      Tab.Offline := False;
     end;
     Tab.Loaded := True;
     Tab.Stale := False;
@@ -6849,6 +7270,8 @@ begin
         UpdateLoadChrome;
       end;
     end;
+    if AShare then
+      SharePathChunk(AIndex, Tab.Path, ASlice, ADone, '');
   finally
     if Assigned(ASlice) then
       ASlice.Free;
@@ -6865,7 +7288,9 @@ begin
   Tab.Partial := False;
   Tab.Offline := False;
   Tab.LoadError := '';
+  Tab.AutoRetryUsed := False;
   FTabs[FActiveTabIndex] := Tab;
+  FLogonHold := False;
   CaptureSelection(FKeepSelPaths, FKeepSelFocus);
   StartDirLoadAt(FActiveTabIndex, Tab.Path, '', True);
 end;
@@ -6892,11 +7317,19 @@ begin
   if (N <= 0) and Assigned(Tab.Entries) then
     N := Tab.Entries.Count;
   if Tab.Loading then
-    AStatus := Format('%d…', [N])
-  else if Tab.Partial then
+  begin
+    if N <= 0 then
+      AStatus := L('panel.link.wait')
+    else
+      AStatus := Format('%d…', [N]);
+  end
+  else if Tab.Offline or Tab.Partial then
   begin
     AShowRetry := True;
-    if (not Assigned(Tab.Entries) or (Tab.Entries.Count = 0)) then
+    if (Tab.LoadError = L('op.noaccess')) and
+       (not Assigned(Tab.Entries) or (Tab.Entries.Count = 0)) then
+      AStatus := L('op.noaccess')
+    else if Tab.Offline or (not Assigned(Tab.Entries) or (Tab.Entries.Count = 0)) then
       AStatus := L('panel.link.none')
     else
       AStatus := L('panel.link.broke');
@@ -6962,15 +7395,10 @@ begin
   Job.WasOff := WasOff;
   TThread.CreateAnonymousThread(
     procedure
-    var
-      SR: TSearchRec;
-      RC: Integer;
     begin
-      RC := System.SysUtils.FindFirst(
-        System.IOUtils.TPath.Combine(Job.Path, '*.*'), faAnyFile, SR);
-      Job.Ok := RC = 0;
-      if Job.Ok then
-        System.SysUtils.FindClose(SR);
+      var Code: DWORD;
+      Job.Ok := ProbeDirectoryOpen(Job.Path, 2500, Code);
+      Job.Code := Code;
       TThread.Queue(nil, Job.Apply);
     end).Start;
 end;
@@ -6979,15 +7407,248 @@ procedure TNetPulseJob.Apply;
 begin
   try
     if Assigned(Panel) then
-      Panel.ApplyNetPulse(TabIdx, Path, WasOff, Ok);
+      Panel.ApplyNetPulse(TabIdx, Path, WasOff, Ok, Code);
   finally
     Free;
   end;
 end;
 
-procedure TFilePanel.ApplyNetPulse(ATabIndex: Integer; const APath: string;
-  AWasOff, AOk: Boolean);
+function NetDottedIp(const AHost: string): Boolean;
 var
+  P: TArray<string>;
+  I, N: Integer;
+begin
+  Result := False;
+  P := Trim(AHost).Split(['.']);
+  if Length(P) <> 4 then
+    Exit;
+  for I := 0 to High(P) do
+  begin
+    if P[I] = '' then
+      Exit;
+    N := StrToIntDef(P[I], -1);
+    if (N < 0) or (N > 255) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function NetLooksLikeMac(const S: string): Boolean;
+var
+  I, Dashes: Integer;
+  C: Char;
+begin
+  Result := Length(S) = 17;
+  if not Result then
+    Exit;
+  Dashes := 0;
+  for I := 1 to Length(S) do
+  begin
+    C := S[I];
+    if C = '-' then
+    begin
+      Inc(Dashes);
+      if (I mod 3) <> 0 then
+        Exit(False);
+    end
+    else if not CharInSet(C, ['0'..'9', 'A'..'F', 'a'..'f']) then
+      Exit(False);
+  end;
+  Result := Dashes = 5;
+end;
+
+function NetRowHost(const APath: string): string;
+var
+  S: string;
+  P: Integer;
+begin
+  Result := '';
+  if IsVibeNetworkPath(APath) then
+    Exit(VibeNetworkHost(APath));
+  if IsUncPath(APath) then
+  begin
+    S := ExcludeTrailingPathDelimiter(Trim(APath));
+    if Length(S) <= 2 then
+      Exit;
+    Delete(S, 1, 2);
+    P := Pos('\', S);
+    if P > 0 then
+      Result := Copy(S, 1, P - 1)
+    else
+      Result := S;
+    Exit;
+  end;
+  S := Trim(APath);
+  P := Pos('://', S);
+  if P <= 0 then
+    Exit;
+  Delete(S, 1, P + 2);
+  P := Pos('@', S);
+  if P > 0 then
+    Delete(S, 1, P);
+  P := Pos('/', S);
+  if P > 0 then
+    S := Copy(S, 1, P - 1);
+  P := Pos('\', S);
+  if P > 0 then
+    S := Copy(S, 1, P - 1);
+  if (S <> '') and (S[1] <> '[') then
+  begin
+    P := Pos(':', S);
+    if P > 0 then
+      S := Copy(S, 1, P - 1);
+  end;
+  Result := S;
+end;
+
+function NetShareLogonCode(ACode: DWORD): Boolean;
+begin
+  Result := False;
+  if ACode = ERROR_ACCESS_DENIED then
+    Exit(True);
+  if ACode = ERROR_LOGON_FAILURE then
+    Exit(True);
+  if ACode = ERROR_INVALID_PASSWORD then
+    Exit(True);
+  if ACode = ERROR_SESSION_CREDENTIAL_CONFLICT then
+    Exit(True);
+end;
+
+procedure TNetUiJob.AskLogon;
+begin
+  Asked := False;
+  if Panel = nil then
+    Exit;
+  if Panel.FDestroying then
+    Exit;
+  Asked := PromptShareLogon(PanelWindow(Panel), Unc, Code);
+end;
+
+procedure TNetUiJob.Run;
+var
+  Up: Boolean;
+  Target: string;
+  Hr: HResult;
+  Msg: TMsg;
+begin
+  Ok := False;
+  Already := False;
+  Code := 0;
+  Err := '';
+  Asked := False;
+  try
+    if Kind = 3 then
+    begin
+      Ok := True;
+      Target := Addr;
+      if not NetDottedIp(Target) and NetDottedIp(Also) then
+        Target := Also;
+      Up := ProbeHostAlive(Target);
+      if Up then
+        Err := 'up'
+      else
+        Err := 'down';
+    end
+    else if Kind = 1 then
+    begin
+      Ok := MapNetworkShare(Unc, Letter, Restore, Code);
+      if not Ok then
+        if NetShareLogonCode(Code) then
+        begin
+          TThread.Synchronize(nil, AskLogon);
+          if Asked then
+            Ok := MapNetworkShare(Unc, Letter, Restore, Code);
+        end;
+    end
+    else if Kind = 2 then
+      Ok := UnmapNetworkShare(Letter, Code)
+    else if (Kind = 4) or (Kind = 5) or (Kind = 6) then
+    begin
+      Hr := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+      try
+        PeekMessage(Msg, 0, 0, 0, PM_NOREMOVE);
+        if Kind = 4 then
+          Ok := ConnectPrinter(Unc, Already, Code)
+        else if Kind = 5 then
+          Ok := MakeDefaultPrinter(Unc, Code)
+        else
+          Ok := RemovePrinter(Unc, Code);
+      finally
+        if Hr = S_OK then
+          CoUninitialize;
+      end;
+    end;
+  finally
+    TThread.Queue(nil, Finish);
+  end;
+end;
+
+procedure TNetUiJob.Finish;
+begin
+  try
+    if Panel = nil then
+      Exit;
+    if Panel.FDestroying then
+      Exit;
+    if Kind = 3 then
+    begin
+      if Ok and (Panel.FNet <> nil) then
+        Panel.FNet.NotePing(Addr, Err, Also);
+    end
+    else if (Kind = 1) or (Kind = 2) then
+    begin
+      if Panel.FDriveBar <> nil then
+        Panel.FDriveBar.Rebuild;
+      if not Ok then
+      begin
+        if NetShareLogonCode(Code) and (not Asked) then
+          Panel.ShowNotice(L('op.noaccess'))
+        else if Code <> 0 then
+          Panel.ShowNotice(HumanNetError(SysErrorMessage(Code)))
+        else
+          Panel.ShowNotice(L('op.noaccess'));
+      end;
+    end
+    else if Kind = 4 then
+    begin
+      if Already then
+        Panel.ShowNotice(L('panel.net.prn.exists'))
+      else if not Ok then
+      begin
+        if Code <> 0 then
+          Panel.ShowNotice(HumanNetError(SysErrorMessage(Code)))
+        else
+          Panel.ShowNotice(L('op.noaccess'));
+      end;
+    end
+    else if (Kind = 5) or (Kind = 6) then
+    begin
+      if not Ok then
+      begin
+        if Code <> 0 then
+          Panel.ShowNotice(HumanNetError(SysErrorMessage(Code)))
+        else
+          Panel.ShowNotice(L('op.noaccess'));
+      end;
+    end;
+  finally
+    Free;
+  end;
+end;
+
+procedure TNetUiJob.Start;
+begin
+  TThread.CreateAnonymousThread(
+    procedure
+    begin
+      Run;
+    end).Start;
+end;
+
+procedure TFilePanel.ApplyNetPulse(ATabIndex: Integer; const APath: string;
+  AWasOff, AOk: Boolean; ACode: DWORD);
+var
+  I: Integer;
   T: TFileTab;
 begin
   FNetPulseBusy := False;
@@ -6996,18 +7657,50 @@ begin
   if not SameDirHistoryPath(FTabs[ATabIndex].Path, APath) then
     Exit;
   if AOk then
+    Exit;
+  if (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_LOGON_FAILURE) or
+     (ACode = ERROR_INVALID_PASSWORD) or
+     (ACode = ERROR_SESSION_CREDENTIAL_CONFLICT) or
+     (ACode = ERROR_NETWORK_ACCESS_DENIED) then
   begin
-    if AWasOff or FTabs[ATabIndex].Offline then
+    if not FTabs[ATabIndex].Offline then
     begin
       T := FTabs[ATabIndex];
-      T.Offline := False;
-      T.LoadError := '';
-      FTabs[ATabIndex] := T;
-      StartDirLoadAt(ATabIndex, APath, '', True);
+      if T.LoadError = '' then
+      begin
+        T.Partial := True;
+        T.Offline := False;
+        T.LoadError := L('op.noaccess');
+        FTabs[ATabIndex] := T;
+        if ATabIndex = FActiveTabIndex then
+          UpdateLoadChrome;
+      end;
     end;
-  end
-  else if not FTabs[ATabIndex].Offline then
+    Exit;
+  end;
+  if AWasOff then
+    { Связь вернулась: список не перечитываем. };
+  if not FTabs[ATabIndex].Offline then
     SetTabOffline(ATabIndex, L('panel.link.lost'));
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    if I = FActiveTabIndex then
+      Continue;
+    if not FTabs[I].Loading then
+      Continue;
+    if not (IsRemotePath(FTabs[I].Path) or UiSkipNetworkTouch(FTabs[I].Path)) then
+      Continue;
+    T := FTabs[I];
+    T.Loading := False;
+    T.LoadQueued := False;
+    T.Offline := True;
+    T.WaitShared := False;
+    if T.LoadError = '' then
+      T.LoadError := L('panel.link.lost');
+    FTabs[I] := T;
+    HoldInactiveRemote(I);
+  end;
+  UpdateLoadChrome;
 end;
 
 procedure TFilePanel.StartDirLoad(const APath, ASelectPath: string; AKeepSelection: Boolean);
@@ -7032,12 +7725,48 @@ begin
     Exit;
   Path := APath;
   Remote := IsRemotePath(Path);
+  if not Remote and UiSkipNetworkTouch(Path) then
+    Remote := True;
+  if Remote and (not IsUncPath(Path)) and (not NetworkDriveConnected(Path)) then
+  begin
+    SetTabOffline(ATabIndex, L('panel.link.lost'));
+    Exit;
+  end;
   Tab := FTabs[ATabIndex];
+  if Remote and PathReadBusy(Path) then
+  begin
+    Tab.Loading := ATabIndex = FActiveTabIndex;
+    Tab.WaitShared := True;
+    Tab.Offline := False;
+    Tab.LoadError := '';
+    Tab.LoadQueued := False;
+    FTabs[ATabIndex] := Tab;
+    SeedSharedRead(ATabIndex, Path);
+    if ATabIndex = FActiveTabIndex then
+      UpdateLoadChrome;
+    Exit;
+  end;
   if Tab.LoadThread <> nil then
   begin
     { Сверять с путём ПОТОКА, не Tab.Path: Navigate уже подменяет Path. }
     if SameDirHistoryPath(Tab.LoadPath, Path) then
     begin
+      if Remote then
+      begin
+        if ATabIndex = FActiveTabIndex then
+        begin
+          Tab.Loading := True;
+          Tab.WaitShared := False;
+          FTabs[ATabIndex] := Tab;
+          UpdateLoadChrome;
+        end;
+        Exit;
+      end;
+      if FKeepLiveNext then
+      begin
+        Tab.KeepLive := True;
+        FKeepLiveNext := False;
+      end;
       Tab.RefreshPending := True;
       if ASelectPath <> '' then
         Tab.PendingSelect := ASelectPath;
@@ -7050,9 +7779,12 @@ begin
   end;
   if (ActiveLoadCount >= 3) and (Tab.LoadThread = nil) then
   begin
+    Tab.KeepLive := Tab.KeepLive or FKeepLiveNext;
+    FKeepLiveNext := False;
     Tab.Loading := Remote or IsRecycleBinPath(Path);
     Tab.LoadQueued := True;
     Tab.LoadError := '';
+    Tab.Offline := False;
     FTabs[ATabIndex] := Tab;
     if Remote or IsRecycleBinPath(Path) then
       UpdateLoadChrome;
@@ -7067,6 +7799,10 @@ begin
   Tab.Loading := Remote or IsRecycleBinPath(Path);
   Tab.LoadQueued := False;
   Tab.LoadError := '';
+  Tab.Offline := False;
+  Tab.WaitShared := False;
+  Tab.KeepLive := Tab.KeepLive or FKeepLiveNext;
+  FKeepLiveNext := False;
   Tab.Partial := False;
   Tab.LoadTick := GetTickCount;
   if Assigned(Tab.Entries) then
@@ -7134,18 +7870,22 @@ begin
         Cur := FTabs[TabIdx];
         if (Cur.LoadGen <> Gen) or not SameDirHistoryPath(Cur.Path, Path) then
         begin
-          Cur.LoadThread := nil;
-          Cur.Loading := False;
-          FTabs[TabIdx] := Cur;
           if Assigned(List) then
             List.Free;
-          ContinueAfterLoad(TabIdx);
           Exit;
         end;
         if List = nil then
         begin
           Cur.LoadThread := nil;
           Cur.Loading := False;
+          if Remote and (TabIdx <> FActiveTabIndex) and (Cur.Offline or Cur.Partial) then
+          begin
+            FTabs[TabIdx] := Cur;
+            HoldInactiveRemote(TabIdx);
+            UpdateLoadChrome;
+            PumpLoadQueue;
+            Exit;
+          end;
           if Remote or IsRecycleBinPath(Path) then
           begin
             Cur.Partial := False;
@@ -7187,7 +7927,11 @@ begin
           Applied := True;
         end
         else
+        begin
+          if Remote then
+            SharePathChunk(TabIdx, Path, List, True, '');
           ApplyLoadedList(Path, List, ASelectPath, KeepSel, CapturedPaths, CapturedFocus, False);
+        end;
         Applied := True;
         if FWatchEnabled then
           WatchTab(TabIdx);
@@ -7248,16 +7992,39 @@ begin
       Cur.LoadThread := nil;
       Cur.Loading := False;
       Cur.LoadPath := '';
-      if (Cur.LoadGen = Gen) and SameDirHistoryPath(Cur.Path, Path) and Remote then
+      if (Cur.LoadGen = Gen) and SameDirHistoryPath(Cur.Path, Path) and
+         (Remote or IsRemotePath(Path)) then
       begin
         N := 0;
         if Assigned(Cur.Entries) then
           N := Cur.Entries.Count;
         Cur.Loading := False;
+        Cur.LoadQueued := False;
+        Cur.RefreshPending := False;
+        Cur.WaitShared := False;
         Cur.LoadError := '';
-        if AError = L('op.noaccess') then
+        if NetLogonPlain(AError) = L('op.noaccess') then
         begin
-          Cur.LoadError := AError;
+          var Code: Cardinal;
+          if (not FLogonHold) and (TabIdx = FActiveTabIndex) and IsUncPath(Path) and
+             NetLogonCodeOf(AError, Code) then
+          begin
+            FLogonHold := True;
+            if PromptShareLogon(PanelWindow(Self), Path, Code) then
+            begin
+              FTabs[TabIdx] := Cur;
+              StartDirLoadAt(TabIdx, Path, '', False);
+              if Assigned(FOnListReady) and not FListReadyFired then
+              begin
+                FListReadyFired := True;
+                FOnListReady(Self);
+              end;
+              UpdateLoadChrome;
+              ContinueAfterLoad(TabIdx);
+              Exit;
+            end;
+          end;
+          Cur.LoadError := L('op.noaccess');
           Cur.Partial := True;
           Cur.Offline := False;
         end
@@ -7268,22 +8035,14 @@ begin
         end
         else
         begin
-          Cur.Partial := True;
+          Cur.Partial := False;
           Cur.Offline := True;
-          if not Cur.AutoRetryUsed then
-          begin
-            Cur.AutoRetryUsed := True;
-            Cur.Partial := False;
-            Cur.Offline := False;
-            FTabs[TabIdx] := Cur;
-            StartDirLoadAt(TabIdx, Path, '', True);
-            if Remote then
-              UpdateLoadChrome;
-            ContinueAfterLoad(TabIdx);
-            Exit;
-          end;
+          Cur.LoadError := L('panel.link.lost');
         end;
         FTabs[TabIdx] := Cur;
+        if TabIdx <> FActiveTabIndex then
+          HoldInactiveRemote(TabIdx);
+        SharePathChunk(TabIdx, Path, nil, True, AError);
       end
       else if not Remote then
       begin
@@ -7338,8 +8097,27 @@ begin
     end
   );
   Tab := FTabs[ATabIndex];
+  if Remote and not TryClaimPathRead(Path, Thr) then
+  begin
+    TDirLoadThread(Thr).Discard := True;
+    CapturedPaths.Free;
+    Thr.Free;
+    Tab.LoadThread := nil;
+    Tab.LoadPath := '';
+    Tab.Loading := ATabIndex = FActiveTabIndex;
+    Tab.WaitShared := True;
+    Tab.Offline := False;
+    Tab.LoadError := '';
+    FTabs[ATabIndex] := Tab;
+    SeedSharedRead(ATabIndex, Path);
+    if ATabIndex = FActiveTabIndex then
+      UpdateLoadChrome;
+    Exit;
+  end;
   Tab.LoadThread := Thr;
   Tab.LoadPath := Path;
+  Tab.Offline := False;
+  Tab.WaitShared := False;
   FTabs[ATabIndex] := Tab;
   Thr.Start;
 end;
@@ -7403,6 +8181,40 @@ var
   EffectiveRight: Single;
   Entries: uFileModel.TFileEntryList;
   SelectedIndicesRef: TList<Integer>;
+
+  function RowIsHead(AVisual: Integer): Boolean;
+  var
+    Actual: Integer;
+  begin
+    Result := False;
+    if HasParent and (AVisual = 0) then
+      Exit;
+    if not Assigned(Entries) or not VisualToActual(AVisual, Actual) then
+      Exit;
+    if (Actual < 0) or (Actual >= Entries.Count) then
+      Exit;
+    Result := SameText(Entries[Actual].IconKey, '#nethead');
+  end;
+
+  procedure ForceHead(AVisual: Integer; var ASelected, ACursor: Boolean);
+  begin
+    if RowIsHead(AVisual) then
+    begin
+      ASelected := False;
+      ACursor := False;
+    end;
+  end;
+
+  procedure PaintHeadBand(const AR: TRectF; ARadius: Single; AVisual: Integer;
+    var AColor: TAlphaColor);
+  begin
+    if not RowIsHead(AVisual) then
+      Exit;
+    Canvas.Fill.Color := FColors.ItemHover;
+    Canvas.FillRect(AR, ARadius, ARadius, AllCorners, AbsoluteOpacity);
+    AColor := FColors.TextColor;
+  end;
+
 begin
   SB := CurrentScrollBox;
   if SB = nil then Exit;
@@ -7455,7 +8267,9 @@ begin
         R := TRectF.Create(6, I * RH + 1, EffectiveRight + 4, (I + 1) * RH - 2);
 
         var ItemTextColor: TAlphaColor;
+        ForceHead(I, IsSelected, IsCursor);
         PaintItemChrome(Canvas, R, 5, IsSelected, IsCursor, I, ItemTextColor);
+        PaintHeadBand(R, 5, I, ItemTextColor);
         Canvas.Fill.Color := ItemTextColor;
         Canvas.Font.Size := Fs;
 
@@ -7525,6 +8339,14 @@ begin
         var IconRect := TRectF.Create(R.Left + 14, IconTop, R.Left + 14 + DetailsIconSize, IconTop + DetailsIconSize);
         DrawEntryIcon(Canvas, Entry, IconRect, RowOp);
 
+        if SameText(Entry.IconKey, '#nethead') then
+        begin
+          DrawTrimmedText(Canvas, TRectF.Create(NameL, R.Top, EffectiveRight - 8, R.Bottom),
+            Entry.DisplayName, ItemTextColor, RowOp, TTextAlign.Leading, Fs,
+            TTextTrimming.None);
+          Continue;
+        end;
+
         if FColTwoLine then
         begin
           DrawTrimmedText(Canvas, TRectF.Create(NameL, R.Top, EffectiveRight - 8, R.Top + LineH),
@@ -7590,7 +8412,9 @@ begin
         R := TRectF.Create(X, Y, X + TS, Y + TS + TILE_TEXT_ZONE);
 
         var ItemTextColor: TAlphaColor;
+        ForceHead(I, IsSelected, IsCursor);
         PaintItemChrome(Canvas, R, 8, IsSelected, IsCursor, I, ItemTextColor);
+        PaintHeadBand(R, 8, I, ItemTextColor);
         Canvas.Fill.Color := ItemTextColor;
 
         if HasParent and (I = 0) then
@@ -7666,6 +8490,15 @@ begin
           DrawEntryIcon(Canvas, Entry, IconDrawRect, RowOp);
         end;
 
+        if SameText(Entry.IconKey, '#nethead') then
+        begin
+          DrawTrimmedText(Canvas,
+            TRectF.Create(R.Left + 6, R.Top + TS, R.Right - 6, R.Bottom - 4),
+            Entry.DisplayName, ItemTextColor, RowOp, TTextAlign.Leading, 12,
+            TTextTrimming.None);
+          Continue;
+        end;
+
         var ExtStr: string;
         if IsRecycleBinPath(GetCurrentPathImpl) then
           ExtStr := Entry.DisplayType
@@ -7676,7 +8509,8 @@ begin
 
         var ExtWidth := Canvas.TextWidth(ExtStr);
         var NameRect := TRectF.Create(R.Left + 6, R.Top + TS, R.Right - 6 - ExtWidth - 10, R.Top + TS + 20);
-        Canvas.FillText(NameRect, Entry.DisplayName, False, RowOp, [], TTextAlign.Leading, TTextAlign.Center);
+        DrawTrimmedText(Canvas, NameRect, Entry.DisplayName, ItemTextColor, RowOp,
+          TTextAlign.Leading, 12);
 
         var ExtRect := TRectF.Create(R.Right - 6 - ExtWidth, R.Top + TS, R.Right - 6, R.Top + TS + 20);
         Canvas.FillText(ExtRect, ExtStr, False, RowOp, [], TTextAlign.Trailing, TTextAlign.Center);
@@ -7687,7 +8521,8 @@ begin
           Canvas.Fill.Color := FColors.SubTextColor;
         var SizeStr := EntrySizeText(Entry);
         if FColNetMode = 1 then
-          SizeStr := Trim(Entry.DisplayType + '  ' + Entry.DisplaySize)
+          SizeStr := Trim(Entry.DisplayType + '  ' + Entry.DisplaySize + '  ' +
+            Entry.DisplayDate)
         else if (FColNetMode = 2) and (Entry.DisplayType <> '') then
           SizeStr := Entry.DisplayType
         else if (SizeStr = '') and Entry.IsDirectory then
@@ -7708,7 +8543,8 @@ begin
         if ExtraStr <> '' then
           ExtraW := Canvas.TextWidth(ExtraStr) + 8;
         var Line2Rect := TRectF.Create(R.Left + 6, R.Top + TS + 20, R.Right - 6 - ExtraW, R.Bottom - 4);
-        Canvas.FillText(Line2Rect, SizeStr, False, RowOp, [], TTextAlign.Leading, TTextAlign.Center);
+        DrawTrimmedText(Canvas, Line2Rect, SizeStr, Canvas.Fill.Color, RowOp,
+          TTextAlign.Leading, 12);
         if ExtraStr <> '' then
         begin
           var ExtraRect := TRectF.Create(R.Right - 6 - ExtraW + 4, R.Top + TS + 20, R.Right - 6, R.Bottom - 4);
@@ -7777,7 +8613,11 @@ begin
 
   ClickedIdx := GetIndexAt(X, Y);
   if NetHeadRow(ClickedIdx) then
+  begin
+    if (Button = TMouseButton.mbRight) and NetRecentHead(ClickedIdx) then
+      ShowNetClearMenu;
     Exit;
+  end;
   TotalCount := VisualCount;
 
   if (Button = TMouseButton.mbLeft) and HasParentDirectory and (ClickedIdx = 0) and
@@ -7857,7 +8697,17 @@ begin
       FDragReady := False;
       ClearLeftGesture;
       FSelectionManager.CancelDrag;
-      if NetRecentVisual(ClickedIdx) then
+      var NetMenu := False;
+      if IsVibeNetworkPath(GetCurrentPathImpl) then
+      begin
+        var NetHit: TFileEntry;
+        if NetRecentVisual(ClickedIdx) then
+          NetMenu := True
+        else if NetEntryAt(ClickedIdx, NetHit) then
+          if ClassifyNetRow(NetHit) <> 0 then
+            NetMenu := True;
+      end;
+      if NetMenu then
       begin
         FPendingRightSelect := False;
         FPendingExplorerMenu := False;
@@ -8059,10 +8909,12 @@ begin
   end
   else if (ssLeft in Shift) or (ssRight in Shift) then
     UpdateStatusText;
+  ApplyNetHint(ClickedIdx);
 end;
 
 procedure TFilePanel.PaintBoxMouseLeave(Sender: TObject);
 begin
+  ApplyNetHint(-1);
   if FHoverIndex <> -1 then
   begin
     FHoverIndex := -1;
@@ -8094,7 +8946,7 @@ begin
       {$IFDEF MSWINDOWS}
       ReleaseCapture;
       {$ENDIF}
-      ShowNetRecentMenu(FLongClickIdx);
+      ShowNetObjectMenu(FLongClickIdx);
     end
     else if FExplorerMouse and FPendingExplorerMenu then
     begin
@@ -8677,24 +9529,9 @@ begin
     Exit;
   if NetHeadRow(AVisualIdx) then
     Exit;
-  if NetRecentVisual(AVisualIdx) then
-  begin
-    ShowNetRecentMenu(AVisualIdx);
-    Exit;
-  end;
   if IsVibeNetworkPath(GetCurrentPathImpl) then
   begin
-    var NetHit: TFileEntry;
-    if NetEntryAt(AVisualIdx, NetHit) and
-       (SameText(NetHit.IconKey, '#computer') or
-        SameText(NetHit.IconKey, '#router') or
-        SameText(NetHit.IconKey, '#ftp') or
-        StartsText('network://', NetHit.FullPath) or
-        StartsText('ftp://', NetHit.FullPath) or
-        StartsText('ftps://', NetHit.FullPath) or
-        StartsText('sftp://', NetHit.FullPath) or
-        StartsText('http://', NetHit.FullPath) or
-        StartsText('https://', NetHit.FullPath)) then
+    if ShowNetObjectMenu(AVisualIdx) then
       Exit;
   end;
   if HasParentDirectory and (AVisualIdx = 0) then
@@ -9039,11 +9876,20 @@ begin
   try
     NewName := Trim(FRenameEdit.Text);
     FRenameEdit.Visible := False;
+    { SameStr: Name.txt и name.txt — разные имена, регистр надо записать. }
     if AApply and (FRenamePath <> '') and (NewName <> '') and
-       not SameText(NewName, ExtractFileName(FRenamePath)) then
+       not SameStr(NewName, ExtractFileName(ExcludeTrailingPathDelimiter(FRenamePath))) then
     begin
       if RenamePath(FRenamePath, NewName, NewPath) then
-        Refresh(NewPath);
+      begin
+        var Info := Default(TLiveOpInfo);
+        Info.Kind := lokRename;
+        Info.Source := FRenamePath;
+        Info.Dest := NewPath;
+        Info.Ok := True;
+        Info.Size := -1;
+        PublishLiveOp(Info);
+      end;
     end
     else if AApply and Assigned(FSelectionManager) then
       FSelectionManager.DeselectAll;
@@ -9162,6 +10008,552 @@ begin
   Result := 'network://' + Host;
 end;
 
+function TFilePanel.ClassifyNetRow(const AEntry: TFileEntry): Integer;
+var
+  Id, P: Integer;
+  Body, Tail: string;
+begin
+  Result := 0;
+  if SameText(AEntry.IconKey, '#nethead') then
+    Exit;
+  if StartsText('#shell:', AEntry.IconKey) then
+  begin
+    Id := StrToIntDef(Copy(AEntry.IconKey, 8, 6), 0);
+    if Id = 16 then
+      Exit(3);
+    if (Id = 52) or (Id = 17) then
+      Exit(4);
+  end;
+  if StartsText('ftp://', AEntry.FullPath) or StartsText('ftps://', AEntry.FullPath) or
+     StartsText('sftp://', AEntry.FullPath) or SameText(AEntry.IconKey, '#ftp') then
+    Exit(5);
+  if StartsText('http://', AEntry.FullPath) or StartsText('https://', AEntry.FullPath) then
+    Exit(6);
+  if IsUncPath(AEntry.FullPath) and not IsVibeNetworkPath(AEntry.FullPath) then
+  begin
+    Body := ExcludeTrailingPathDelimiter(AEntry.FullPath);
+    if Length(Body) > 2 then
+    begin
+      Delete(Body, 1, 2);
+      P := Pos('\', Body);
+      if P > 1 then
+      begin
+        Tail := Copy(Body, P + 1, MaxInt);
+        if (Tail <> '') and (Pos('\', Tail) = 0) and AEntry.IsDirectory then
+          Exit(2);
+        Exit;
+      end;
+    end;
+    Exit(1);
+  end;
+  if StartsText('network://', AEntry.FullPath) or
+     SameText(AEntry.IconKey, '#computer') or SameText(AEntry.IconKey, '#router') or
+     SameText(AEntry.IconKey, '#stock:94') or SameText(AEntry.IconKey, '#stock:103') or
+     SameText(AEntry.IconKey, '#stock:51') or SameText(AEntry.IconKey, '#stock:17') then
+    Exit(1);
+end;
+
+function TFilePanel.ShowNetObjectMenu(AVisual: Integer): Boolean;
+var
+  E: TFileEntry;
+  H: TNetworkHost;
+  Kind, Added: Integer;
+  Recent, Found, WantPage, Queued: Boolean;
+  Url: string;
+
+  procedure AddAct(const ACaption: string; AClick: TNotifyEvent; AEnabled: Boolean);
+  begin
+    FNetHistMenu.AddItem(ACaption, '', AClick, AEnabled);
+    Inc(Added);
+  end;
+
+begin
+  Result := False;
+  if not IsVibeNetworkPath(GetCurrentPathImpl) then
+    Exit;
+  if NetHeadRow(AVisual) then
+    Exit;
+  if not NetEntryAt(AVisual, E) then
+    Exit;
+  Kind := ClassifyNetRow(E);
+  Recent := False;
+  if FNet <> nil then
+    Recent := FNet.IsRecentRow(E.FullPath);
+  if (Kind = 0) and (not Recent) then
+    Exit;
+  if (Kind = 4) and (not Recent) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := True;
+  if Assigned(FSelectionManager) and (FSelectionManager.CurrentIndex <> AVisual) then
+  begin
+    FSelectionManager.CurrentIndex := AVisual;
+    NotifyCursorChange;
+  end;
+
+  FNetHistPath := E.FullPath;
+  FNetActPath := '';
+  FNetActAddr := Trim(E.DisplayType);
+  if Pos(' ', FNetActAddr) > 0 then
+    FNetActAddr := '';
+  if FNetActAddr = '' then
+    FNetActAddr := NetRowHost(E.FullPath);
+  FNetActAlso := '';
+  FNetActIp := '';
+  FNetActName := '';
+  FNetActMac := '';
+  FNetActUnc := '';
+  FNetActPage := '';
+  FNetActDock := '';
+  FNetActLetter := '';
+  FNetActRestore := True;
+
+  Found := False;
+  H := Default(TNetworkHost);
+  if FNet <> nil then
+  begin
+    if FNetActAddr <> '' then
+      Found := FNet.HostByAddress(FNetActAddr, H);
+    if not Found then
+      if Trim(E.Name) <> '' then
+        Found := FNet.HostByAddress(Trim(E.Name), H);
+  end;
+  if NetDottedIp(FNetActAddr) then
+    FNetActIp := FNetActAddr;
+  if Found and NetDottedIp(H.Address) then
+    FNetActIp := H.Address;
+  if (FNetActIp <> '') and not SameText(FNetActIp, FNetActAddr) then
+    FNetActAlso := FNetActIp
+  else if Found and (Trim(H.Name) <> '') and not SameText(Trim(H.Name), FNetActAddr) and
+          not NetDottedIp(Trim(H.Name)) then
+    FNetActAlso := Trim(H.Name);
+  if Kind = 1 then
+  begin
+    if Found and (Trim(H.Name) <> '') and not SameText(Trim(H.Name), H.Address) and
+       not SameText(Trim(H.Name), FNetActIp) then
+      FNetActName := Trim(H.Name)
+    else if (Trim(E.DisplayName) <> '') and not NetDottedIp(Trim(E.DisplayName)) and
+            not SameText(Trim(E.DisplayName), FNetActAddr) and
+            not SameText(Trim(E.DisplayName), FNetActIp) then
+      FNetActName := Trim(E.DisplayName);
+  end;
+  if Found and NetLooksLikeMac(H.Mac) then
+    FNetActMac := H.Mac
+  else if NetLooksLikeMac(Trim(E.DisplayDate)) then
+    FNetActMac := Trim(E.DisplayDate);
+
+  if (Kind = 2) or (Kind = 3) then
+    FNetActUnc := ExcludeTrailingPathDelimiter(E.FullPath)
+  else if Kind = 1 then
+  begin
+    if FNetActIp <> '' then
+      FNetActUnc := '\\' + FNetActIp
+    else if FNetActAddr <> '' then
+      FNetActUnc := '\\' + FNetActAddr;
+  end;
+
+  if Kind = 1 then
+    FNetActPath := NetworkComputerTarget(E)
+  else if (Kind = 2) or (Kind = 5) then
+    FNetActPath := E.FullPath;
+
+  WantPage := False;
+  if Kind = 6 then
+  begin
+    FNetActPage := E.FullPath;
+    WantPage := FNetActPage <> '';
+  end
+  else if Kind = 1 then
+  begin
+    if Found and (H.IsRouter or H.HasWebAdmin) then
+    begin
+      Url := RouterPageUrl(H);
+      if Length(Url) > 8 then
+      begin
+        FNetActPage := Url;
+        WantPage := True;
+      end;
+    end;
+    if not WantPage then
+      if SameText(E.IconKey, '#stock:103') or SameText(E.IconKey, '#router') then
+      begin
+        if FNetActIp <> '' then
+          FNetActPage := 'http://' + FNetActIp
+        else if FNetActAddr <> '' then
+          FNetActPage := 'http://' + FNetActAddr;
+        WantPage := FNetActPage <> '';
+      end;
+  end;
+
+  if Kind = 2 then
+    FNetActDock := FNetActUnc
+  else if (Kind = 5) or (Kind = 6) then
+    FNetActDock := E.FullPath
+  else if Kind = 1 then
+  begin
+    if FNetActIp <> '' then
+      FNetActDock := '\\' + FNetActIp
+    else if FNetActAddr <> '' then
+      FNetActDock := 'network://' + FNetActAddr;
+  end;
+
+  if FNetHistMenu = nil then
+  begin
+    FNetHistMenu := TFluentPopupMenu.Create(Self);
+    FNetHistMenu.Parent := Self;
+  end;
+  FNetHistMenu.ClearItems;
+  Added := 0;
+
+  if Kind = 1 then
+  begin
+    if FNetActPath <> '' then
+      AddAct(L('panel.net.open'), NetOpenClick, True);
+    if FNetActUnc <> '' then
+      AddAct(Lf('panel.net.openunc', [FNetActUnc]), NetOpenUncClick, True);
+    if WantPage then
+      AddAct(L('panel.net.page'), NetPageClick, True);
+    if (FNetActAddr <> '') or (FNetActAlso <> '') then
+      AddAct(L('panel.net.ping'), NetPingClick, True);
+    if FNetActIp <> '' then
+      AddAct(L('panel.net.copyip'), NetCopyIpClick, True);
+    if FNetActName <> '' then
+      AddAct(L('panel.net.copyname'), NetCopyNameClick, True);
+    if FNetActMac <> '' then
+      AddAct(L('panel.net.copymac'), NetCopyMacClick, True);
+    if FNetActDock <> '' then
+      AddAct(L('panel.net.dock'), NetDockClick, True);
+  end
+  else if Kind = 2 then
+  begin
+    if FNetActPath <> '' then
+      AddAct(L('panel.net.openhere'), NetOpenClick, True);
+    if FNetActUnc <> '' then
+      AddAct(L('panel.net.map'), NetMapClick, True);
+    if FNetActUnc <> '' then
+      if MappedLetterFor(FNetActUnc) <> '' then
+        AddAct(L('panel.net.unmap'), NetUnmapClick, True);
+    if FNetActUnc <> '' then
+      AddAct(L('panel.net.copypath'), NetCopyPathClick, True);
+    if FNetActDock <> '' then
+      AddAct(L('panel.net.dock'), NetDockClick, True);
+  end
+  else if Kind = 3 then
+  begin
+    Queued := False;
+    if FNetActUnc <> '' then
+      Queued := PrinterIsQueued(FNetActUnc);
+    AddAct(L('panel.net.prn.add'), NetPrnAddClick, True);
+    if FNetActUnc <> '' then
+      AddAct(L('panel.net.prn.queue'), NetPrnQueueClick, True);
+    AddAct(L('panel.net.prn.default'), NetPrnDefaultClick, Queued);
+    if Queued then
+      AddAct(L('panel.net.prn.remove'), NetPrnRemoveClick, True);
+  end
+  else if Kind = 5 then
+  begin
+    if FNetActPath <> '' then
+      AddAct(L('panel.net.openhere'), NetOpenClick, True);
+    if FNetActIp <> '' then
+      AddAct(L('panel.net.copyip'), NetCopyIpClick, True);
+    if FNetActDock <> '' then
+      AddAct(L('panel.net.dock'), NetDockClick, True);
+  end
+  else if Kind = 6 then
+  begin
+    if WantPage then
+      AddAct(L('panel.net.page'), NetPageClick, True);
+    if FNetActIp <> '' then
+      AddAct(L('panel.net.copyip'), NetCopyIpClick, True);
+    if FNetActDock <> '' then
+      AddAct(L('panel.net.dock'), NetDockClick, True);
+  end;
+
+  if Recent then
+  begin
+    if Added > 0 then
+      FNetHistMenu.AddSeparator;
+    FNetHistMenu.AddItem(L('panel.net.forget'), '', NetHistForgetClick);
+    Inc(Added);
+  end;
+  if Added = 0 then
+    Exit;
+  FNetHistMenu.ApplyTheme(FColors);
+  FNetHistMenu.PopupAtCursor;
+end;
+
+function TFilePanel.OpenBareRouter(const AEntry: TFileEntry): Boolean;
+var
+  H: TNetworkHost;
+  Key, Url: string;
+  Found: Boolean;
+begin
+  Result := False;
+  if not SameText(AEntry.IconKey, '#stock:103') then
+    if not SameText(AEntry.IconKey, '#router') then
+      Exit;
+  Key := Trim(AEntry.DisplayType);
+  if Pos(' ', Key) > 0 then
+    Key := '';
+  if Key = '' then
+    Key := VibeNetworkHost(AEntry.FullPath);
+  if Key = '' then
+    Key := Trim(AEntry.Name);
+  Found := False;
+  H := Default(TNetworkHost);
+  if FNet <> nil then
+    Found := FNet.HostByAddress(Key, H);
+  if not Found then
+    Exit;
+  if not H.IsRouter then
+    Exit;
+  if H.HasSMB then
+    Exit;
+  Result := True;
+  Url := RouterPageUrl(H);
+  {$IFDEF MSWINDOWS}
+  if (Length(Url) <= 8) or
+     (NativeInt(ShellExecute(0, 'open', PChar(Url), nil, nil, SW_SHOWNORMAL)) <= 32) then
+    ShowNotice(L('net.need.http'));
+  {$ELSE}
+  ShowNotice(L('net.need.http'));
+  {$ENDIF}
+end;
+
+function TFilePanel.AskMapLetter(out ALetter: string; out ARestore: Boolean): Boolean;
+var
+  Mask: DWORD;
+  C: Char;
+  Frm: TForm;
+  Lbl: TLabel;
+  Combo: TComboBox;
+  Check: TCheckBox;
+  OkBtn, CancelBtn: TButton;
+begin
+  ALetter := '';
+  ARestore := True;
+  Result := False;
+  Mask := GetLogicalDrives;
+  Frm := nil;
+  Combo := nil;
+  Check := nil;
+  { Пароля в діалозі немає: чужу шару питає системне вікно. }
+  for C := 'A' to 'Z' do
+    if (Mask and (1 shl (Ord(C) - Ord('A')))) = 0 then
+    begin
+      if Combo = nil then
+      begin
+        Frm := TForm.CreateNew(nil);
+        Frm.Caption := L('panel.net.map');
+        Frm.BorderStyle := TFmxFormBorderStyle.Single;
+        Frm.Position := TFormPosition.MainFormCenter;
+        Frm.Width := 360;
+        Frm.Height := 230;
+        Frm.Fill.Kind := TBrushKind.Solid;
+        Frm.Fill.Color := FColors.CardBackground;
+        Lbl := TLabel.Create(Frm);
+        Lbl.Parent := Frm;
+        Lbl.Position.X := 16;
+        Lbl.Position.Y := 16;
+        Lbl.Width := 320;
+        Lbl.Text := L('panel.net.map.letter');
+        Lbl.StyledSettings := Lbl.StyledSettings - [TStyledSetting.FontColor];
+        Lbl.TextSettings.FontColor := FColors.TextColor;
+        Combo := TComboBox.Create(Frm);
+        Combo.Parent := Frm;
+        Combo.Position.X := 16;
+        Combo.Position.Y := 44;
+        Combo.Width := 320;
+        Check := TCheckBox.Create(Frm);
+        Check.Parent := Frm;
+        Check.Position.X := 16;
+        Check.Position.Y := 92;
+        Check.Width := 320;
+        Check.Text := L('panel.net.map.restore');
+        Check.IsChecked := True;
+        Check.StyledSettings := Check.StyledSettings - [TStyledSetting.FontColor];
+        Check.TextSettings.FontColor := FColors.TextColor;
+        OkBtn := TButton.Create(Frm);
+        OkBtn.Parent := Frm;
+        OkBtn.Position.X := 16;
+        OkBtn.Position.Y := 148;
+        OkBtn.Width := 150;
+        OkBtn.Height := 36;
+        OkBtn.Text := L('panel.net.map.ok');
+        OkBtn.ModalResult := mrOk;
+        CancelBtn := TButton.Create(Frm);
+        CancelBtn.Parent := Frm;
+        CancelBtn.Position.X := 186;
+        CancelBtn.Position.Y := 148;
+        CancelBtn.Width := 150;
+        CancelBtn.Height := 36;
+        CancelBtn.Text := L('panel.net.map.cancel');
+        CancelBtn.ModalResult := mrCancel;
+      end;
+      Combo.Items.Add(string(C) + ':');
+    end;
+  if Combo = nil then
+  begin
+    ShowNotice(L('panel.net.map.none'));
+    Exit;
+  end;
+  try
+    Combo.ItemIndex := 0;
+    if Frm.ShowModal <> mrOk then
+      Exit;
+    if (Combo.ItemIndex < 0) or (Combo.ItemIndex >= Combo.Items.Count) then
+      Exit;
+    ALetter := Combo.Items[Combo.ItemIndex];
+    ARestore := Check.IsChecked;
+    Result := ALetter <> '';
+  finally
+    Frm.Free;
+  end;
+end;
+
+procedure TFilePanel.StartNetJob(AKind: Integer);
+var
+  Job: TNetUiJob;
+begin
+  Job := TNetUiJob.Create;
+  Job.Panel := Self;
+  Job.Kind := AKind;
+  Job.Unc := FNetActUnc;
+  Job.Letter := FNetActLetter;
+  Job.Addr := FNetActAddr;
+  Job.Also := FNetActAlso;
+  Job.Restore := FNetActRestore;
+  Job.Start;
+end;
+
+procedure TFilePanel.CopyNetText(const AText: string);
+var
+  Svc: IFMXClipboardService;
+begin
+  if AText = '' then
+    Exit;
+  if TPlatformServices.Current.SupportsPlatformService(IFMXClipboardService, Svc) then
+    Svc.SetClipboard(AText);
+end;
+
+procedure TFilePanel.NetOpenClick(Sender: TObject);
+begin
+  if FNetActPath = '' then
+    Exit;
+  Navigate(FNetActPath);
+end;
+
+procedure TFilePanel.NetOpenUncClick(Sender: TObject);
+begin
+  if FNetActUnc = '' then
+    Exit;
+  Navigate(FNetActUnc);
+end;
+
+procedure TFilePanel.NetPingClick(Sender: TObject);
+begin
+  if (FNetActAddr = '') and (FNetActAlso = '') then
+    Exit;
+  StartNetJob(3);
+end;
+
+procedure TFilePanel.NetCopyIpClick(Sender: TObject);
+begin
+  CopyNetText(FNetActIp);
+end;
+
+procedure TFilePanel.NetCopyNameClick(Sender: TObject);
+begin
+  CopyNetText(FNetActName);
+end;
+
+procedure TFilePanel.NetCopyMacClick(Sender: TObject);
+begin
+  CopyNetText(FNetActMac);
+end;
+
+procedure TFilePanel.NetCopyPathClick(Sender: TObject);
+begin
+  CopyNetText(FNetActUnc);
+end;
+
+procedure TFilePanel.NetDockClick(Sender: TObject);
+begin
+  if (FNetActDock <> '') and Assigned(FOnPinDock) then
+    FOnPinDock(Self, FNetActDock);
+end;
+
+procedure TFilePanel.NetMapClick(Sender: TObject);
+var
+  Letter: string;
+  Restore: Boolean;
+begin
+  if FNetActUnc = '' then
+    Exit;
+  if not AskMapLetter(Letter, Restore) then
+    Exit;
+  FNetActLetter := Letter;
+  FNetActRestore := Restore;
+  StartNetJob(1);
+end;
+
+procedure TFilePanel.NetUnmapClick(Sender: TObject);
+begin
+  FNetActLetter := MappedLetterFor(FNetActUnc);
+  if FNetActLetter = '' then
+    Exit;
+  StartNetJob(2);
+end;
+
+procedure TFilePanel.NetPageClick(Sender: TObject);
+begin
+  if FNetActPage = '' then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  if NativeInt(ShellExecute(0, 'open', PChar(FNetActPage), nil, nil,
+       SW_SHOWNORMAL)) <= 32 then
+    ShowNotice(L('net.need.http'));
+  {$ELSE}
+  ShowNotice(L('net.need.http'));
+  {$ENDIF}
+end;
+
+procedure TFilePanel.NetPrnAddClick(Sender: TObject);
+begin
+  if FNetActUnc = '' then
+    Exit;
+  StartNetJob(4);
+end;
+
+procedure TFilePanel.NetPrnQueueClick(Sender: TObject);
+begin
+  if FNetActUnc = '' then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  if NativeInt(ShellExecute(0, 'open', PChar(FNetActUnc), nil, nil,
+       SW_SHOWNORMAL)) <= 32 then
+    ShowNotice(L('net.printer'));
+  {$ENDIF}
+end;
+
+procedure TFilePanel.NetPrnDefaultClick(Sender: TObject);
+begin
+  if FNetActUnc = '' then
+    Exit;
+  if not PrinterIsQueued(FNetActUnc) then
+    Exit;
+  StartNetJob(5);
+end;
+
+procedure TFilePanel.NetPrnRemoveClick(Sender: TObject);
+begin
+  if FNetActUnc = '' then
+    Exit;
+  StartNetJob(6);
+end;
+
 procedure TFilePanel.PaintBoxDblClick(Sender: TObject);
 var
   ActualIndex: Integer;
@@ -9237,8 +10629,17 @@ begin
     Sel := Entries[ActualIndex];
     if SameText(Sel.IconKey, '#nethead') then
       Exit;
+    if OpenBareRouter(Sel) then
+    begin
+      DropNavGesture;
+      Exit;
+    end;
     if SameText(Sel.IconKey, '#computer') or SameText(Sel.IconKey, '#router') or
-       SameText(Sel.IconKey, '#ftp') then
+       SameText(Sel.IconKey, '#ftp') or
+       (StartsText('#stock:', Sel.IconKey) and
+        (StartsText('network://', Sel.FullPath) or StartsText('ftp://', Sel.FullPath) or
+         StartsText('ftps://', Sel.FullPath) or StartsText('sftp://', Sel.FullPath) or
+         StartsText('http://', Sel.FullPath) or StartsText('https://', Sel.FullPath))) then
     begin
       Target := NetworkComputerTarget(Sel);
       if Target = '' then
@@ -9246,6 +10647,29 @@ begin
       DropNavGesture;
       Navigate(Target);
       Exit;
+    end;
+    if StartsText('#shell:', Sel.IconKey) then
+    begin
+      var ShellId := StrToIntDef(Copy(Sel.IconKey, 8, 6), 0);
+      if ShellId = 16 then
+      begin
+        DropNavGesture;
+        ShowNotice(L('net.printer'));
+        Exit;
+      end;
+      if ShellId = 52 then
+      begin
+        ShowNotice(L('net.fax'));
+        Exit;
+      end;
+      if ShellId = 17 then
+      begin
+        if Trim(Sel.DisplayType) <> '' then
+          ShowNotice(Sel.DisplayType)
+        else
+          ShowNotice(L('net.scan'));
+        Exit;
+      end;
     end;
     if Trim(Sel.FullPath) = '' then
       Exit;
@@ -9362,8 +10786,9 @@ begin
   if Abs(FStatusText.Margins.Right - ARight) < 0.5 then
     Exit;
   FStatusText.Margins.Right := ARight;
+  FStatusText.WordWrap := False;
   if ARight > 12 then
-    FStatusText.TextSettings.Trimming := TTextTrimming.Character
+    FStatusText.TextSettings.Trimming := TTextTrimming.Word
   else
     FStatusText.TextSettings.Trimming := TTextTrimming.None;
 end;
@@ -9617,6 +11042,9 @@ begin
 
   if Assigned(FHeaderBar) then
   begin
+    { Любая альфа меньше $FF уже лежит на FPathAndHeader.
+      Вторая плашка той же краски делает заголовок колонок плотнее крошек.
+      Стекло акрила ($70) и ползунок мики (~$C9) оба остаются одним слоем. }
     if TAlphaColorRec(AColors.HeaderBackground).A < 255 then
       FHeaderBar.Fill.Color := TAlphaColors.Null
     else
@@ -9772,6 +11200,9 @@ end;
 procedure TFilePanel.CreateNewFolderInPlace;
 var
   Created: string;
+  Info: TLiveOpInfo;
+  I, Visual: Integer;
+  Entries: uFileModel.TFileEntryList;
 begin
   if IsRecycleBinPath(GetCurrentPathImpl) then
   begin
@@ -9781,8 +11212,27 @@ begin
   Created := CreateNewFolder(GetCurrentPathImpl, L('panel.newfolder'));
   if Created = '' then
     Exit;
-  FPendingRenamePath := Created;
-  Refresh(Created);
+  Info := Default(TLiveOpInfo);
+  Info.Kind := lokCopy;
+  Info.Dest := Created;
+  Info.Ok := True;
+  Info.IsDir := True;
+  Info.Size := 0;
+  Info.Modified := Now;
+  PublishLiveOp(Info);
+  Entries := GetCurrentEntries;
+  if not Assigned(Entries) then
+    Exit;
+  for I := 0 to Entries.Count - 1 do
+    if SameText(ExcludeTrailingPathDelimiter(Entries[I].FullPath),
+                ExcludeTrailingPathDelimiter(Created)) then
+    begin
+      Visual := VisualFromActual(I);
+      if Assigned(FSelectionManager) then
+        FSelectionManager.CurrentIndex := Visual;
+      BeginInlineRename(Visual);
+      Break;
+    end;
 end;
 
 
@@ -10040,7 +11490,8 @@ begin
       ShowNotice(L('panel.branch.thispc'));
       Exit;
     end;
-    if IsVirtualShellPath(Path) and not TDirectory.Exists(Path) and
+    if IsVirtualShellPath(Path) and
+       (not UiSkipNetworkTouch(Path)) and (not TDirectory.Exists(Path)) and
        not (SplitArchivePath(Path, Arc, Inner) and IsArchiveFileName(Arc)) then
     begin
       ShowNotice(L('panel.branch.here'));
@@ -10509,6 +11960,222 @@ begin
   end;
 end;
 
+procedure TFilePanel.ApplyLiveOp(const AInfo: TLiveOpInfo);
+var
+  I, J, K: Integer;
+  Tab: TFileTab;
+  SrcParent, DstParent, Focus, Key, Name: string;
+  Sel: TStringList;
+  HaveSrc, Changed, ActiveChanged, Touched: Boolean;
+  SrcEntry, E: TFileEntry;
+
+  function ParentOf(const AFull: string): string;
+  begin
+    Result := ExcludeTrailingPathDelimiter(
+      ExtractFilePath(ExcludeTrailingPathDelimiter(AFull)));
+  end;
+
+  function FindEntryAnywhere(const AFull: string; out AEntry: TFileEntry): Boolean;
+  var
+    P: TFilePanel;
+    TI, EI: Integer;
+    Want: string;
+  begin
+    Result := False;
+    AEntry := Default(TFileEntry);
+    Want := ExcludeTrailingPathDelimiter(AFull);
+    if (Want = '') or (GFilePanels = nil) then
+      Exit;
+    for P in GFilePanels do
+    begin
+      if (P = nil) or P.FDestroying or (P.FTabs = nil) then
+        Continue;
+      for TI := 0 to P.FTabs.Count - 1 do
+      begin
+        if not Assigned(P.FTabs[TI].Entries) then
+          Continue;
+        for EI := 0 to P.FTabs[TI].Entries.Count - 1 do
+          if SameText(ExcludeTrailingPathDelimiter(
+               P.FTabs[TI].Entries[EI].FullPath), Want) then
+          begin
+            AEntry := P.FTabs[TI].Entries[EI];
+            Exit(True);
+          end;
+      end;
+    end;
+  end;
+
+  procedure PaintRow(var ARow: TFileEntry);
+  begin
+    ARow.LivePin := True;
+    ARow.Extension := ExtractFileExt(ARow.Name);
+    PrepareFileEntry(ARow);
+    if ARow.IsDirectory and
+       (IsRemotePath(ARow.FullPath) or UiSkipNetworkTouch(ARow.FullPath)) then
+      ARow.NeedsCustomIcon := False;
+  end;
+
+begin
+  if FDestroying or not AInfo.Ok then
+    Exit;
+  SrcParent := ParentOf(AInfo.Source);
+  DstParent := ParentOf(AInfo.Dest);
+  HaveSrc := False;
+  if AInfo.Size < 0 then
+    HaveSrc := FindEntryAnywhere(AInfo.Source, SrcEntry);
+  ActiveChanged := False;
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    Tab := FTabs[I];
+    if Tab.SearchView then
+      Continue;
+    Changed := False;
+    Sel := TStringList.Create;
+    Sel.CaseSensitive := False;
+    try
+      if I = FActiveTabIndex then
+        FFilterReady := False;
+      CaptureTabSelection(I, Sel, Focus);
+      if ((AInfo.Kind = lokDelete) or (AInfo.Kind = lokMove)) and
+         (AInfo.Source <> '') and SameDirHistoryPath(Tab.Path, SrcParent) and
+         Assigned(Tab.Entries) then
+      begin
+        Key := ExcludeTrailingPathDelimiter(AInfo.Source);
+        for J := 0 to Tab.Entries.Count - 1 do
+          if SameText(ExcludeTrailingPathDelimiter(Tab.Entries[J].FullPath), Key) then
+          begin
+            if SameText(ExcludeTrailingPathDelimiter(Focus), Key) then
+            begin
+              if J < Tab.Entries.Count - 1 then
+                Focus := Tab.Entries[J + 1].FullPath
+              else if J > 0 then
+                Focus := Tab.Entries[J - 1].FullPath
+              else
+                Focus := '';
+            end;
+            for K := Sel.Count - 1 downto 0 do
+              if SameText(ExcludeTrailingPathDelimiter(Sel[K]), Key) then
+                Sel.Delete(K);
+            Tab.Entries.Delete(J);
+            Changed := True;
+            Break;
+          end;
+      end;
+      if (AInfo.Kind = lokRename) and (AInfo.Source <> '') and (AInfo.Dest <> '') and
+         SameDirHistoryPath(Tab.Path, SrcParent) and Assigned(Tab.Entries) then
+      begin
+        Key := ExcludeTrailingPathDelimiter(AInfo.Source);
+        for J := 0 to Tab.Entries.Count - 1 do
+          if SameText(ExcludeTrailingPathDelimiter(Tab.Entries[J].FullPath), Key) then
+          begin
+            E := Tab.Entries[J];
+            E.FullPath := AInfo.Dest;
+            E.Name := ExtractFileName(ExcludeTrailingPathDelimiter(AInfo.Dest));
+            PaintRow(E);
+            Tab.Entries[J] := E;
+            if SameText(ExcludeTrailingPathDelimiter(Focus), Key) then
+              Focus := AInfo.Dest;
+            for K := 0 to Sel.Count - 1 do
+              if SameText(ExcludeTrailingPathDelimiter(Sel[K]), Key) then
+                Sel[K] := AInfo.Dest;
+            Changed := True;
+            Break;
+          end;
+      end;
+      if (AInfo.Kind in [lokCopy, lokMove]) and (AInfo.Dest <> '') and
+         SameDirHistoryPath(Tab.Path, DstParent) then
+      begin
+        if not Assigned(Tab.Entries) then
+          Tab.Entries := uFileModel.TFileEntryList.Create;
+        Name := ExtractFileName(ExcludeTrailingPathDelimiter(AInfo.Dest));
+        Key := ExcludeTrailingPathDelimiter(AInfo.Dest);
+        Touched := False;
+        for J := 0 to Tab.Entries.Count - 1 do
+          if SameText(ExcludeTrailingPathDelimiter(Tab.Entries[J].FullPath), Key) or
+             SameText(Tab.Entries[J].Name, Name) then
+          begin
+            E := Tab.Entries[J];
+            E.Name := Name;
+            E.FullPath := AInfo.Dest;
+            if AInfo.Size >= 0 then
+            begin
+              E.IsDirectory := AInfo.IsDir;
+              E.Size := AInfo.Size;
+              if AInfo.Modified <> 0 then
+                E.Modified := AInfo.Modified;
+            end
+            else if HaveSrc then
+            begin
+              E.IsDirectory := SrcEntry.IsDirectory;
+              E.Size := SrcEntry.Size;
+              if SrcEntry.Modified <> 0 then
+                E.Modified := SrcEntry.Modified;
+            end
+            else
+              E.IsDirectory := AInfo.IsDir;
+            PaintRow(E);
+            Tab.Entries[J] := E;
+            Touched := True;
+            Break;
+          end;
+        if not Touched then
+        begin
+          E := Default(TFileEntry);
+          E.Name := Name;
+          E.FullPath := AInfo.Dest;
+          if (AInfo.Size < 0) and HaveSrc then
+          begin
+            E.IsDirectory := SrcEntry.IsDirectory;
+            E.Size := SrcEntry.Size;
+            E.Modified := SrcEntry.Modified;
+            E.Attributes := SrcEntry.Attributes;
+            E.IsHidden := SrcEntry.IsHidden;
+            E.IsSystem := SrcEntry.IsSystem;
+          end
+          else
+          begin
+            E.IsDirectory := AInfo.IsDir;
+            if AInfo.Size > 0 then
+              E.Size := AInfo.Size
+            else
+              E.Size := 0;
+            E.Modified := AInfo.Modified;
+          end;
+          PaintRow(E);
+          Tab.Entries.Add(E);
+        end;
+        Changed := True;
+      end;
+      if Changed then
+      begin
+        Tab.Loaded := True;
+        Tab.Stale := False;
+        if Assigned(Tab.Entries) then
+          SortEntries(Tab.Entries, Tab.SortField, Tab.SortAsc);
+        FTabs[I] := Tab;
+        RestoreTabSelection(I, Tab.Entries, Sel, Focus, I = FActiveTabIndex);
+        if I = FActiveTabIndex then
+          ActiveChanged := True;
+      end;
+    finally
+      Sel.Free;
+    end;
+  end;
+  if ActiveChanged then
+  begin
+    if FNameFilter <> '' then
+      CommitNameFilter(False)
+    else
+    begin
+      UpdateStatusText;
+      RebuildContent;
+    end;
+    InvalidateView;
+    if Assigned(FThumbTimer) and not FDestroying then
+      FThumbTimer.Enabled := True;
+  end;
+end;
+
 procedure TFilePanel.BindDragEvents(AControl: TControl);
 begin
   if AControl = nil then
@@ -10902,7 +12569,8 @@ begin
   SetLength(Result, 0);
   for I := 0 to High(APaths) do
   begin
-    if TFile.Exists(APaths[I]) or TDirectory.Exists(APaths[I]) then
+    if IsRemotePath(APaths[I]) or UiSkipNetworkTouch(APaths[I]) or
+       TFile.Exists(APaths[I]) or TDirectory.Exists(APaths[I]) then
     begin
       SetLength(Result, Length(Result) + 1);
       Result[High(Result)] := APaths[I];
@@ -11033,7 +12701,7 @@ begin
     Exit;
   if SplitArchivePath(Dest, Z, Inner) then
     Exit;
-  if IsRemotePath(Dest) or IsUncPath(Dest) then
+  if IsRemotePath(Dest) or IsUncPath(Dest) or UiSkipNetworkTouch(Dest) then
     Exit(True);
   if TFile.Exists(Dest) then
     Exit;
@@ -11509,7 +13177,7 @@ begin
     Exit;
   if SplitArchivePath(Dest, ZipFile, ZipInner) and IsArchiveFileName(ZipFile) then
     Result := True
-  else if IsRemotePath(Dest) or IsUncPath(Dest) then
+  else if IsRemotePath(Dest) or IsUncPath(Dest) or UiSkipNetworkTouch(Dest) then
     Result := True
   else
     Result := TDirectory.Exists(Dest);
@@ -11522,7 +13190,7 @@ begin
       Exit(False);
     SrcSlash := IncludeTrailingPathDelimiter(ExcludeTrailingPathDelimiter(Src));
     if StartsText(SrcSlash, DestSlash) and
-       (IsRemotePath(Src) or TDirectory.Exists(Src)) then
+       (IsRemotePath(Src) or UiSkipNetworkTouch(Src) or TDirectory.Exists(Src)) then
       Exit(False);
   end;
   { Та же папка: не копировать, не перемещать и не дописывать в архив. }
@@ -11761,7 +13429,7 @@ begin
   FListReadyFired := False;
   if Length(AState.Tabs) = 0 then
   begin
-    DoAddTab(ExtractFileDrive(ParamStr(0)) + '\', True);
+    DoAddTab(DefaultStartupDrive, True);
     if FTabs.Count > 0 then
     begin
       Tab := FTabs[0];
@@ -11807,6 +13475,12 @@ begin
   SyncDriveBar;
 end;
 
+procedure TFilePanel.ReleaseDeferredLoad;
+begin
+  { Каталог уже открыт снаружи. Без этого смена вкладки так и не читает папку. }
+  FDeferDirLoad := False;
+end;
+
 procedure TFilePanel.LoadActiveTab;
 var
   Tab: TFileTab;
@@ -11844,6 +13518,8 @@ begin
     if I = FActiveTabIndex then
       Continue;
     Tab := FTabs[I];
+    if IsRemotePath(Tab.Path) or UiSkipNetworkTouch(Tab.Path) then
+      Continue;
     if Tab.Stale or not Tab.Loaded then
     begin
       Tab.Stale := False;
@@ -12107,6 +13783,8 @@ begin
       Continue;
     if FTabs[I].SearchView then
       Continue;
+    if IsRemotePath(FTabs[I].Path) or UiSkipNetworkTouch(FTabs[I].Path) then
+      Continue;
     if I = FActiveTabIndex then
       RefreshActive := True
     else
@@ -12124,20 +13802,21 @@ begin
     Cur := GetCurrentPathImpl;
     if not SplitArchivePath(Cur, Arc, Inner) then
     begin
-      if IsRemotePath(Cur) then
-      begin
-        Refresh('', True);
+      if IsRemotePath(Cur) or UiSkipNetworkTouch(Cur) then
         Exit;
-      end;
       if (Cur <> '') and not TDirectory.Exists(Cur) and not IsVirtualShellPath(Cur) then
       begin
         if IsBrowsablePath(Cur) then
-          Refresh('', True)
+        begin
+          FKeepLiveNext := True;
+          Refresh('', True);
+        end
         else
           NavigateToParent;
         Exit;
       end;
     end;
+    FKeepLiveNext := True;
     Refresh('', True);
     Exit;
   end;
@@ -12147,6 +13826,7 @@ begin
     CaptureTabSelection(InactiveLoadIdx, FKeepSelPaths, FKeepSelFocus);
     if (FKeepSelFocus = '') then
       FKeepSelFocus := FTabs[InactiveLoadIdx].CursorPath;
+    FKeepLiveNext := True;
     StartDirLoadAt(InactiveLoadIdx, FTabs[InactiveLoadIdx].Path, '', True);
   end;
 end;
@@ -12243,6 +13923,8 @@ var
   Tab: TFileTab;
   Active: Boolean;
   Focus: string;
+  Seen: TDictionary<string, Boolean>;
+  Pin: TFileEntry;
 begin
   if List = nil then
     Exit;
@@ -12279,6 +13961,32 @@ begin
     SortEntries(List, sfName, True)
   else
     SortEntries(List, Tab.SortField, Tab.SortAsc);
+
+  if Tab.KeepLive and Assigned(Tab.Entries) and (Tab.Entries <> List) then
+  begin
+    Seen := TDictionary<string, Boolean>.Create;
+    try
+      for I := 0 to List.Count - 1 do
+        if List[I].FullPath <> '' then
+          Seen.AddOrSetValue(AnsiLowerCase(
+            ExcludeTrailingPathDelimiter(List[I].FullPath)), True);
+      for I := 0 to Tab.Entries.Count - 1 do
+      begin
+        Pin := Tab.Entries[I];
+        if Pin.LivePin and (Pin.FullPath <> '') and
+           not Seen.ContainsKey(AnsiLowerCase(
+             ExcludeTrailingPathDelimiter(Pin.FullPath))) then
+          List.Add(Pin);
+      end;
+    finally
+      Seen.Free;
+    end;
+    if APartial then
+      SortEntries(List, sfName, True)
+    else
+      SortEntries(List, Tab.SortField, Tab.SortAsc);
+  end;
+  Tab.KeepLive := False;
 
   if Assigned(Tab.Entries) and (Tab.Entries <> List) and
      (Tab.Entries.Count > 0) and FileListsEquivalent(Tab.Entries, List) then

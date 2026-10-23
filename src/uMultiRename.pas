@@ -458,14 +458,19 @@ var
   I: Integer;
   Folder, TempName, Dummy, FinalPath: string;
   Temped: TArray<Boolean>;
+  Orig: TArray<string>;
+  Info: TLiveOpInfo;
 begin
   Result := 0;
   RebuildPreview;
   SetLength(Temped, Length(FItems));
+  SetLength(Orig, Length(FItems));
+  for I := 0 to High(FItems) do
+    Orig[I] := FItems[I].OldPath;
   for I := 0 to High(FItems) do
   begin
     Temped[I] := False;
-    if FItems[I].Collision or SameText(FItems[I].NewName, FItems[I].OldName) then
+    if FItems[I].Collision or SameStr(FItems[I].NewName, FItems[I].OldName) then
       Continue;
     Folder := ExtractFilePath(FItems[I].OldPath);
     TempName := Format('.__vibe_%d_%d.tmp', [I, Random(MaxInt)]);
@@ -484,10 +489,26 @@ begin
     if not RenamePath(FItems[I].OldPath, FItems[I].NewName, FinalPath) then
     begin
       FItems[I].Skipped := True;
+      Info := Default(TLiveOpInfo);
+      Info.Kind := lokRename;
+      Info.Source := Orig[I];
+      Info.Dest := FItems[I].OldPath;
+      Info.Ok := True;
+      Info.IsDir := FItems[I].IsDirectory;
+      Info.Size := -1;
+      PublishLiveOp(Info);
       Continue;
     end;
     FItems[I].OldPath := FinalPath;
     FItems[I].OldName := FItems[I].NewName;
+    Info := Default(TLiveOpInfo);
+    Info.Kind := lokRename;
+    Info.Source := Orig[I];
+    Info.Dest := FinalPath;
+    Info.Ok := True;
+    Info.IsDir := FItems[I].IsDirectory;
+    Info.Size := -1;
+    PublishLiveOp(Info);
     Inc(Result);
   end;
 end;

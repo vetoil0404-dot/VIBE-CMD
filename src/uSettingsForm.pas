@@ -27,6 +27,7 @@ type
     FOnThemeChanged: TThemeChangedProc;
     FOnOptionsChanged: TOptionsChangedProc;
     FOnTintChanged: TProc;
+    FOnOpacityChanged: TProc;
     FColors: TThemeColors;
     FPage: Integer;
 
@@ -49,6 +50,11 @@ type
     FTintHold: Integer;
     FTintDrag: Boolean;
     FTintSync: Boolean;
+    FOpacitySlider: TPaintBox;
+    FCbOpacity: TFluentCheckRow;
+    FOpacityHold: Integer;
+    FOpacityDrag: Boolean;
+    FOpacitySync: Boolean;
     FCbDock, FCbMid, FCbDrives, FCbDriveHome, FCbFn, FCbQuick, FCbCmd: TFluentCheckRow;
     FCbFollow: TFluentCheckRow;
     FCbSelExplorer, FCbSelVibe: TFluentCheckRow;
@@ -88,6 +94,19 @@ type
     procedure SyncTintCheck;
     procedure ApplyTintLive(AValue: Integer; ASave: Boolean);
     procedure SyncTintHint;
+    procedure LockTintOrder;
+    procedure OpacityTrack(out TrackL, TrackR: Single);
+    function OpacityFromSliderX(X: Single): Integer;
+    procedure PaintOpacitySlider(Sender: TObject; Canvas: TCanvas);
+    procedure OpacitySliderDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure OpacitySliderMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+    procedure OpacitySliderUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure OpacitySliderDblClick(Sender: TObject);
+    procedure OpacityEnabledClick(Sender: TObject);
+    procedure SyncOpacityCheck;
+    procedure ApplyOpacityLive(AValue: Integer; ASave: Boolean);
     procedure NavClick(Sender: TObject);
     procedure ShowPage(AIndex: Integer);
     procedure ThemeCardClick(Sender: TObject);
@@ -118,6 +137,7 @@ type
     property OnOptionsChanged: TOptionsChangedProc read FOnOptionsChanged write FOnOptionsChanged;
     property OnLanguageChanged: TProc read FOnLanguageChanged write FOnLanguageChanged;
     property OnTintChanged: TProc read FOnTintChanged write FOnTintChanged;
+    property OnOpacityChanged: TProc read FOnOpacityChanged write FOnOpacityChanged;
   end;
 
 implementation
@@ -360,7 +380,10 @@ begin
     FTintHold := FSettings.ColorTint
   else
     FTintHold := 200;
-  { Align=Top: последний добавленный оказывается сверху. }
+  if Assigned(FSettings) and (FSettings.Transparency > 0) then
+    FOpacityHold := FSettings.Transparency
+  else
+    FOpacityHold := 40;
   FTintHint := TText.Create(Self);
   FTintHint.Parent := FTintCard;
   FTintHint.Align := TAlignLayout.Top;
@@ -373,6 +396,19 @@ begin
   ApplyFluentText(FTintHint, 12, False);
   FTintHint.TextSettings.HorzAlign := TTextAlign.Leading;
   FTintHint.TextSettings.VertAlign := TTextAlign.Leading;
+  FOpacitySlider := TPaintBox.Create(Self);
+  FOpacitySlider.Parent := FTintCard;
+  FOpacitySlider.Align := TAlignLayout.Top;
+  FOpacitySlider.Height := 36;
+  FOpacitySlider.Margins.Rect := TRectF.Create(0, 2, 0, 0);
+  FOpacitySlider.Cursor := crHandPoint;
+  FOpacitySlider.OnPaint := PaintOpacitySlider;
+  FOpacitySlider.OnMouseDown := OpacitySliderDown;
+  FOpacitySlider.OnMouseMove := OpacitySliderMove;
+  FOpacitySlider.OnMouseUp := OpacitySliderUp;
+  FOpacitySlider.OnDblClick := OpacitySliderDblClick;
+  FCbOpacity := AddCheck(FTintCard, 'set.opacity',
+    Assigned(FSettings) and (FSettings.Transparency > 0), OpacityEnabledClick);
   FTintSlider := TPaintBox.Create(Self);
   FTintSlider.Parent := FTintCard;
   FTintSlider.Align := TAlignLayout.Top;
@@ -387,6 +423,35 @@ begin
   FCbTint := AddCheck(FTintCard, 'set.tint',
     Assigned(FSettings) and (FSettings.ColorTint >= 0), TintEnabledClick);
   SyncTintHint;
+end;
+
+procedure TSettingsForm.LockTintOrder;
+var
+  I: Integer;
+begin
+  if not Assigned(FTintCard) then
+    Exit;
+  { Align=Top берёт текущий Top, а не порядок детей.
+    Меньший Top оказывается выше. Флажок прозрачности — сразу над полоской. }
+  FTintCard.BeginUpdate;
+  try
+    if Assigned(FCbTint) then
+      FCbTint.Position.Y := 0;
+    if Assigned(FTintSlider) then
+      FTintSlider.Position.Y := 10;
+    if Assigned(FCbOpacity) then
+      FCbOpacity.Position.Y := 20;
+    if Assigned(FOpacitySlider) then
+      FOpacitySlider.Position.Y := 30;
+    if Assigned(FTintHint) then
+      FTintHint.Position.Y := 40;
+    for I := 0 to FTintCard.ControlsCount - 1 do
+      if (FTintCard.Controls[I] is TText) and
+         (TText(FTintCard.Controls[I]).Tag = 7) then
+        TText(FTintCard.Controls[I]).Position.Y := 80;
+  finally
+    FTintCard.EndUpdate;
+  end;
 end;
 
 function HueSwatch(Hue: Single): TAlphaColor;
@@ -649,11 +714,201 @@ begin
     end;
   end;
   if ShowHint then
-    FTintCard.Height := 124
+    FTintCard.Height := 198
   else
-    FTintCard.Height := 86;
+    FTintCard.Height := 160;
   if Assigned(FTintSlider) then
     FTintSlider.Repaint;
+  if Assigned(FOpacitySlider) then
+    FOpacitySlider.Repaint;
+  LockTintOrder;
+end;
+
+procedure TSettingsForm.OpacityTrack(out TrackL, TrackR: Single);
+begin
+  TrackL := 4;
+  TrackR := 48;
+  if Assigned(FOpacitySlider) then
+    TrackR := FOpacitySlider.Width - 52;
+  if TrackR < TrackL + 40 then
+    TrackR := TrackL + 40;
+end;
+
+function TSettingsForm.OpacityFromSliderX(X: Single): Integer;
+var
+  TrackL, TrackR: Single;
+begin
+  OpacityTrack(TrackL, TrackR);
+  Result := EnsureRange(Round((X - TrackL) / (TrackR - TrackL) * 100), 0, 100);
+end;
+
+procedure TSettingsForm.PaintOpacitySlider(Sender: TObject; Canvas: TCanvas);
+var
+  TrackL, TrackR, ThumbX, MidY: Single;
+  Bar, R: TRectF;
+  Grad: TGradient;
+  Stop: TGradientPoint;
+  Caption: string;
+begin
+  if not Assigned(FOpacitySlider) or not Assigned(FSettings) then
+    Exit;
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := FColors.CardBackground;
+  Canvas.FillRect(FOpacitySlider.LocalRect, 0, 0, [], 1);
+  OpacityTrack(TrackL, TrackR);
+  MidY := FOpacitySlider.Height / 2;
+  Bar := TRectF.Create(TrackL, MidY - 5, TrackR, MidY + 5);
+  Grad := TGradient.Create;
+  try
+    Grad.Style := TGradientStyle.Linear;
+    Grad.StartPosition.X := 0;
+    Grad.StartPosition.Y := 0;
+    Grad.StopPosition.X := 1;
+    Grad.StopPosition.Y := 0;
+    Grad.Points.Clear;
+    Stop := TGradientPoint(Grad.Points.Add);
+    Stop.Offset := 0;
+    Stop.Color := ThemeAdjustAlpha(FColors.TextColor, 230);
+    Stop := TGradientPoint(Grad.Points.Add);
+    Stop.Offset := 1;
+    Stop.Color := ThemeAdjustAlpha(FColors.TextColor, 28);
+    Canvas.Fill.Kind := TBrushKind.Gradient;
+    Canvas.Fill.Gradient.Assign(Grad);
+  finally
+    Grad.Free;
+  end;
+  Canvas.FillRect(Bar, 4, 4, AllCorners, 1);
+  Canvas.Stroke.Kind := TBrushKind.Solid;
+  Canvas.Stroke.Color := FColors.CardStroke;
+  Canvas.Stroke.Thickness := 1;
+  Canvas.DrawRect(Bar, 4, 4, AllCorners, 1);
+  Canvas.Font.Family := 'Segoe UI';
+  Canvas.Font.Size := 12;
+  Canvas.Font.Style := [];
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := FColors.SubTextColor;
+  if FSettings.Transparency <= 0 then
+    Caption := L('set.opacity.off')
+  else
+    Caption := IntToStr(FSettings.Transparency) + '%';
+  R := TRectF.Create(FOpacitySlider.Width - 46, 0, FOpacitySlider.Width, FOpacitySlider.Height);
+  Canvas.FillText(R, Caption, False, 1, [], TTextAlign.Trailing, TTextAlign.Center);
+  if FSettings.Transparency > 0 then
+  begin
+    ThumbX := TrackL + (TrackR - TrackL) * (FSettings.Transparency / 100);
+    Canvas.Fill.Color := $FF1A1A1A;
+    Canvas.FillEllipse(TRectF.Create(ThumbX - 8, MidY - 8, ThumbX + 8, MidY + 8), 1);
+    Canvas.Fill.Color := FColors.TextColor;
+    Canvas.FillEllipse(TRectF.Create(ThumbX - 5, MidY - 5, ThumbX + 5, MidY + 5), 1);
+  end;
+end;
+
+procedure TSettingsForm.ApplyOpacityLive(AValue: Integer; ASave: Boolean);
+var
+  Next: Integer;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  if AValue <= 0 then
+    Next := 0
+  else
+    Next := EnsureRange(AValue, 1, 100);
+  if FSettings.Transparency = Next then
+  begin
+    if Assigned(FOpacitySlider) then
+      FOpacitySlider.Repaint;
+    if ASave then
+      ScheduleSave;
+    Exit;
+  end;
+
+  FSettings.Transparency := Next;
+  ConfigureWindowOpacity(Next);
+  if Next > 0 then
+    FOpacityHold := Next;
+  SyncOpacityCheck;
+  if Assigned(FOpacitySlider) then
+    FOpacitySlider.Repaint;
+  if FSettings.WindowMaterial = wmNormal then
+  begin
+    if Assigned(FOnOpacityChanged) then
+      FOnOpacityChanged()
+    else if Assigned(FOnThemeChanged) then
+      FOnThemeChanged(FSettings.Theme);
+  end
+  else if Assigned(FOnThemeChanged) then
+    FOnThemeChanged(FSettings.Theme);
+  if ASave then
+    ScheduleSave;
+end;
+
+procedure TSettingsForm.OpacitySliderDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  FOpacityDrag := True;
+  if Assigned(FOpacitySlider) and Assigned(FOpacitySlider.Root) then
+    FOpacitySlider.Root.Captured := FOpacitySlider;
+  ApplyOpacityLive(OpacityFromSliderX(X), False);
+end;
+
+procedure TSettingsForm.OpacitySliderMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+begin
+  if FOpacityDrag then
+    ApplyOpacityLive(OpacityFromSliderX(X), False);
+end;
+
+procedure TSettingsForm.OpacitySliderUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if Button <> TMouseButton.mbLeft then
+    Exit;
+  if FOpacityDrag then
+    ApplyOpacityLive(OpacityFromSliderX(X), True);
+  FOpacityDrag := False;
+  if Assigned(FOpacitySlider) and Assigned(FOpacitySlider.Root) and
+     Assigned(FOpacitySlider.Root.Captured) and
+     (FOpacitySlider.Root.Captured.GetObject = FOpacitySlider) then
+    FOpacitySlider.Root.Captured := nil;
+end;
+
+procedure TSettingsForm.OpacitySliderDblClick(Sender: TObject);
+begin
+  FOpacityDrag := False;
+  ApplyOpacityLive(0, True);
+end;
+
+procedure TSettingsForm.OpacityEnabledClick(Sender: TObject);
+begin
+  if FOpacitySync or not Assigned(FSettings) or not Assigned(FCbOpacity) then
+    Exit;
+  if FCbOpacity.Checked then
+  begin
+    if FSettings.Transparency <= 0 then
+    begin
+      if (FOpacityHold <= 0) or (FOpacityHold > 100) then
+        FOpacityHold := 40;
+      ApplyOpacityLive(FOpacityHold, True);
+    end;
+  end
+  else if FSettings.Transparency > 0 then
+  begin
+    FOpacityHold := FSettings.Transparency;
+    ApplyOpacityLive(0, True);
+  end;
+end;
+
+procedure TSettingsForm.SyncOpacityCheck;
+begin
+  if not Assigned(FCbOpacity) or not Assigned(FSettings) then
+    Exit;
+  FOpacitySync := True;
+  try
+    FCbOpacity.Checked := FSettings.Transparency > 0;
+  finally
+    FOpacitySync := False;
+  end;
 end;
 
 procedure TSettingsForm.BuildNav;
@@ -768,17 +1023,26 @@ begin
 
   BuildTintCard(FPages[1]);
 
-  Card := AddCard(FPages[1], 'set.card.material');
-  Card.Height := 22 + 78 + 12;
-  Row := TRectangle.Create(Self);
-  Row.Parent := Card;
-  Row.Align := TAlignLayout.Top;
-  Row.Height := 78;
-  Row.Stroke.Kind := TBrushKind.None;
-  Row.Fill.Color := TAlphaColors.Null;
-  BuildMaterialCard(FCardMatNormal, Row, 'set.mat.normal', wmNormal, $FF3B3B3B);
-  BuildMaterialCard(FCardMatAcrylic, Row, 'set.mat.acrylic', wmAcrylic, $FF5A7A9A);
-  BuildMaterialCard(FCardMatMica, Row, 'set.mat.mica', wmMica, $FF4A5560);
+  if WindowsVersion >= 11 then
+  begin
+    Card := AddCard(FPages[1], 'set.card.material');
+    Card.Height := 22 + 78 + 12;
+    Row := TRectangle.Create(Self);
+    Row.Parent := Card;
+    Row.Align := TAlignLayout.Top;
+    Row.Height := 78;
+    Row.Stroke.Kind := TBrushKind.None;
+    Row.Fill.Color := TAlphaColors.Null;
+    BuildMaterialCard(FCardMatNormal, Row, 'set.mat.normal', wmNormal, $FF3B3B3B);
+    BuildMaterialCard(FCardMatAcrylic, Row, 'set.mat.acrylic', wmAcrylic, $FF5A7A9A);
+    BuildMaterialCard(FCardMatMica, Row, 'set.mat.mica', wmMica, $FF4A5560);
+  end
+  else
+  begin
+    FCardMatNormal := nil;
+    FCardMatAcrylic := nil;
+    FCardMatMica := nil;
+  end;
 
   Card := AddCard(FPages[1], 'set.card.font');
   Card.Height := 22 + 40 + 16;
@@ -1161,6 +1425,8 @@ end;
 
 procedure TSettingsForm.ScheduleSave;
 begin
+  if Assigned(FSettings) then
+    FSettings.MarkPrefsDirty;
   if not Assigned(FSaveTimer) then
   begin
     if Assigned(FSettings) then
@@ -1272,11 +1538,13 @@ end;
 
 destructor TSettingsForm.Destroy;
 begin
-  { Кнопка «Закрыть» ничего не пишет. Если правка ещё в таймере — дописать в фоне. }
-  if Assigned(FSaveTimer) and FSaveTimer.Enabled and Assigned(FSettings) then
-  begin
+  { «Закрыть» само не пишет. Таймер 350 мс мог ещё не сработать — дописать здесь. }
+  if Assigned(FSaveTimer) then
     FSaveTimer.Enabled := False;
-    FSettings.SaveAsync;
+  if Assigned(FSettings) then
+  try
+    FSettings.FlushPrefs;
+  except
   end;
   FreeAndNil(FLangRows);
   inherited;

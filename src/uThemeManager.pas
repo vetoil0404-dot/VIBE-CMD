@@ -1,4 +1,4 @@
-unit uThemeManager;
+﻿unit uThemeManager;
 
 {
   Fluent Design / WinUI 3 tokens for CORE Commander.
@@ -103,6 +103,12 @@ function GetThemeColors(Theme: TAppTheme; AApplyTint: Boolean = True): TThemeCol
 procedure ApplyColorTint(var Colors: TThemeColors; Tint: Integer; IsDark: Boolean);
 function ThemeTintPaintsControls(const ATinted, APlain: TThemeColors): Boolean;
 procedure ConfigureThemeTint(ATint: Integer; AMaterial: TWindowMaterial);
+{ Фон Normal: 0 — альфа 255, 100 — четверть прежнего хода, около 201. }
+function WindowOpacityByte(ATransparency: Integer): Byte;
+{ Блок Mica: 0 — альфа 255, 100 — альфа 40. }
+function ChromeOpacityByte(ATransparency: Integer): Byte;
+procedure ConfigureWindowOpacity(ATransparency: Integer);
+function WindowChromeIsAcrylic: Boolean;
 procedure SetActiveAppTheme(ATheme: TAppTheme);
 function ActiveAppTheme: TAppTheme;
 
@@ -240,6 +246,8 @@ var
   GActiveTheme: TAppTheme = atSystem;
   GColorTint: Integer = -1;
   GWindowMaterial: TWindowMaterial = wmNormal;
+  GOpacityByte: Byte = 255;
+  GChromeOpacityByte: Byte = 255;
 
 procedure ConfigureThemeTint(ATint: Integer; AMaterial: TWindowMaterial);
 begin
@@ -247,7 +255,30 @@ begin
     GColorTint := -1
   else
     GColorTint := EnsureRange(ATint, 0, 359);
-  GWindowMaterial := AMaterial;
+  GWindowMaterial := MaterialForWindows(AMaterial);
+end;
+
+function WindowOpacityByte(ATransparency: Integer): Byte;
+begin
+  ATransparency := EnsureRange(ATransparency, 0, 100);
+  Result := Byte(255 - Round(ATransparency / 100 * (255 - 40) * 0.25));
+end;
+
+function ChromeOpacityByte(ATransparency: Integer): Byte;
+begin
+  ATransparency := EnsureRange(ATransparency, 0, 100);
+  Result := Byte(255 - Round(ATransparency / 100 * (255 - 40)));
+end;
+
+procedure ConfigureWindowOpacity(ATransparency: Integer);
+begin
+  GOpacityByte := WindowOpacityByte(ATransparency);
+  GChromeOpacityByte := ChromeOpacityByte(ATransparency);
+end;
+
+function WindowChromeIsAcrylic: Boolean;
+begin
+  Result := GWindowMaterial = wmAcrylic;
 end;
 
 { HSV: hue and saturation replace gray, value stays. Lightness is not
@@ -486,7 +517,9 @@ begin
 end;
 
 const
+  DWMWA_USE_HOSTBACKDROPBRUSH = 17;
   DWMWA_SYSTEMBACKDROP_TYPE = 38;
+  DWMWA_REDIRECTIONBITMAP_ALPHA = 39;
   DWMWA_MICA_EFFECT = 1029;
   DWMWA_CAPTION_COLOR = 35;
   DWMWA_BORDER_COLOR = 34;
@@ -517,10 +550,11 @@ type
 
 function NtBuildNumber: DWORD;
 begin
-  Result := TOSVersion.Build;
+  Result := WindowsBuild;
 end;
 
-procedure SetAccentPolicy(AWnd: HWND; AState: Integer; AGradient: Cardinal);
+procedure SetAccentPolicy(AWnd: HWND; AState: Integer; AGradient: Cardinal;
+  AFlags: Integer = 2);
 var
   SetAttr: function(Wnd: HWND; var Data: TWinCompAttrData): BOOL; stdcall;
   Policy: TAccentPolicy;
@@ -531,12 +565,26 @@ begin
     Exit;
   FillChar(Policy, SizeOf(Policy), 0);
   Policy.AccentState := AState;
-  Policy.AccentFlags := 2;
+  Policy.AccentFlags := AFlags;
   Policy.GradientColor := AGradient;
   Data.Attribute := WCA_ACCENT_POLICY;
   Data.Data := @Policy;
   Data.SizeOfData := SizeOf(Policy);
   SetAttr(AWnd, Data);
+end;
+
+procedure SetRedirectionAlpha(AWnd: HWND; AOn: Boolean);
+var
+  Value: BOOL;
+begin
+  { Сборка 26100 и новее умеет брать альфу из картинки окна.
+    Без этого DWM считает клиент непрозрачным, и акрил виден только рамкой. }
+  if WindowsBuild < 26100 then
+    Exit;
+  if (GetWindowLong(AWnd, GWL_EXSTYLE) and WS_EX_LAYERED) <> 0 then
+    AOn := False;
+  Value := AOn;
+  DwmSetWindowAttribute(AWnd, DWMWA_REDIRECTIONBITMAP_ALPHA, @Value, SizeOf(Value));
 end;
 
 procedure ApplyWindowMaterial(AWnd: HWND; AMaterial: TWindowMaterial; ADark: Boolean);
@@ -546,14 +594,19 @@ var
   Margins: TMargins;
   Tint: Cardinal;
   ColorNone: COLORREF;
+  HonorAlpha, HostBrush: Boolean;
+  BrushOn: BOOL;
 begin
   if AWnd = 0 then
     Exit;
 
+  AMaterial := MaterialForWindows(AMaterial);
   ApplyNativeWindowChrome(AWnd, ADark);
 
   FillChar(Margins, SizeOf(Margins), 0);
   ColorNone := DWMWA_COLOR_NONE;
+  HonorAlpha := False;
+  HostBrush := False;
 
   case AMaterial of
     wmMica:
@@ -567,25 +620,20 @@ begin
         DwmSetWindowAttribute(AWnd, DWMWA_BORDER_COLOR, @ColorNone, SizeOf(ColorNone));
         if NtBuildNumber >= 22621 then
         begin
-          Backdrop := DWMSBT_TABBEDWINDOW;
-         // Backdrop := DWMSBT_MAINWINDOW;
+        //  Backdrop := DWMSBT_TABBEDWINDOW;
+          Backdrop := DWMSBT_MAINWINDOW;
           DwmSetWindowAttribute(AWnd, DWMWA_SYSTEMBACKDROP_TYPE, @Backdrop, SizeOf(Backdrop));
+          HonorAlpha := True;
         end
         else if NtBuildNumber >= 22000 then
         begin
           MicaOn := True;
           DwmSetWindowAttribute(AWnd, DWMWA_MICA_EFFECT, @MicaOn, SizeOf(MicaOn));
-        end
-        else
-        begin
-          if ADark then
-            Tint := $66202020
-          else
-            Tint := $66F3F3F3;
-          SetAccentPolicy(AWnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, Tint);
         end;
       end;
     wmAcrylic:
+      begin
+      if NtBuildNumber >= 22000 then
       begin
         Margins.cxLeftWidth := -1;
         Margins.cxRightWidth := -1;
@@ -598,6 +646,7 @@ begin
         begin
           Backdrop := DWMSBT_TRANSIENTWINDOW;
           DwmSetWindowAttribute(AWnd, DWMWA_SYSTEMBACKDROP_TYPE, @Backdrop, SizeOf(Backdrop));
+          HonorAlpha := True;
         end
         else
         begin
@@ -608,14 +657,31 @@ begin
           SetAccentPolicy(AWnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, Tint);
         end;
       end;
+      end;
   else
     Backdrop := DWMSBT_NONE;
     DwmSetWindowAttribute(AWnd, DWMWA_SYSTEMBACKDROP_TYPE, @Backdrop, SizeOf(Backdrop));
     MicaOn := False;
     DwmSetWindowAttribute(AWnd, DWMWA_MICA_EFFECT, @MicaOn, SizeOf(MicaOn));
     SetAccentPolicy(AWnd, ACCENT_DISABLED, 0);
+    { Альфа фона видна, только если кадр продлён в клиент и окно не layered.
+      Иначе DWM оставляет плотную плашку, и оттенок есть, а стекла нет. }
+    HonorAlpha := (GOpacityByte < 255) and (WindowsBuild >= 26100) and
+      ((GetWindowLong(AWnd, GWL_EXSTYLE) and WS_EX_LAYERED) = 0);
+    if HonorAlpha then
+    begin
+      Margins.cxLeftWidth := -1;
+      Margins.cxRightWidth := -1;
+      Margins.cyTopHeight := -1;
+      Margins.cyBottomHeight := -1;
+      HostBrush := True;
+    end;
     DwmExtendFrameIntoClientArea(AWnd, Margins);
   end;
+
+  SetRedirectionAlpha(AWnd, HonorAlpha);
+  BrushOn := HostBrush;
+  DwmSetWindowAttribute(AWnd, DWMWA_USE_HOSTBACKDROPBRUSH, @BrushOn, SizeOf(BrushOn));
 
   SetWindowPos(AWnd, 0, 0, 0, 0, 0,
     SWP_NOMOVE or SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE or SWP_FRAMECHANGED);
@@ -623,8 +689,40 @@ end;
 {$ENDIF}
 
 procedure TintChromeForMaterial(var AColors: TThemeColors; AMaterial: TWindowMaterial);
+
+  procedure Fade(var C: TAlphaColor);
+  var
+    Rec: TAlphaColorRec;
+  begin
+    if GChromeOpacityByte >= 255 then
+      Exit;
+    Rec.Color := C;
+    Rec.A := Byte(EnsureRange(Round(Rec.A * (GChromeOpacityByte / 255)), 0, 255));
+    C := Rec.Color;
+  end;
+
+  procedure ScaleWindow(var C: TAlphaColor);
+  var
+    Rec: TAlphaColorRec;
+  begin
+    if GOpacityByte >= 255 then
+      Exit;
+    Rec.Color := C;
+    Rec.A := Byte((Cardinal(Rec.A) * GOpacityByte + 127) div 255);
+    C := Rec.Color;
+  end;
+
 begin
+  AMaterial := MaterialForWindows(AMaterial);
   case AMaterial of
+    wmNormal:
+      if GOpacityByte < 255 then
+      begin
+        { Заливка окна и заголовок: оба поля красит оттенок.
+          Список, шапка колонок, вкладки и диски остаются плотными. }
+        AColors.Background := ThemeAdjustAlpha(AColors.Background, GOpacityByte);
+        AColors.TitleBarBackground := ThemeAdjustAlpha(AColors.TitleBarBackground, GOpacityByte);
+      end;
     wmMica:
       begin
         AColors.Background := ThemeAdjustAlpha(AColors.Background, $01);
@@ -638,6 +736,11 @@ begin
           AColors.PanelBackground := ThemeAdjustAlpha($FFF0F0F0, $E8)
         else
           AColors.PanelBackground := ThemeAdjustAlpha(AColors.PanelBackground, $E8);
+        { Ползунок: заливка списка, вкладки, диски, крошки, заголовок, статус. }
+        Fade(AColors.PanelBackground);
+        Fade(AColors.TitleBarBackground);
+        Fade(AColors.HeaderBackground);
+        Fade(AColors.TabBarBackground);
       end;
     wmAcrylic:
       begin
@@ -650,6 +753,15 @@ begin
         AColors.TabBarBackground := ThemeAdjustAlpha(AColors.TabBarBackground, $70);
         AColors.HeaderBackground := ThemeAdjustAlpha(AColors.HeaderBackground, $70);
         AColors.PanelBackground := ThemeAdjustAlpha(AColors.PanelBackground, $70);
+        { Ползунок: тот же предел, что у Normal, четверть прежнего хода. }
+        ScaleWindow(AColors.Background);
+        ScaleWindow(AColors.TitleBarBackground);
+        ScaleWindow(AColors.DockBackground);
+        ScaleWindow(AColors.ToolbarBackground);
+        ScaleWindow(AColors.FooterBackground);
+        ScaleWindow(AColors.TabBarBackground);
+        ScaleWindow(AColors.HeaderBackground);
+        ScaleWindow(AColors.PanelBackground);
       end;
   end;
 end;

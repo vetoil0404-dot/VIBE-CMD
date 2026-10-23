@@ -108,7 +108,8 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     procedure ClearItems;
-    procedure AddItem(const ACaption, AShortcut: string; AOnClick: TNotifyEvent);
+    procedure AddItem(const ACaption, AShortcut: string; AOnClick: TNotifyEvent;
+      AEnabled: Boolean = True);
     procedure AddSeparator;
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure PopupNear(ATarget: TControl; AOpenOnRight: Boolean);
@@ -736,7 +737,7 @@ begin
     if ARow.Controls[I] is TText then
     begin
       T := TText(ARow.Controls[I]);
-      if T.Tag = 8 then
+      if (T.Tag = 8) or (T.Tag = 9) then
         T.TextSettings.FontColor := FColors.SubTextColor
       else
         T.TextSettings.FontColor := FColors.TextColor;
@@ -762,7 +763,7 @@ begin
 end;
 
 procedure TFluentPopupMenu.AddItem(const ACaption, AShortcut: string;
-  AOnClick: TNotifyEvent);
+  AOnClick: TNotifyEvent; AEnabled: Boolean);
 var
   Row: TRectangle;
   Cap, Key: TText;
@@ -795,7 +796,19 @@ begin
   ApplyFluentText(Cap, 13, False);
   Cap.TextSettings.HorzAlign := TTextAlign.Leading;
   Cap.TextSettings.VertAlign := TTextAlign.Center;
-  Cap.TextSettings.FontColor := FColors.TextColor;
+  if AEnabled then
+    Cap.TextSettings.FontColor := FColors.TextColor
+  else
+  begin
+    { Tag 9 лишає тьмяний колір після ApplyTheme. HitTest false не ловить клік. }
+    Cap.Tag := 9;
+    Cap.TextSettings.FontColor := FColors.SubTextColor;
+    Row.HitTest := False;
+    Row.Cursor := crDefault;
+    Row.OnClick := nil;
+    Row.OnMouseEnter := nil;
+    Row.OnMouseLeave := nil;
+  end;
 
   if AShortcut <> '' then
   begin

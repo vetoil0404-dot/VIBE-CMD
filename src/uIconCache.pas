@@ -291,6 +291,23 @@ begin
   PathKey := '';
   if AEntry.FullPath <> '' then
     PathKey := CustomKey(AEntry.FullPath, ABucket);
+  { #shell:N — своя иконка пути. Тип #dir для шары сюда не подставляется. }
+  if StartsText('#shell:', AEntry.IconKey) then
+  begin
+    Result := nil;
+    NeedCustom := FAllowCustom and AEntry.NeedsCustomIcon and (PathKey <> '');
+    FLock.Enter;
+    try
+      if (PathKey <> '') and FCustom.TryGetValue(PathKey, Result) and Assigned(Result) then
+        Exit;
+      Result := nil;
+    finally
+      FLock.Leave;
+    end;
+    if NeedCustom then
+      RequestCustom(AEntry, ABucket, AScale);
+    Exit;
+  end;
   ExtKey := TypeKey(AEntry.IconKey, AEntry.IsDirectory, ABucket);
   if AEntry.IsDirectory then
     FbKey := TypeKey('#dir', True, ABucket)

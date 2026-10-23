@@ -31,6 +31,10 @@ end;
 function FormatFileDate(const DateTime: TDateTime): string;
 function FormatFileSize(const Bytes: Int64): string;
 procedure GetFileIconBitmap(const AFilePath: string; IsFolder: Boolean; var ABitmap: FMX.Graphics.TBitmap);
+procedure GetNetworkDriveIconBitmap(var ABitmap: FMX.Graphics.TBitmap;
+  AConnected: Boolean = True);
+procedure GetNetworkFolderIconBitmap(var ABitmap: FMX.Graphics.TBitmap);
+function CachedStockIcon(AId: Integer): FMX.Graphics.TBitmap;
 procedure GetTypeIconBitmap(const AIconKey: string; AIsDir: Boolean; var ABitmap: FMX.Graphics.TBitmap);
 procedure GetAppIconBitmap(var ABitmap: FMX.Graphics.TBitmap; ASize: Integer = 32);
 function GetFileThumbnail(const AFilePath: string; AWidth, AHeight: Integer; ABitmap: FMX.Graphics.TBitmap): Boolean;
@@ -1023,6 +1027,7 @@ end;
 
 var
   GSysImageLock: TCriticalSection;
+  GStockIcons: TDictionary<Integer, FMX.Graphics.TBitmap>;
 
 function LooksLikePaperSheet(const APixels: TBytes; AWidth, AHeight: Integer): Boolean;
 var
@@ -1903,6 +1908,51 @@ begin
     RawToFmxBitmap(Pixels, W, H, ABitmap);
 end;
 
+procedure GetStockIconBitmap(AId: Integer; var ABitmap: FMX.Graphics.TBitmap);
+var
+  Info: TSHStockIconInfo;
+begin
+  ABitmap := nil;
+  FillChar(Info, SizeOf(Info), 0);
+  Info.cbSize := SizeOf(Info);
+  if Failed(SHGetStockIconInfo(AId, SHGSI_ICON or SHGSI_LARGEICON, Info)) then
+    Exit;
+  try
+    if Info.hIcon <> 0 then
+      IconHandleToFmxBitmap(Info.hIcon, ABitmap);
+  finally
+    if Info.hIcon <> 0 then
+      DestroyIcon(Info.hIcon);
+  end;
+end;
+
+function CachedStockIcon(AId: Integer): FMX.Graphics.TBitmap;
+begin
+  Result := nil;
+  if AId <= 0 then
+    Exit;
+  if GStockIcons = nil then
+    GStockIcons := TDictionary<Integer, FMX.Graphics.TBitmap>.Create;
+  if GStockIcons.TryGetValue(AId, Result) then
+    Exit;
+  GetStockIconBitmap(AId, Result);
+  GStockIcons.AddOrSetValue(AId, Result);
+end;
+
+procedure GetNetworkDriveIconBitmap(var ABitmap: FMX.Graphics.TBitmap;
+  AConnected: Boolean);
+begin
+  if AConnected then
+    GetStockIconBitmap(SIID_DRIVENET, ABitmap)
+  else
+    GetStockIconBitmap(SIID_DRIVENETDISABLED, ABitmap);
+end;
+
+procedure GetNetworkFolderIconBitmap(var ABitmap: FMX.Graphics.TBitmap);
+begin
+  GetStockIconBitmap(SIID_SERVERSHARE, ABitmap);
+end;
+
 procedure GetAppIconBitmap(var ABitmap: FMX.Graphics.TBitmap; ASize: Integer);
 var
   H, Shared: HICON;
@@ -2065,6 +2115,12 @@ initialization
   GSysImageLock := TCriticalSection.Create;
 
 finalization
+  if GStockIcons <> nil then
+  begin
+    for var StockBmp in GStockIcons.Values do
+      StockBmp.Free;
+    FreeAndNil(GStockIcons);
+  end;
   FreeAndNil(GSysImageLock);
 
 end.

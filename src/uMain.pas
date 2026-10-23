@@ -115,6 +115,13 @@ type
     FStartupDone: Boolean;
     FFading: Boolean;
     FStartupPhase: Integer;
+    FLaunchApplied: Boolean;
+    FLaunchLeftOwned: Boolean;
+    FLaunchRightOwned: Boolean;
+    FLaunchNoticeL: string;
+    FLaunchNoticeR: string;
+    FLaunchGenL: Integer;
+    FLaunchGenR: Integer;
     FFirstPaintLogged: Boolean;
     FLeftReady: Boolean;
     FRightReady: Boolean;
@@ -298,6 +305,7 @@ type
     procedure ApplyLanguage;
     procedure ApplyThemeToAll(const AColors: TThemeColors);
     procedure ApplyWindowBackground;
+    procedure ApplyWindowOpacity;
     procedure ApplyBandLayout;
     procedure ApplyPanelSettings;
     procedure ApplyDriveOptions;
@@ -326,6 +334,14 @@ type
     procedure DockGoToObject(Sender: TObject; const APath: string);
     procedure DockStatus(Sender: TObject; const AText: string);
     procedure DockChanged(Sender: TObject);
+    procedure InstallFrameHook;
+    procedure ApplyLaunchOpen(AForce: Boolean);
+    procedure OpenLaunchSide(APanel: TFilePanel; const APath: string;
+      ASelect, ANewTab, AStartup: Boolean; var ANotice: string);
+    procedure QueueLaunchProbe(APanel: TFilePanel; const APath: string;
+      ANewTab, AStartup: Boolean);
+    procedure FinishLaunchProbe(APanel: TFilePanel; const APath: string;
+      AIsDir, AIsFile, ANewTab, AStartup: Boolean; ASide, AGen: Integer);
 
   protected
     procedure CreateHandle; override;
@@ -358,6 +374,8 @@ uses
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
   APP_WND_PROP = 'VibeCmdMain';
+  LAUNCH_MAGIC = $56434D31;
+  LAUNCH_PATH_CHARS = 2048;
   TITLEBAR_HEIGHT = 40;
   CAPTION_BTN_W = 47;
   APP_VERSION_FALLBACK = '1.0.0';
@@ -389,12 +407,60 @@ const
   MIN_WINDOW_FLOOR = 480;
   MIN_WINDOW_HEIGHT = 700;
 
+type
+  TLaunchSide = record
+    Used: Boolean;
+    Select: Boolean;
+    Path: string;
+  end;
+
+  TLaunchState = record
+    Parsed: Boolean;
+    NewTab: Boolean;
+    HandOff: Boolean;
+    NewWindow: Boolean;
+    Minimize: Boolean;
+    Left: TLaunchSide;
+    Right: TLaunchSide;
+  end;
+
+  TLaunchPacket = packed record
+    Magic: Cardinal;
+    Version: Word;
+    NewTab: Byte;
+    HasLeft: Byte;
+    HasRight: Byte;
+    SelectLeft: Byte;
+    SelectRight: Byte;
+    LeftPath: array[0..LAUNCH_PATH_CHARS - 1] of WideChar;
+    RightPath: array[0..LAUNCH_PATH_CHARS - 1] of WideChar;
+  end;
+
+  TLaunchProbe = class
+  public
+    Form: TMainForm;
+    Panel: TFilePanel;
+    Path: string;
+    NewTab: Boolean;
+    Startup: Boolean;
+    IsDir: Boolean;
+    IsFile: Boolean;
+    Side: Integer;
+    Gen: Integer;
+    procedure Execute;
+    procedure Apply;
+  end;
+
 var
   GAppStartTick: UInt64;
+  GLaunch: TLaunchState;
+  GMainAlive: Boolean;
 {$IFDEF MSWINDOWS}
   GAppMutex: THandle;
   GFoundWnd: Winapi.Windows.HWND;
 {$ENDIF}
+
+function FrameWndProc(hWnd: HWND; Msg: UINT; wParam: WPARAM; lParam: LPARAM): LRESULT; stdcall; forward;
 
 procedure StartupLog(const AStage: string);
 begin
@@ -427,18 +493,329 @@ begin
 end;
 {$ENDIF}
 
+function ExpandLaunchPath(const APath: string): string;
+var
+  S: string;
+begin
+  S := Trim(APath);
+  if S = '' then
+    Exit('');
+  if (Length(S) >= 2) and
+     (((S[1] = '\') and (S[2] = '\')) or ((S[1] = '/') and (S[2] = '/'))) then
+  begin
+    S[1] := '\';
+    S[2] := '\';
+    Exit(S);
+  end;
+  if Pos('://', S) > 0 then
+    Exit(S);
+  Result := ExpandFileName(S);
+end;
+
+function SplitLaunchSwitch(const A: string; out AKey, AVal: string): Boolean;
+var
+  Body: string;
+  I, P: Integer;
+begin
+  Result := False;
+  AKey := '';
+  AVal := '';
+  if (A = '') or (A[1] <> '/') then
+    Exit;
+  { //server — это путь, не ключ. }
+  if (Length(A) >= 2) and (A[2] = '/') then
+    Exit;
+  Body := Copy(A, 2, MaxInt);
+  P := 0;
+  for I := 1 to Length(Body) do
+    if (Body[I] = '=') or (Body[I] = ':') or (Body[I] = ',') then
+    begin
+      P := I;
+      Break;
+    end;
+  if P = 0 then
+    AKey := Body
+  else
+  begin
+    AKey := Copy(Body, 1, P - 1);
+    AVal := Trim(Copy(Body, P + 1, MaxInt));
+  end;
+  Result := True;
+end;
+
+procedure ParseLaunchArgs;
+var
+  I, NS, NB: Integer;
+  Arg, Key, Val, IniRaw, Expanded: string;
+  HasL, HasR: Boolean;
+  LFlag, RFlag: string;
+  Selects, Bares: TArray<string>;
+
+  procedure Push(var Arr: TArray<string>; var Count: Integer; const S: string);
+  begin
+    if Trim(S) = '' then
+      Exit;
+    if Count > High(Arr) then
+      SetLength(Arr, Count + 8);
+    Arr[Count] := Trim(S);
+    Inc(Count);
+  end;
+
+  procedure Take(var Side: TLaunchSide; const APath: string; ASelect: Boolean);
+  begin
+    if Side.Used or (Trim(APath) = '') then
+      Exit;
+    try
+      Expanded := ExpandLaunchPath(APath);
+    except
+      Exit;
+    end;
+    if Expanded = '' then
+      Exit;
+    Side.Used := True;
+    Side.Select := ASelect;
+    Side.Path := Expanded;
+  end;
+
+begin
+  if GLaunch.Parsed then
+    Exit;
+  GLaunch.Parsed := True;
+  HasL := False;
+  HasR := False;
+  NS := 0;
+  NB := 0;
+  IniRaw := '';
+  SetLength(Selects, 4);
+  SetLength(Bares, 4);
+  for I := 1 to ParamCount do
+  begin
+    Arg := ParamStr(I);
+    if Arg = '' then
+      Continue;
+    try
+      if not SplitLaunchSwitch(Arg, Key, Val) then
+      begin
+        Push(Bares, NB, Arg);
+        Continue;
+      end;
+      if SameText(Key, 'L') and (Val <> '') then
+      begin
+        HasL := True;
+        LFlag := Val;
+      end
+      else if SameText(Key, 'R') and (Val <> '') then
+      begin
+        HasR := True;
+        RFlag := Val;
+      end
+      else if SameText(Key, 'T') then
+        GLaunch.NewTab := True
+      else if SameText(Key, 'O') then
+        GLaunch.HandOff := True
+      else if SameText(Key, 'N') then
+        GLaunch.NewWindow := True
+      else if SameText(Key, 'min') then
+        GLaunch.Minimize := True
+      else if SameText(Key, 'ini') and (Val <> '') then
+        IniRaw := Val
+      else if SameText(Key, 'select') and (Val <> '') then
+        Push(Selects, NS, Val);
+    except
+    end;
+  end;
+
+  if IniRaw <> '' then
+  try
+    SetSettingsIniOverride(ExpandLaunchPath(IniRaw));
+  except
+  end;
+
+  if HasL then
+    Take(GLaunch.Left, LFlag, False);
+  if HasR then
+    Take(GLaunch.Right, RFlag, False);
+  for I := 0 to NS - 1 do
+    if not GLaunch.Left.Used then
+      Take(GLaunch.Left, Selects[I], True)
+    else
+      Take(GLaunch.Right, Selects[I], True);
+  for I := 0 to NB - 1 do
+    if not GLaunch.Left.Used then
+      Take(GLaunch.Left, Bares[I], False)
+    else
+      Take(GLaunch.Right, Bares[I], False);
+end;
+
+function LaunchHasPaths: Boolean;
+begin
+  Result := GLaunch.Left.Used or GLaunch.Right.Used;
+end;
+
+{$IFDEF MSWINDOWS}
+function FindVibeWindow: Winapi.Windows.HWND;
+begin
+  GFoundWnd := 0;
+  Winapi.Windows.EnumWindows(@EnumVibeWnd, 0);
+  if GFoundWnd = 0 then
+    GFoundWnd := Winapi.Windows.FindWindow(nil, PChar('V!BE CMD'));
+  Result := GFoundWnd;
+end;
+
+procedure StoreLaunchPath(var ABuf: array of WideChar; const S: string);
+var
+  I, N: Integer;
+begin
+  N := Length(S);
+  if N > High(ABuf) then
+    N := High(ABuf);
+  for I := 1 to N do
+    ABuf[I - 1] := S[I];
+  if N <= High(ABuf) then
+    ABuf[N] := #0;
+end;
+
+function SendLaunch(Wnd: Winapi.Windows.HWND): LRESULT;
+var
+  Packet: TLaunchPacket;
+  Cds: TCopyDataStruct;
+begin
+  Result := 0;
+  if (Wnd = 0) or not LaunchHasPaths then
+    Exit;
+  FillChar(Packet, SizeOf(Packet), 0);
+  Packet.Magic := LAUNCH_MAGIC;
+  Packet.Version := 1;
+  if GLaunch.NewTab then
+    Packet.NewTab := 1;
+  if GLaunch.Left.Used then
+    Packet.HasLeft := 1;
+  if GLaunch.Right.Used then
+    Packet.HasRight := 1;
+  if GLaunch.Left.Select then
+    Packet.SelectLeft := 1;
+  if GLaunch.Right.Select then
+    Packet.SelectRight := 1;
+  StoreLaunchPath(Packet.LeftPath, GLaunch.Left.Path);
+  StoreLaunchPath(Packet.RightPath, GLaunch.Right.Path);
+  Cds.dwData := LAUNCH_MAGIC;
+  Cds.cbData := SizeOf(Packet);
+  Cds.lpData := @Packet;
+  Result := SendMessage(Wnd, WM_COPYDATA, 0, LPARAM(@Cds));
+end;
+
+procedure BringVibeForward(Wnd: Winapi.Windows.HWND);
+var
+  Pid: DWORD;
+begin
+  if (Wnd = 0) or not IsWindow(Wnd) then
+    Exit;
+  Pid := 0;
+  GetWindowThreadProcessId(Wnd, Pid);
+  if Pid <> 0 then
+    AllowSetForegroundWindow(Pid);
+  if IsIconic(Wnd) then
+    Winapi.Windows.ShowWindow(Wnd, SW_RESTORE)
+  else if IsWindowVisible(Wnd) then
+    Winapi.Windows.ShowWindow(Wnd, SW_SHOW);
+  SetForegroundWindow(Wnd);
+  BringWindowToTop(Wnd);
+end;
+
+procedure TryOwnMutex;
+var
+  Held: THandle;
+begin
+  if (GAppMutex <> 0) or not SingleInstanceWanted then
+    Exit;
+  Held := CreateMutex(nil, True, APP_MUTEX_NAME);
+  if Held = 0 then
+    Exit;
+  if GetLastError = ERROR_ALREADY_EXISTS then
+    CloseHandle(Held)
+  else
+    GAppMutex := Held;
+end;
+
+function TryTakeLaunchPacket(LParam: LPARAM): Boolean;
+var
+  Cds: PCopyDataStruct;
+  Pkt: ^TLaunchPacket;
+begin
+  Result := False;
+  if LParam = 0 then
+    Exit;
+  Cds := PCopyDataStruct(LParam);
+  if (Cds = nil) or (Cds.dwData <> LAUNCH_MAGIC) or
+     (Cds.lpData = nil) or (Cds.cbData < SizeOf(TLaunchPacket)) then
+    Exit;
+  Pkt := Pointer(Cds.lpData);
+  if (Pkt.Magic <> LAUNCH_MAGIC) or (Pkt.Version <> 1) then
+    Exit;
+  GLaunch.NewTab := Pkt.NewTab <> 0;
+  GLaunch.Left.Used := Pkt.HasLeft <> 0;
+  GLaunch.Left.Select := Pkt.SelectLeft <> 0;
+  GLaunch.Left.Path := PWideChar(@Pkt.LeftPath[0]);
+  GLaunch.Right.Used := Pkt.HasRight <> 0;
+  GLaunch.Right.Select := Pkt.SelectRight <> 0;
+  GLaunch.Right.Path := PWideChar(@Pkt.RightPath[0]);
+  { Чужой запуск показывает это окно. Отложенный /min больше не сворачивает. }
+  GLaunch.Minimize := False;
+  if GHookForm <> nil then
+  begin
+    var HookWnd := FormToHWND(GHookForm);
+    if HookWnd <> 0 then
+      SetLayeredWindowAttributes(HookWnd, 0, 255, LWA_ALPHA);
+    GHookForm.HideFmxAppWindow;
+  end;
+  Result := True;
+  if (GHookForm <> nil) and GHookForm.FLaunchApplied and
+     not (csDestroying in GHookForm.ComponentState) then
+    TThread.ForceQueue(nil,
+      procedure
+      begin
+        if (GHookForm <> nil) and not (csDestroying in GHookForm.ComponentState) then
+          GHookForm.ApplyLaunchOpen(True);
+      end);
+end;
+{$ENDIF}
+
 function TryActivateRunningInstance: Boolean;
 {$IFDEF MSWINDOWS}
 var
-  Wnd: Winapi.Windows.HWND;
-  Pid: DWORD;
+  Wnd, SawWnd: Winapi.Windows.HWND;
   Started: UInt64;
   Held: THandle;
+  WantSingle: Boolean;
 begin
   Result := False;
-  if not SingleInstanceWanted then
+  ParseLaunchArgs;
+  { /N не отказывает. Свободный мьютекс забираем, занятый не держим. }
+  if GLaunch.NewWindow then
+  begin
+    TryOwnMutex;
+    StartupLog('launch /N');
+    Exit(False);
+  end;
+  WantSingle := SingleInstanceWanted;
+  if GLaunch.HandOff and not WantSingle then
+  begin
+    Wnd := FindVibeWindow;
+    if Wnd <> 0 then
+    begin
+      if LaunchHasPaths then
+        SendLaunch(Wnd);
+      BringVibeForward(Wnd);
+      StartupLog('launch /O');
+      Exit(True);
+    end;
+    StartupLog('launch /O new');
+    Exit(False);
+  end;
+  if not WantSingle then
     Exit;
   Started := GetTickCount64;
+  SawWnd := 0;
   while True do
   begin
     Held := CreateMutex(nil, True, APP_MUTEX_NAME);
@@ -447,32 +824,31 @@ begin
     if GetLastError <> ERROR_ALREADY_EXISTS then
     begin
       GAppMutex := Held;
+      StartupLog('launch primary');
       Exit;
     end;
     { Чужой хэндл не держим: иначе мьютекс живёт, пока мы ждём. }
     CloseHandle(Held);
-    GFoundWnd := 0;
-    Winapi.Windows.EnumWindows(@EnumVibeWnd, 0);
-    if GFoundWnd = 0 then
-      GFoundWnd := Winapi.Windows.FindWindow(nil, PChar('V!BE CMD'));
-    Wnd := GFoundWnd;
-    if (Wnd <> 0) and IsWindowVisible(Wnd) then
+    Wnd := FindVibeWindow;
+    if Wnd <> 0 then
     begin
-      GetWindowThreadProcessId(Wnd, Pid);
-      if Pid <> 0 then
-        AllowSetForegroundWindow(Pid);
-      if IsIconic(Wnd) then
-        Winapi.Windows.ShowWindow(Wnd, SW_RESTORE)
-      else
-        Winapi.Windows.ShowWindow(Wnd, SW_SHOW);
-      SetForegroundWindow(Wnd);
-      BringWindowToTop(Wnd);
-      Result := True;
-      Exit;
+      SawWnd := Wnd;
+      if (not LaunchHasPaths) or (SendLaunch(Wnd) <> 0) then
+      begin
+        BringVibeForward(Wnd);
+        StartupLog('launch handoff');
+        Exit(True);
+      end;
     end;
     if GetTickCount64 - Started >= 300 then
     begin
-      with TIniFile.Create(ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini') do
+      if SawWnd <> 0 then
+      begin
+        BringVibeForward(SawWnd);
+        StartupLog('launch handoff late');
+        Exit(True);
+      end;
+      with TIniFile.Create(ActiveSettingsIni) do
       try
         SetLanguage(ReadString('Main', 'Language', 'system'));
       finally
@@ -488,12 +864,14 @@ begin
 end;
 {$ELSE}
 begin
+  ParseLaunchArgs;
   Result := False;
 end;
 {$ENDIF}
 
 constructor TMainForm.Create(AOwner: TComponent);
 begin
+  GMainAlive := True;
   inherited CreateNew(AOwner);
   StartupLog('Create');
   Caption := 'V!BE CMD';
@@ -505,6 +883,7 @@ begin
   FSettings.Load;
   SetLanguage(FSettings.Language);
   ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  ConfigureWindowOpacity(FSettings.Transparency);
   SeedDockIfNeeded(FSettings);
   SetActiveAppTheme(FSettings.Theme);
   SetFileOpMode(FSettings.FileOpMode);
@@ -569,6 +948,8 @@ end;
 
 destructor TMainForm.Destroy;
 begin
+  GMainAlive := False;
+  SetLiveOpHandler(nil);
   SetFileOpHubChanged(nil);
   if Assigned(FOpTimer) then
     FOpTimer.Enabled := False;
@@ -591,6 +972,7 @@ begin
       if FSessionDirty or not FSessionSnap then
         SnapshotSession;
       try
+        FSettings.FlushPrefs;
         FSettings.SaveSession;
       except
       end;
@@ -626,6 +1008,334 @@ begin
   inherited;
 end;
 
+procedure TLaunchProbe.Execute;
+begin
+  IsDir := False;
+  IsFile := False;
+  try
+    IsDir := TDirectory.Exists(Path);
+    if not IsDir then
+      IsFile := TFile.Exists(Path);
+  except
+    IsDir := False;
+    IsFile := False;
+  end;
+  TThread.Queue(nil, Apply);
+end;
+
+procedure TLaunchProbe.Apply;
+var
+  Fresh: Boolean;
+begin
+  try
+    Fresh := False;
+    if GMainAlive and (Form <> nil) and
+       not (csDestroying in Form.ComponentState) then
+    begin
+      if Side = 1 then
+        Fresh := Gen = Form.FLaunchGenR
+      else
+        Fresh := Gen = Form.FLaunchGenL;
+    end;
+    if Fresh then
+      Form.FinishLaunchProbe(Panel, Path, IsDir, IsFile, NewTab, Startup, Side, Gen);
+  finally
+    Free;
+  end;
+end;
+
+procedure TMainForm.QueueLaunchProbe(APanel: TFilePanel; const APath: string;
+  ANewTab, AStartup: Boolean);
+var
+  Probe: TLaunchProbe;
+begin
+  if (APanel = nil) or (APath = '') or not GMainAlive then
+    Exit;
+  Probe := TLaunchProbe.Create;
+  Probe.Form := Self;
+  Probe.Panel := APanel;
+  Probe.Path := APath;
+  Probe.NewTab := ANewTab;
+  Probe.Startup := AStartup;
+  if APanel = FRightPanel then
+  begin
+    Probe.Side := 1;
+    Inc(FLaunchGenR);
+    Probe.Gen := FLaunchGenR;
+  end
+  else
+  begin
+    Probe.Side := 0;
+    Inc(FLaunchGenL);
+    Probe.Gen := FLaunchGenL;
+  end;
+  TThread.CreateAnonymousThread(
+    procedure
+    begin
+      Probe.Execute;
+    end).Start;
+end;
+
+procedure TMainForm.FinishLaunchProbe(APanel: TFilePanel; const APath: string;
+  AIsDir, AIsFile, ANewTab, AStartup: Boolean; ASide, AGen: Integer);
+var
+  Parent, Notice: string;
+
+  procedure Remember(const AText: string);
+  begin
+    if not AStartup then
+    begin
+      APanel.ShowNotice(AText);
+      Exit;
+    end;
+    if APanel = FLeftPanel then
+    begin
+      if FLeftReady then
+        APanel.ShowNotice(AText)
+      else
+        FLaunchNoticeL := AText;
+    end
+    else if FRightReady then
+      APanel.ShowNotice(AText)
+    else
+      FLaunchNoticeR := AText;
+  end;
+
+  procedure OpenNow(const AFolder, ASelectPath: string);
+  begin
+    if not IsListablePath(AFolder) then
+    begin
+      Remember(L('panel.folder.missing'));
+      Exit;
+    end;
+    if APanel = FLeftPanel then
+      FLaunchLeftOwned := True
+    else if APanel = FRightPanel then
+      FLaunchRightOwned := True;
+    try
+      if ANewTab then
+        APanel.AddTab(AFolder, ASelectPath)
+      else
+        APanel.Navigate(AFolder, ASelectPath);
+      APanel.ReleaseDeferredLoad;
+    except
+      if APanel = FLeftPanel then
+        FLaunchLeftOwned := False
+      else if APanel = FRightPanel then
+        FLaunchRightOwned := False;
+      Remember(L('panel.folder.missing'));
+    end;
+  end;
+
+begin
+  if (ASide = 1) and (AGen <> FLaunchGenR) then
+    Exit;
+  if (ASide <> 1) and (AGen <> FLaunchGenL) then
+    Exit;
+  if APanel = nil then
+    Exit;
+  if AIsDir then
+  begin
+    OpenNow(APath, '');
+    Exit;
+  end;
+  if AIsFile then
+  begin
+    Parent := ExtractFileDir(ExcludeTrailingPathDelimiter(APath));
+    if Parent = '' then
+      Parent := ExtractFilePath(APath);
+    if Parent = '' then
+      Remember(L('panel.folder.missing'))
+    else
+      OpenNow(Parent, APath);
+    Exit;
+  end;
+  Notice := L('panel.folder.missing');
+  Remember(Notice);
+end;
+
+function LaunchSkipStat(const APath: string): Boolean;
+begin
+  Result := IsUncPath(APath) or IsVibeNetworkPath(APath) or IsRemotePath(APath) or
+    UiSkipNetworkTouch(APath) or IsVirtualShellPath(APath) or
+    IsPortableDevicePath(APath) or IsThisPCPath(APath);
+end;
+
+procedure TMainForm.InstallFrameHook;
+{$IFDEF MSWINDOWS}
+var
+  Wnd: HWND;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Wnd := FormToHWND(Self);
+  if Wnd = 0 then
+    Exit;
+  GHookForm := Self;
+  if FFrameHooked then
+    Exit;
+  FOldWndProc := Pointer(GetWindowLongPtr(Wnd, GWL_WNDPROC));
+  SetWindowLongPtr(Wnd, GWL_WNDPROC, NativeInt(@FrameWndProc));
+  FFrameHooked := True;
+  {$ENDIF}
+end;
+
+procedure TMainForm.OpenLaunchSide(APanel: TFilePanel; const APath: string;
+  ASelect, ANewTab, AStartup: Boolean; var ANotice: string);
+var
+  Parent: string;
+
+  procedure NoteMissing;
+  begin
+    if AStartup then
+      ANotice := L('panel.folder.missing')
+    else if Assigned(APanel) then
+      APanel.ShowNotice(L('panel.folder.missing'));
+  end;
+
+  function ParentOf(const P: string): string;
+  begin
+    Result := ExtractFileDir(ExcludeTrailingPathDelimiter(P));
+    if Result = '' then
+      Result := ExtractFilePath(P);
+  end;
+
+  procedure MarkOwned;
+  begin
+    if APanel = FLeftPanel then
+      FLaunchLeftOwned := True
+    else if APanel = FRightPanel then
+      FLaunchRightOwned := True;
+  end;
+
+  procedure UnmarkOwned;
+  begin
+    if APanel = FLeftPanel then
+      FLaunchLeftOwned := False
+    else if APanel = FRightPanel then
+      FLaunchRightOwned := False;
+  end;
+
+  function ParentMissing(const P: string): Boolean;
+  begin
+    Result := False;
+    if P = '' then
+      Exit(True);
+    if LaunchSkipStat(P) then
+      Exit(False);
+    Result := not TDirectory.Exists(P);
+  end;
+
+  procedure OpenFolder(const AFolder, ASelectPath: string);
+  begin
+    if ANewTab and not IsListablePath(AFolder) then
+    begin
+      NoteMissing;
+      Exit;
+    end;
+    MarkOwned;
+    try
+      if ANewTab then
+        APanel.AddTab(AFolder, ASelectPath)
+      else
+        APanel.Navigate(AFolder, ASelectPath);
+      APanel.ReleaseDeferredLoad;
+    except
+      UnmarkOwned;
+      NoteMissing;
+    end;
+  end;
+
+begin
+  if (APanel = nil) or (APath = '') then
+    Exit;
+  try
+    if ASelect then
+    begin
+      Parent := ParentOf(APath);
+      if ParentMissing(Parent) then
+      begin
+        NoteMissing;
+        Exit;
+      end;
+      OpenFolder(Parent, APath);
+      Exit;
+    end;
+    if IsVibeNetworkPath(APath) or IsVirtualShellPath(APath) or
+       IsPortableDevicePath(APath) or IsThisPCPath(APath) then
+    begin
+      OpenFolder(APath, '');
+      Exit;
+    end;
+    { UNC и сетевой диск не трогаем с UI: файл это или папка — смотрит фон. }
+    if IsUncPath(APath) or IsRemotePath(APath) or UiSkipNetworkTouch(APath) then
+    begin
+      if (APath[Length(APath)] = '\') or (APath[Length(APath)] = '/') then
+        OpenFolder(APath, '')
+      else
+        QueueLaunchProbe(APanel, APath, ANewTab, AStartup);
+      Exit;
+    end;
+    if TDirectory.Exists(APath) then
+    begin
+      OpenFolder(APath, '');
+      Exit;
+    end;
+    if TFile.Exists(APath) then
+    begin
+      Parent := ParentOf(APath);
+      if ParentMissing(Parent) then
+      begin
+        NoteMissing;
+        Exit;
+      end;
+      OpenFolder(Parent, APath);
+      Exit;
+    end;
+    NoteMissing;
+  except
+    NoteMissing;
+  end;
+end;
+
+procedure TMainForm.ApplyLaunchOpen(AForce: Boolean);
+var
+  LeftPath, RightPath: string;
+  UseL, UseR, SelL, SelR, NewTab, ActiveRight: Boolean;
+begin
+  if FLaunchApplied and not AForce then
+    Exit;
+  if not AForce then
+  begin
+    FLaunchApplied := True;
+    FLaunchLeftOwned := False;
+    FLaunchRightOwned := False;
+    FLaunchNoticeL := '';
+    FLaunchNoticeR := '';
+  end;
+  UseL := GLaunch.Left.Used;
+  LeftPath := GLaunch.Left.Path;
+  SelL := GLaunch.Left.Select;
+  UseR := GLaunch.Right.Used;
+  RightPath := GLaunch.Right.Path;
+  SelR := GLaunch.Right.Select;
+  NewTab := GLaunch.NewTab;
+  if FActivePanel = FRightPanel then
+    ActiveRight := True
+  else if FActivePanel = FLeftPanel then
+    ActiveRight := False
+  else
+    ActiveRight := Assigned(FSettings) and (FSettings.ActivePanel = 1);
+  if UseL then
+    OpenLaunchSide(FLeftPanel, LeftPath, SelL, NewTab and not ActiveRight,
+      not AForce, FLaunchNoticeL);
+  if UseR then
+    OpenLaunchSide(FRightPanel, RightPath, SelR, NewTab and ActiveRight,
+      not AForce, FLaunchNoticeR);
+  if UseL or UseR then
+    StartupLog('launch paths');
+end;
+
 procedure TMainForm.CreateHandle;
 {$IFDEF MSWINDOWS}
 var
@@ -638,6 +1348,7 @@ begin
   Wnd := FormToHWND(Self);
   if Wnd <> 0 then
   begin
+    InstallFrameHook;
     SetProp(Wnd, PChar(APP_WND_PROP), 1);
     SetFileOpOwnerWnd(Wnd);
     ShowWindow(Wnd, SW_HIDE);
@@ -720,7 +1431,10 @@ begin
     FRightPanel.CancelPendingIO;
   try
     if Assigned(FSettings) then
+    begin
+      FSettings.FlushPrefs;
       FSettings.SaveSession;
+    end;
   except
   end;
   FSessionSaved := True;
@@ -847,7 +1561,11 @@ begin
 
   case Msg of
 
-   WM_CLOSE:
+   WM_COPYDATA:
+    if TryTakeLaunchPacket(lParam) then
+      Exit(1);
+
+  WM_CLOSE:
   begin
     TThread.ForceQueue(nil,
       procedure
@@ -876,10 +1594,13 @@ begin
       // 3. Программный "клик" альта для синхронизации очереди
       keybd_event(VK_MENU, $38, KEYEVENTF_KEYUP, 0);
 
-      // 4. Возвращаем фокус
-      Winapi.Windows.SetFocus(hWnd);
-      if GHookForm.FActivePanel <> nil then
-        GHookForm.FActivePanel.SetFocus;
+      // 4. Фокус. На свёрнутом окне SetFocus его раскрывает — не трогаем.
+      if not IsIconic(hWnd) then
+      begin
+        Winapi.Windows.SetFocus(hWnd);
+        if GHookForm.FActivePanel <> nil then
+          GHookForm.FActivePanel.SetFocus;
+      end;
 
       Exit(0);
     end;
@@ -1052,11 +1773,13 @@ begin
               end;
               GHookForm.FSettings.WindowMaximized := Maxed;
               { Поверх IsZoomed не писать ни wsNormal, ни wsMaximized:
-                FMX от wsMaximized снимает разворот и ставит его снова. }
-              if (not IsZoomed(hWnd)) and (not Maxed) then
+                FMX от wsMaximized снимает разворот и ставит его снова.
+                Свёрнутое тоже не трогать: wsNormal разворачивает его обратно. }
+              if (not IsZoomed(hWnd)) and (not IsIconic(hWnd)) and (not Maxed) then
                 GHookForm.WindowState := TWindowState.wsNormal;
               GHookForm.UpdateWindowButtons;
-              PostMessage(hWnd, WM_REFRESH_FOCUS, 0, 0);
+              if not IsIconic(hWnd) then
+                PostMessage(hWnd, WM_REFRESH_FOCUS, 0, 0);
             end);
           Exit;
         end;
@@ -1122,6 +1845,7 @@ var
   Corner: Integer;
   Margins: TMargins;
   CapColor: COLORREF;
+  WantPixel: Boolean;
 {$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
@@ -1135,23 +1859,25 @@ begin
   SetWindowLong(Wnd, GWL_STYLE, Style);
   var Ex := GetWindowLong(Wnd, GWL_EXSTYLE);
   Ex := (Ex or WS_EX_APPWINDOW) and not WS_EX_TOOLWINDOW;
+  { Normal с прозрачностью на 24H2: без layered, чтобы DWM взял альфу фона.
+    Пока идёт появление, окно остаётся layered и доходит до альфы 255. }
+  WantPixel := (not FFading) and FStartupDone and Assigned(FSettings) and
+    (FSettings.WindowMaterial = wmNormal) and (FSettings.Transparency > 0) and
+    (WindowsBuild >= 26100);
   if FFading or (not FStartupDone) or not Assigned(FSettings) or
-     (FSettings.WindowMaterial = wmNormal) then
+     ((FSettings.WindowMaterial = wmNormal) and not WantPixel) then
     Ex := Ex or WS_EX_LAYERED
   else
     Ex := Ex and not NativeInt(WS_EX_LAYERED);
   SetWindowLong(Wnd, GWL_EXSTYLE, Ex);
   if FFading or (not FStartupDone) then
-    SetLayeredWindowAttributes(Wnd, 0, 0, LWA_ALPHA);
+    SetLayeredWindowAttributes(Wnd, 0, 0, LWA_ALPHA)
+  else if (Ex and WS_EX_LAYERED) <> 0 then
+    SetLayeredWindowAttributes(Wnd, 0, 255, LWA_ALPHA);
   var TransitionsOff: BOOL := False;
   DwmSetWindowAttribute(Wnd, 3, @TransitionsOff, SizeOf(TransitionsOff));
 
-  if not FFrameHooked then
-  begin
-    FOldWndProc := Pointer(GetWindowLongPtr(Wnd, GWL_WNDPROC));
-    SetWindowLongPtr(Wnd, GWL_WNDPROC, NativeInt(@FrameWndProc));
-    FFrameHooked := True;
-  end;
+  InstallFrameHook;
 
   Corner := 2;
   DwmSetWindowAttribute(Wnd, 33, @Corner, SizeOf(Corner));
@@ -1162,9 +1888,22 @@ begin
   if (not Assigned(FSettings)) or (FSettings.WindowMaterial = wmNormal) then
   begin
     FillChar(Margins, SizeOf(Margins), 0);
-    Margins.cyBottomHeight := 1;
+    if Assigned(FSettings) and (FSettings.Transparency > 0) and
+       (WindowsBuild >= 26100) and
+       ((GetWindowLong(Wnd, GWL_EXSTYLE) and WS_EX_LAYERED) = 0) then
+    begin
+      Margins.cxLeftWidth := -1;
+      Margins.cxRightWidth := -1;
+      Margins.cyTopHeight := -1;
+      Margins.cyBottomHeight := -1;
+      CapColor := COLORREF($FFFFFFFE);
+    end
+    else
+    begin
+      Margins.cyBottomHeight := 1;
+      CapColor := AlphaToColorRef(FColors.TitleBarBackground);
+    end;
     DwmExtendFrameIntoClientArea(Wnd, Margins);
-    CapColor := AlphaToColorRef(FColors.TitleBarBackground);
     DwmSetWindowAttribute(Wnd, 35, @CapColor, SizeOf(CapColor));
     DwmSetWindowAttribute(Wnd, 34, @CapColor, SizeOf(CapColor));
   end;
@@ -1756,13 +2495,15 @@ begin
     { Visible := True уже мог вернуть окно на основной экран. Ставим место до показа. }
     if not FCenterAtShow then
       ApplySavedWindowRect;
-    if FPendingMaximized then
+    if GLaunch.Minimize then
+      ShowCmd := SW_SHOWNA
+    else if FPendingMaximized then
       ShowCmd := SW_SHOWMAXIMIZED
     else
       ShowCmd := SW_SHOWNA;
     FPendingMaximized := False;
     ShowWindow(Wnd, ShowCmd);
-    if ShowCmd <> SW_SHOWMAXIMIZED then
+    if (not GLaunch.Minimize) and (ShowCmd <> SW_SHOWMAXIMIZED) then
     begin
       { ShowWindow снова может сдвинуть на основной. Развёрнутое не трогаем:
         его монитор уже задан прямоугольником перед SW_SHOWMAXIMIZED. }
@@ -1771,7 +2512,15 @@ begin
       else
         ApplySavedWindowRect;
     end;
-    if WindowAnimEnabled then
+    if GLaunch.Minimize then
+    begin
+      { Показ ещё идёт, SC_MINIMIZE здесь сворачивает служебное окно FMX,
+        а форма остаётся на экране. Альфа 0 до отложенного сворачивания. }
+      FFading := False;
+      FStartupDone := True;
+      KickFolderSizes;
+    end
+    else if WindowAnimEnabled then
     begin
       FFadeStart := GetTickCount64;
       if Assigned(FFadeTimer) then
@@ -1796,6 +2545,7 @@ var
   T: Single;
   Alpha: Byte;
   Wnd: HWND;
+  Target: Integer;
 {$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
@@ -1806,7 +2556,8 @@ begin
     FinishStartupFade;
     Exit;
   end;
-  Alpha := Byte(Round((1 - Power(1 - T, 3)) * 255));
+  Target := 255;
+  Alpha := Byte(Round((1 - Power(1 - T, 3)) * Target));
   if Alpha < 1 then
     Alpha := 1;
   if Wnd <> 0 then
@@ -1838,7 +2589,8 @@ begin
     FLeftPanel.RestoreTabs(FSettings.Left);
   if Assigned(FRightPanel) and Assigned(FSettings) then
     FRightPanel.RestoreTabs(FSettings.Right);
-  if Assigned(FLeftPanel) then
+  ApplyLaunchOpen(False);
+  if Assigned(FLeftPanel) and not FLaunchLeftOwned then
     FLeftPanel.LoadActiveTab;
   if Assigned(FIdlePlusTimer) then
     FIdlePlusTimer.Enabled := True;
@@ -1851,7 +2603,12 @@ begin
     Exit;
   FLeftReady := True;
   StartupLog('left list ready');
-  if Assigned(FRightPanel) then
+  if (FLaunchNoticeL <> '') and Assigned(FLeftPanel) then
+  begin
+    FLeftPanel.ShowNotice(FLaunchNoticeL);
+    FLaunchNoticeL := '';
+  end;
+  if Assigned(FRightPanel) and not FLaunchRightOwned then
     FRightPanel.LoadActiveTab;
 end;
 
@@ -1861,6 +2618,11 @@ begin
     Exit;
   FRightReady := True;
   StartupLog('right list ready');
+  if (FLaunchNoticeR <> '') and Assigned(FRightPanel) then
+  begin
+    FRightPanel.ShowNotice(FLaunchNoticeR);
+    FLaunchNoticeR := '';
+  end;
 end;
 
 procedure TMainForm.StartupIdlePlusTick(Sender: TObject);
@@ -1896,6 +2658,21 @@ begin
   end;
   if Assigned(FStaleTimer) then
     FStaleTimer.Enabled := True;
+  {$IFDEF MSWINDOWS}
+  if GLaunch.Minimize then
+  begin
+    GLaunch.Minimize := False;
+    var WndMin := FormToHWND(Self);
+    if WndMin <> 0 then
+    begin
+      SendMessage(WndMin, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+      SetLayeredWindowAttributes(WndMin, 0, 255, LWA_ALPHA);
+      if not IsIconic(WndMin) then
+        SendMessage(WndMin, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+      HideFmxAppWindow;
+    end;
+  end;
+  {$ENDIF}
 end;
 
 procedure TMainForm.StartupStaleTick(Sender: TObject);
@@ -1928,9 +2705,11 @@ begin
   Wnd := FormToHWND(Self);
   if Wnd <> 0 then
   begin
-    SetLayeredWindowAttributes(Wnd, 0, 255, LWA_ALPHA);
-    if Assigned(FSettings) and (FSettings.WindowMaterial <> wmNormal) then
-      ApplyCustomFrame;
+    if Assigned(FSettings) and
+       ((FSettings.WindowMaterial <> wmNormal) or (FSettings.Transparency > 0)) then
+      ApplyCustomFrame
+    else
+      SetLayeredWindowAttributes(Wnd, 0, 255, LWA_ALPHA);
   end;
   {$ENDIF}
   KickFolderSizes;
@@ -2094,8 +2873,14 @@ begin
   end;
   UpdateViewButtons;
   SyncRecycleCommands;
+  { Свёрнутый /min: SetFocus через FMX делает SW_RESTORE. }
   if AFocus and APanel.CanFocus then
-    APanel.SetFocus;
+  begin
+    {$IFDEF MSWINDOWS}
+    if not IsIconic(FormToHWND(Self)) then
+    {$ENDIF}
+      APanel.SetFocus;
+  end;
   SyncCmdPath;
   if Assigned(FOpPill) and FOpPill.Visible and not OpPillOnRail then
     LayoutOpPill;
@@ -3313,7 +4098,10 @@ begin
   if FSelMenu = nil then
     Exit;
   FSelMenu.ClearItems;
-  FSelMenu.AddItem(L('main.sel.all'), 'Ctrl+A', OnSelAll);
+    FSelMenu.AddItem(L('set.sel.explorer'),
+    Mark(FSettings.MouseSelectMode = msmExplorer), OnSelModeExplorer);
+
+
   FSelMenu.AddItem(L('main.sel.compare'), '', OnSelCompare);
   FSelMenu.AddSeparator;
   FSelMenu.AddItem(L('main.sel.folders'), '', OnSelFolders);
@@ -3325,11 +4113,11 @@ begin
   FSelMenu.AddSeparator;
   FSelMenu.AddItem(L('main.sel.invert'), '*', OnSelInvert);
   FSelMenu.AddItem(L('main.sel.none'), 'Ctrl+-', OnSelNone);
+    FSelMenu.AddItem(L('main.sel.all'), 'Ctrl+A', OnSelAll);
   FSelMenu.AddSeparator;
   FSelMenu.AddItem(L('set.sel.vibe'),
     Mark(FSettings.MouseSelectMode <> msmExplorer), OnSelModeVibe);
-  FSelMenu.AddItem(L('set.sel.explorer'),
-    Mark(FSettings.MouseSelectMode = msmExplorer), OnSelModeExplorer);
+
 end;
 
 procedure TMainForm.SetMouseSelectMode(AExplorer: Boolean);
@@ -3454,6 +4242,14 @@ begin
   FLeftPanel.SetActive(True);
   FRightPanel.SetActive(False);
   FActivePanel := FLeftPanel;
+  SetLiveOpHandler(
+    procedure(const AInfo: TLiveOpInfo)
+    begin
+      if Assigned(FLeftPanel) then
+        FLeftPanel.ApplyLiveOp(AInfo);
+      if Assigned(FRightPanel) then
+        FRightPanel.ApplyLiveOp(AInfo);
+    end);
   LayoutWorkArea;
 end;
 
@@ -4271,6 +5067,11 @@ begin
       begin
         ApplyWindowBackground;
       end;
+    Frm.OnOpacityChanged :=
+      procedure
+      begin
+        ApplyWindowOpacity;
+      end;
     Frm.OnLanguageChanged :=
       procedure
       begin
@@ -4555,6 +5356,14 @@ begin
   {$ENDIF}
 end;
 
+procedure TMainForm.ApplyWindowOpacity;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  ConfigureWindowOpacity(FSettings.Transparency);
+  ApplyThemeToAll(GetThemeColors(FSettings.Theme));
+end;
+
 procedure TMainForm.ApplyBandLayout;
 var
   I: Integer;
@@ -4651,7 +5460,12 @@ begin
     begin
       H := CreateMutex(nil, True, APP_MUTEX_NAME);
       if H <> 0 then
-        GAppMutex := H;
+      begin
+        if GetLastError = ERROR_ALREADY_EXISTS then
+          CloseHandle(H)
+        else
+          GAppMutex := H;
+      end;
     end;
   end
   else if GAppMutex <> 0 then
@@ -4690,6 +5504,7 @@ procedure TMainForm.OnThemeChangedFromSettings(NewTheme: TAppTheme);
 begin
   FSettings.Theme := NewTheme;
   ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  ConfigureWindowOpacity(FSettings.Transparency);
   FColors := GetThemeColors(NewTheme);
   ApplyThemeToAll(FColors);
 end;
@@ -4833,6 +5648,10 @@ begin
   FCmdQuickView.ApplyTheme(AColors);
   FCmdCopy.ApplyTheme(AColors);
   FCmdMove.ApplyTheme(AColors);
+  if Assigned(FCmdRestore) then
+    FCmdRestore.ApplyTheme(AColors);
+  if Assigned(FCmdEmpty) then
+    FCmdEmpty.ApplyTheme(AColors);
   FCmdDelete.ApplyTheme(AColors);
   FCmdNewFolder.ApplyTheme(AColors);
   FCmdRename.ApplyTheme(AColors);
@@ -4864,7 +5683,7 @@ begin
 
   FFnBar.Fill.Color := Chrome.FooterBackground;
   if Assigned(FCmdBack) then
-    FCmdBack.Fill.Color := AColors.PanelBackground;
+    FCmdBack.Fill.Color := Chrome.PanelBackground;
   if Assigned(FCmdTopLine) then
     FCmdTopLine.Fill.Color := AColors.DividerColor;
   if Assigned(FCmdSplit) then
@@ -4918,7 +5737,6 @@ end;
 procedure TMainForm.RunCopyMove(const ASources: TArray<string>; const ADestDir: string;
   AMove: Boolean; ASrcPanel, ADestPanel: TFilePanel);
 var
-  FocusPath: string;
   Src, Dest: TFilePanel;
 begin
   if Length(ASources) = 0 then
@@ -4957,18 +5775,10 @@ begin
     Exit;
   end;
 
-  FocusPath := '';
-  if AMove and Assigned(Src) then
-    FocusPath := Src.FocusPathAfterRemove(ASources);
-
   if AMove then
     MovePathsAsync(ASources, ADestDir,
       procedure(Success: Boolean; const ErrorMsg: string)
       begin
-        if Assigned(Dest) then
-          Dest.Refresh;
-        if Assigned(Src) then
-          Src.Refresh(FocusPath);
         if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         begin
           if Assigned(Src) then
@@ -4986,10 +5796,6 @@ begin
     CopyPathsAsync(ASources, ADestDir,
       procedure(Success: Boolean; const ErrorMsg: string)
       begin
-        if Assigned(Dest) then
-          Dest.Refresh;
-        if Assigned(Src) then
-          Src.InvalidateView;
         if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
         begin
           if Assigned(Src) then
@@ -5330,7 +6136,6 @@ var
   Panel: TFilePanel;
   Permanent: Boolean;
   Paths: TArray<string>;
-  FocusPath: string;
   I: Integer;
 begin
   if Assigned(FActivePanel) and FActivePanel.TryForgetNetworkRecent then
@@ -5353,12 +6158,10 @@ begin
   SetLength(Paths, Length(Entries));
   for I := 0 to High(Entries) do
     Paths[I] := Entries[I].FullPath;
-  FocusPath := Panel.FocusPathAfterRemove(Paths);
 
   DeletePathsAsync(Paths,
     procedure(Success: Boolean; const ErrorMsg: string)
     begin
-      Panel.Refresh(FocusPath);
       if (not Permanent) or IsRecycleBinPath(Panel.CurrentPath) then
         RefreshAfterBin;
       if (not Success) and (ErrorMsg <> '') and (ErrorMsg <> L('op.cancelled')) then
@@ -5418,7 +6221,7 @@ begin
   Frm := TMultiRenameForm.Create(Self, Entries, FColors);
   try
     if Frm.ShowModal = mrOk then
-      FActivePanel.Refresh('');
+      FActivePanel.InvalidateView;
   finally
     Frm.Free;
   end;

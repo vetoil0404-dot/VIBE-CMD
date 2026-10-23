@@ -242,7 +242,12 @@ end;
 
 function L(const AKey: string): string;
 begin
-  if (FDict = nil) or not FDict.TryGetValue(AKey, Result) then
+  if (FDict <> nil) and FDict.TryGetValue(AKey, Result) then
+    Exit;
+  { Ключа нет в языке: домівка показывает Home, не старое «Диски». }
+  if AKey = 'panel.hint.home' then
+    Result := 'Home'
+  else
     Result := AKey;
 end;
 

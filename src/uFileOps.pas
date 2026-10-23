@@ -5,8 +5,9 @@
   создание папки. Выполняются в фоновом потоке, чтобы не блокировать UI.
   V!be: engine + окно прогресса (конфликты там).
   Тихий: без progress/Shell-диалогов; конфликты имён — uConflictDialog.
-  Проводник: SHFileOperation с диалогами Windows.
+  Проводник: диалог Windows из своего STA-потока, без привязки к нашему окну.
   Тихий и Проводник показывают процесс на пилюле средней панели.
+  Тихий и V!be: локальный отказ в доступе — второе окно прав, одна пачка — один диалог.
 }
 
 interface
@@ -23,6 +24,24 @@ type
 
   TFileOpItemDoneProc = reference to procedure(const APath: string;
     AStatus: TOpItemStatus);
+
+  TLiveOpKind = (lokCopy, lokMove, lokDelete, lokRename);
+
+  TLiveOpInfo = record
+    Kind: TLiveOpKind;
+    Source: string;
+    Dest: string;
+    Ok: Boolean;
+    IsDir: Boolean;
+    { -1: взять размер и дату из уже показанной строки, без опроса шары. }
+    Size: Int64;
+    Modified: TDateTime;
+  end;
+
+  TLiveOpProc = reference to procedure(const AInfo: TLiveOpInfo);
+
+  { Результат тихого удаления одного пути. ddsElevate ждёт общего диалога. }
+  TDiskDeleteStep = (ddsGone, ddsElevate, ddsFailed);
 
   { Без uses формы прогресса: иначе цикл uFileOps ↔ uFileOpProgressForm
     и uMain не видит FileOpHub*. }
@@ -71,6 +90,14 @@ procedure ArchivePathsAsync(const ASources: TArray<string>; const AZipFile: stri
 procedure ArchivePathsSync(const ASources: TArray<string>; const AZipFile: string);
 procedure ArchiveInnerToZipFile(const ASrcPath, ADestZip: string);
 procedure DeletePathSync(const APath: string; APermanent: Boolean = False);
+function TrySilentDiskDelete(const APath: string; APermanent: Boolean;
+  out ACode: Cardinal): Boolean;
+function DiskDeleteTarget(const APath: string): Boolean;
+function DeleteTargetRemains(const APath: string): Boolean;
+function AfterSilentDiskDelete(const APath: string; APermanent: Boolean;
+  ACode: Cardinal; out AError: string): TDiskDeleteStep;
+function ElevateDeniedDeletes(const APaths: TArray<string>; APermanent: Boolean;
+  out ACancelled: Boolean; out AError: string): Boolean;
 procedure SetFileOpMode(AMode: TFileOpMode);
 function GetFileOpMode: TFileOpMode;
 procedure SetFileOpOwnerWnd(AWnd: NativeUInt);
@@ -79,12 +106,15 @@ function RestoreRecycleItems(const APaths: TArray<string>; out AError: string): 
 function EmptyRecycleBin(out AError: string): Boolean;
 function UndoLastDelete(out AError: string): Boolean;
 procedure NotifyRecycleBinChanged;
+procedure SetLiveOpHandler(const AHandler: TLiveOpProc);
+procedure PublishLiveOp(const AInfo: TLiveOpInfo);
+procedure ProbeLivePath(const APath: string);
 
 implementation
 
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
-  uFileOpEngine, uArchiveEngine, uConflictDialog, uLang
+  uFileOpEngine, uArchiveEngine, uConflictDialog, uLang, uNetworkVfs
   {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.PropSys, Winapi.ActiveX{$ENDIF};
 
 type
@@ -114,6 +144,156 @@ var
   GVibeRestore: TFunc<Integer, Boolean>;
   GUndoLock: TCriticalSection;
   GUndo: TList<TUndoDelete>;
+  GLiveOp: TLiveOpProc;
+
+type
+  TLiveOpMsg = class
+    Info: TLiveOpInfo;
+    procedure Apply;
+  end;
+
+  TAttrProbe = class
+    Path: string;
+    Present: Boolean;
+    procedure Apply;
+  end;
+
+  {$IFDEF MSWINDOWS}
+  { Проводник: одна операция. Диск и архив идут параллельно, итог один. }
+  TExplorerShell = class
+    Kind: TLiveOpKind;
+    Func: UINT;
+    Disk, Other, Snapshot: TArray<string>;
+    Dest, FailText, Err: string;
+    AllowUndo, Permanent, Ok: Boolean;
+    TrackId, Left: Integer;
+    OnDone: TFileOpDoneProc;
+    OnItem: TFileOpItemDoneProc;
+    Lock: TCriticalSection;
+    destructor Destroy; override;
+    procedure Start;
+    procedure RunDisk;
+    procedure RunOther;
+    procedure Note(AOk: Boolean; const AErr: string);
+    procedure FinishUI;
+  end;
+  {$ENDIF}
+
+procedure TLiveOpMsg.Apply;
+var
+  H: TLiveOpProc;
+begin
+  try
+    H := GLiveOp;
+    if Assigned(H) then
+      H(Info);
+  finally
+    Free;
+  end;
+end;
+
+procedure TAttrProbe.Apply;
+var
+  Info: TLiveOpInfo;
+begin
+  try
+    if not Present then
+    begin
+      Info := Default(TLiveOpInfo);
+      Info.Kind := lokDelete;
+      Info.Source := Path;
+      Info.Ok := True;
+      PublishLiveOp(Info);
+    end;
+  finally
+    Free;
+  end;
+end;
+
+procedure SetLiveOpHandler(const AHandler: TLiveOpProc);
+begin
+  GLiveOp := AHandler;
+end;
+
+procedure PublishLiveOp(const AInfo: TLiveOpInfo);
+var
+  Msg: TLiveOpMsg;
+  H: TLiveOpProc;
+begin
+  if not AInfo.Ok then
+    Exit;
+  if TThread.CurrentThread.ThreadID = MainThreadID then
+  begin
+    H := GLiveOp;
+    if Assigned(H) then
+      H(AInfo);
+    Exit;
+  end;
+  Msg := TLiveOpMsg.Create;
+  Msg.Info := AInfo;
+  TThread.Queue(nil, Msg.Apply);
+end;
+
+procedure ProbeLivePath(const APath: string);
+var
+  P: string;
+begin
+  if APath = '' then
+    Exit;
+  P := APath;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Probe: TAttrProbe;
+      Attr: Cardinal;
+    begin
+      Probe := TAttrProbe.Create;
+      Probe.Path := P;
+{$IFDEF MSWINDOWS}
+      Attr := GetFileAttributes(PChar(P));
+{$ELSE}
+      Attr := INVALID_FILE_ATTRIBUTES;
+{$ENDIF}
+      Probe.Present := Attr <> INVALID_FILE_ATTRIBUTES;
+      TThread.Queue(nil, Probe.Apply);
+    end).Start;
+end;
+
+procedure PublishTopLevel(AKind: TLiveOpKind; const ASources: TArray<string>;
+  const ADestDir: string);
+var
+  S, Name: string;
+  Info: TLiveOpInfo;
+begin
+  for S in ASources do
+  begin
+    Info := Default(TLiveOpInfo);
+    Info.Kind := AKind;
+    Info.Source := S;
+    Info.Ok := True;
+    Info.Size := -1;
+    Name := TPath.GetFileName(ExcludeTrailingPathDelimiter(S));
+    if (AKind <> lokDelete) and (ADestDir <> '') and (Name <> '') then
+      Info.Dest := TPath.Combine(ExcludeTrailingPathDelimiter(ADestDir), Name);
+    PublishLiveOp(Info);
+  end;
+end;
+
+procedure EmitLiveOp(AKind: TLiveOpKind; const ASrc, ADst: string;
+  AIsDir: Boolean; ASize: Int64; AModified: TDateTime);
+var
+  Info: TLiveOpInfo;
+begin
+  Info := Default(TLiveOpInfo);
+  Info.Kind := AKind;
+  Info.Source := ASrc;
+  Info.Dest := ADst;
+  Info.Ok := True;
+  Info.IsDir := AIsDir;
+  Info.Size := ASize;
+  Info.Modified := AModified;
+  PublishLiveOp(Info);
+end;
 
 procedure SetVibeHooks(ALaunch: TVibeLaunchProc; ARestore: TFunc<Integer, Boolean>);
 begin
@@ -298,13 +478,24 @@ begin
     Result := Result or FOF_ALLOWUNDO;
 end;
 
-function ShellFileOp(AFunc: UINT; const AFrom: TArray<string>;
-  const ATo: string; AAllowUndo: Boolean): Boolean;
+function ShellWinCode(ARet: Integer): Cardinal;
+begin
+  if (DWORD(ARet) and $FFFF0000) = $80070000 then
+    Result := DWORD(ARet) and $FFFF
+  else
+    Result := DWORD(ARet);
+end;
+
+function ShellFileOpEx(AFunc: UINT; const AFrom: TArray<string>;
+  const ATo: string; AFlags: FILEOP_FLAGS; out ACode: Cardinal;
+  out AAborted: Boolean): Boolean;
 var
   Op: TSHFileOpStruct;
   FromStr, ToStr, S: string;
+  Ret: Integer;
 begin
-  Result := False;
+  ACode := 0;
+  AAborted := False;
   if Length(AFrom) = 0 then
     Exit(True);
   FromStr := '';
@@ -315,19 +506,384 @@ begin
   if ATo <> '' then
     ToStr := ExcludeTrailingPathDelimiter(ATo) + #0#0;
   FillChar(Op, SizeOf(Op), 0);
-  Op.Wnd := HWND(GFileOpWnd);
+  { Проводник: 0, диалог не выключает наше окно. Тихий и V!be держат владельца. }
+  if GFileOpMode = fomExplorer then
+    Op.Wnd := 0
+  else
+    Op.Wnd := HWND(GFileOpWnd);
   Op.wFunc := AFunc;
   Op.pFrom := PChar(FromStr);
   if ATo <> '' then
     Op.pTo := PChar(ToStr);
-  Op.fFlags := ShellFlags(AAllowUndo);
-  Result := (SHFileOperation(Op) = 0) and not Op.fAnyOperationsAborted;
+  Op.fFlags := AFlags;
+  Ret := SHFileOperation(Op);
+  AAborted := Op.fAnyOperationsAborted;
+  ACode := ShellWinCode(Ret);
+  if AAborted and (ACode = 0) then
+    ACode := ERROR_CANCELLED;
+  Result := (Ret = 0) and not AAborted;
+end;
+
+function ShellFileOp(AFunc: UINT; const AFrom: TArray<string>;
+  const ATo: string; AAllowUndo: Boolean): Boolean;
+var
+  Code: Cardinal;
+  Aborted: Boolean;
+begin
+  Result := ShellFileOpEx(AFunc, AFrom, ATo, ShellFlags(AAllowUndo), Code, Aborted);
 end;
 {$ENDIF}
 
 function UseShellDiskOps: Boolean;
 begin
   Result := GFileOpMode in [fomQuiet, fomExplorer];
+end;
+
+function DeleteErrorWantsElevation(ACode: Cardinal): Boolean;
+begin
+  { 740 — ERROR_ELEVATION_REQUIRED, в Winapi.Windows его нет. }
+  Result := (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_PRIVILEGE_NOT_HELD) or
+    (ACode = 740);
+end;
+
+function DiskShareDenied(ACode: Cardinal): Boolean;
+begin
+  Result := (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_LOGON_FAILURE) or
+    (ACode = ERROR_INVALID_PASSWORD) or
+    (ACode = ERROR_SESSION_CREDENTIAL_CONFLICT);
+end;
+
+{$IFDEF MSWINDOWS}
+function DiskDeleteIsNetwork(const APath: string): Boolean;
+var
+  Root, Unc: string;
+  Kind: UINT;
+begin
+  Result := False;
+  if APath = '' then
+    Exit;
+  if IsUncPath(APath) or IsVibeNetworkPath(APath) then
+    Exit(True);
+  if (Length(APath) < 2) or (APath[2] <> ':') then
+    Exit;
+  Root := UpCase(APath[1]) + ':\';
+  Kind := GetDriveType(PChar(Root));
+  if Kind = DRIVE_REMOTE then
+    Exit(True);
+  { Таблица подключений, без похода на шару. Пустой UNC — не сеть. }
+  Unc := MappedDriveUnc(Root);
+  Result := Unc <> '';
+end;
+
+function SilentDeleteFlags(AAllowUndo: Boolean): FILEOP_FLAGS;
+begin
+  Result := FOF_NOCONFIRMATION or FOF_SILENT or FOF_NOERRORUI or
+    FOF_NOCONFIRMMKDIR;
+  if AAllowUndo then
+    Result := Result or FOF_ALLOWUNDO;
+end;
+
+function DeleteOpOwnerWnd: HWND;
+var
+  Fg: HWND;
+  Pid: DWORD;
+begin
+  Result := HWND(GFileOpWnd);
+  Fg := GetForegroundWindow;
+  if Fg = 0 then
+    Exit;
+  Pid := 0;
+  GetWindowThreadProcessId(Fg, Pid);
+  if Pid = GetCurrentProcessId then
+    Result := Fg;
+end;
+
+procedure RunOnUi(const AProc: TThreadProcedure);
+begin
+  if not Assigned(AProc) then
+    Exit;
+  if TThread.CurrentThread.ThreadID = MainThreadID then
+    AProc()
+  else
+    TThread.Synchronize(nil, AProc);
+end;
+{$ENDIF}
+
+function DeletePathCanElevate(const APath: string): Boolean;
+begin
+{$IFDEF MSWINDOWS}
+  Result := CanShellDiskPath(APath) and IsWin32FsPath(APath) and
+    not IsVibeNetworkPath(APath) and not DiskDeleteIsNetwork(APath);
+{$ELSE}
+  Result := False;
+{$ENDIF}
+end;
+
+function DiskDeleteTarget(const APath: string): Boolean;
+begin
+  { Локальный диск, UNC и буква подключенной шары. Не архив и не network://. }
+  Result := CanShellDiskPath(APath) and IsWin32FsPath(APath) and
+    not IsVibeNetworkPath(APath);
+end;
+
+function DeleteTargetRemains(const APath: string): Boolean;
+var
+  Path: string;
+{$IFDEF MSWINDOWS}
+  Attr, Err: DWORD;
+{$ENDIF}
+begin
+  Result := False;
+  Path := ExcludeTrailingPathDelimiter(APath);
+  if Path = '' then
+    Exit;
+{$IFDEF MSWINDOWS}
+  Attr := GetFileAttributes(PChar(Path));
+  if Attr <> INVALID_FILE_ATTRIBUTES then
+    Exit(True);
+  Err := GetLastError;
+  { Отказ в атрибутах — объект есть. Нет файла — коды 2 и 3. }
+  Result := (Err = ERROR_ACCESS_DENIED) or (Err = ERROR_PRIVILEGE_NOT_HELD) or
+    (Err = 740);
+{$ELSE}
+  Result := TFile.Exists(Path) or TDirectory.Exists(Path);
+{$ENDIF}
+end;
+
+function DiskDeleteFailText(ACode: Cardinal; APermanent: Boolean): string;
+begin
+  if ACode = ERROR_CANCELLED then
+    Exit(L('op.cancelled'));
+  if not APermanent then
+    Exit(L('ops.recycle'));
+  if DeleteErrorWantsElevation(ACode) then
+    Exit(L('op.noaccess'));
+  if ACode <> 0 then
+  begin
+    Result := Trim(SysErrorMessage(ACode));
+    if Result = '' then
+      Result := L('ops.delfail');
+  end
+  else
+    Result := L('ops.delfail');
+end;
+
+function TrySilentDiskDelete(const APath: string; APermanent: Boolean;
+  out ACode: Cardinal): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Aborted: Boolean;
+{$ENDIF}
+begin
+  ACode := 0;
+{$IFDEF MSWINDOWS}
+  Result := ShellFileOpEx(FO_DELETE, [APath], '',
+    SilentDeleteFlags(not APermanent), ACode, Aborted);
+  if Aborted and (ACode = 0) then
+    ACode := ERROR_CANCELLED;
+  if Aborted then
+    Result := False;
+{$ELSE}
+  Result := False;
+{$ENDIF}
+end;
+
+{$IFDEF MSWINDOWS}
+function ShareUncOf(const APath: string): string;
+begin
+  Result := '';
+  if IsUncPath(APath) then
+    Exit(APath);
+  if (Length(APath) < 2) or (APath[2] <> ':') then
+    Exit;
+  Result := MappedDriveUnc(APath);
+end;
+
+function RetryDiskAfterLogon(const APath: string; APermanent: Boolean;
+  ACode: Cardinal; out AError: string): Boolean;
+var
+  Unc: string;
+  Code: Cardinal;
+  Asked: Boolean;
+begin
+  AError := L('op.noaccess');
+  Result := False;
+  Unc := ShareUncOf(APath);
+  if Unc = '' then
+    Exit;
+  Asked := False;
+  RunOnUi(
+    procedure
+    begin
+      Asked := PromptShareLogon(NativeUInt(DeleteOpOwnerWnd), Unc, ACode);
+    end);
+  if not Asked then
+    Exit;
+  Code := 0;
+  if TrySilentDiskDelete(APath, APermanent, Code) then
+    Exit(True);
+  if not DeleteTargetRemains(APath) then
+    Exit(True);
+  AError := DiskDeleteFailText(Code, APermanent);
+  if AError = '' then
+    AError := L('op.noaccess');
+  Result := False;
+end;
+
+function HrIsUserCancel(AHr: HRESULT): Boolean;
+var
+  U: Cardinal;
+begin
+  U := Cardinal(AHr);
+  Result := (U = $800704C7) or (U = $80270000) or (U = $80270001);
+end;
+
+function ElevateOnThisThread(const APaths: TArray<string>; APermanent: Boolean;
+  out ACancelled: Boolean; out AError: string): Boolean;
+var
+  HrInit, Hr: HRESULT;
+  NeedUninit: Boolean;
+  Op: IFileOperation;
+  Item: IShellItem;
+  Flags: DWORD;
+  Added: Integer;
+  P: string;
+  Aborted: BOOL;
+  AnyLeft: Boolean;
+begin
+  ACancelled := False;
+  AError := '';
+  Result := False;
+  HrInit := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+  NeedUninit := HrInit = S_OK;
+  Op := nil;
+  try
+    try
+      if Failed(CoCreateInstance(CLSID_FileOperation, nil, CLSCTX_ALL,
+          IFileOperation, Op)) or (Op = nil) then
+      begin
+        AError := L('op.noaccess');
+        Exit;
+      end;
+      { Без FOF_SILENT и без FOF_NOERRORUI: иначе окна прав не будет.
+        FOF_NOCONFIRMATION гасит только «точно удалить». }
+      Flags := DWORD(FOF_NOCONFIRMATION) or DWORD(FOFX_SHOWELEVATIONPROMPT);
+      if not APermanent then
+        Flags := Flags or DWORD(FOF_ALLOWUNDO);
+      Op.SetOperationFlags(Flags);
+      if DeleteOpOwnerWnd <> 0 then
+        Op.SetOwnerWindow(DeleteOpOwnerWnd);
+      Added := 0;
+      for P in APaths do
+      begin
+        if not DeleteTargetRemains(P) then
+          Continue;
+        Item := nil;
+        if Succeeded(SHCreateItemFromParsingName(
+            PChar(ExcludeTrailingPathDelimiter(P)), nil, IID_IShellItem, Item)) then
+          if Item <> nil then
+            if Succeeded(Op.DeleteItem(Item, nil)) then
+              Inc(Added);
+      end;
+      if Added = 0 then
+      begin
+        AnyLeft := False;
+        for P in APaths do
+          if DeleteTargetRemains(P) then
+            AnyLeft := True;
+        if not AnyLeft then
+          Exit(True);
+        AError := L('op.noaccess');
+        Exit;
+      end;
+      Hr := Op.PerformOperations;
+      Aborted := False;
+      Op.GetAnyOperationsAborted(Aborted);
+      AnyLeft := False;
+      for P in APaths do
+        if DeleteTargetRemains(P) then
+          AnyLeft := True;
+      if not AnyLeft then
+        Exit(True);
+      if Aborted or HrIsUserCancel(Hr) then
+      begin
+        ACancelled := True;
+        AError := L('op.cancelled');
+        Exit;
+      end;
+      AError := L('op.noaccess');
+    except
+      on E: Exception do
+      begin
+        Result := False;
+        if AError = '' then
+          AError := E.Message;
+      end;
+    end;
+  finally
+    Op := nil;
+    if NeedUninit then
+      CoUninitialize;
+  end;
+end;
+{$ENDIF}
+
+function AfterSilentDiskDelete(const APath: string; APermanent: Boolean;
+  ACode: Cardinal; out AError: string): TDiskDeleteStep;
+begin
+  AError := '';
+  if not DeleteTargetRemains(APath) then
+    Exit(ddsGone);
+{$IFDEF MSWINDOWS}
+  if DiskDeleteIsNetwork(APath) and DiskShareDenied(ACode) then
+  begin
+    if RetryDiskAfterLogon(APath, APermanent, ACode, AError) then
+      Exit(ddsGone);
+    Exit(ddsFailed);
+  end;
+{$ENDIF}
+  if DeleteErrorWantsElevation(ACode) and DeletePathCanElevate(APath) then
+    Exit(ddsElevate);
+  AError := DiskDeleteFailText(ACode, APermanent);
+  Result := ddsFailed;
+end;
+
+function ElevateDeniedDeletes(const APaths: TArray<string>; APermanent: Boolean;
+  out ACancelled: Boolean; out AError: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Ok, Cancelled: Boolean;
+  Err: string;
+  Paths: TArray<string>;
+  Perm: Boolean;
+{$ENDIF}
+begin
+  ACancelled := False;
+  AError := '';
+  if Length(APaths) = 0 then
+    Exit(True);
+{$IFDEF MSWINDOWS}
+  Paths := Copy(APaths);
+  Perm := APermanent;
+  Ok := False;
+  Cancelled := False;
+  Err := '';
+  RunOnUi(
+    procedure
+    begin
+      Ok := ElevateOnThisThread(Paths, Perm, Cancelled, Err);
+    end);
+  ACancelled := Cancelled;
+  AError := Err;
+  if AError = '' then
+    AError := L('op.noaccess');
+  Result := Ok;
+  if Result then
+    AError := '';
+{$ELSE}
+  AError := L('ops.delfail');
+  Result := False;
+{$ENDIF}
 end;
 
 function TryZipItem(const APath: string; out AZip, AInner: string): Boolean;
@@ -485,29 +1041,7 @@ end;
 procedure DeletePathAsync(const APath: string; AOnDone: TFileOpDoneProc;
   APermanent: Boolean);
 begin
-  TThread.CreateAnonymousThread(
-    procedure
-    var
-      ErrMsg: string;
-      Ok: Boolean;
-    begin
-      Ok := True;
-      ErrMsg := '';
-      try
-        DeletePathCore(APath, APermanent);
-      except
-        on E: Exception do
-        begin
-          Ok := False;
-          ErrMsg := E.Message;
-        end;
-      end;
-      TThread.Queue(nil,
-        procedure
-        begin
-          if Assigned(AOnDone) then AOnDone(Ok, ErrMsg);
-        end);
-    end).Start;
+  DeletePathsAsync([APath], AOnDone, APermanent);
 end;
 
 function CreateNewFolder(const AParentDir, ABaseName: string): string;
@@ -534,7 +1068,35 @@ end;
 
 function RenamePath(const AOldPath, ANewName: string; out ANewPath: string): Boolean;
 var
-  ParentDir, Z, Inner: string;
+  ParentDir, Z, Inner, Temp, Err: string;
+  IsDir: Boolean;
+
+  procedure MoveEntry(const AFrom, ATo: string);
+  begin
+    if IsDir then
+      TDirectory.Move(AFrom, ATo)
+    else
+      TFile.Move(AFrom, ATo);
+  end;
+
+  function CaseTempPath(const ADir, ALeaf: string): string;
+  var
+    N: Integer;
+    Candidate: string;
+  begin
+    Result := '';
+    N := 0;
+    repeat
+      if N = 0 then
+        Candidate := TPath.Combine(ADir, ALeaf + '.~vibe')
+      else
+        Candidate := TPath.Combine(ADir, ALeaf + '.~vibe' + IntToStr(N));
+      Inc(N);
+      if not (TFile.Exists(Candidate) or TDirectory.Exists(Candidate)) then
+        Exit(Candidate);
+    until N > 10000;
+  end;
+
 begin
   Result := False;
   ANewPath := '';
@@ -554,13 +1116,42 @@ begin
 
   ParentDir := ExtractFilePath(ExcludeTrailingPathDelimiter(AOldPath));
   ANewPath := TPath.Combine(ParentDir, ANewName);
-  if SameText(AOldPath, ANewPath) then
+  { Тот же путь с тем же регистром: диск не трогаем. }
+  if SameStr(AOldPath, ANewPath) then
     Exit(True);
+  IsDir := TDirectory.Exists(AOldPath);
+  { NTFS не меняет регистр прямым Move: имя для системы то же. }
+  if SameText(AOldPath, ANewPath) then
+  begin
+    Temp := CaseTempPath(ParentDir,
+      ExtractFileName(ExcludeTrailingPathDelimiter(AOldPath)));
+    if Temp = '' then
+      Exit;
+    try
+      MoveEntry(AOldPath, Temp);
+    except
+      Exit;
+    end;
+    try
+      MoveEntry(Temp, ANewPath);
+      Result := True;
+    except
+      on E: Exception do
+      begin
+        Err := E.Message;
+        try
+          MoveEntry(Temp, AOldPath);
+          Result := False;
+        except
+          on E2: Exception do
+            raise Exception.Create(Err + sLineBreak + E2.Message);
+        end;
+      end;
+    end;
+    Exit;
+  end;
   try
-    if TDirectory.Exists(AOldPath) then
-      TDirectory.Move(AOldPath, ANewPath)
-    else
-      TFile.Move(AOldPath, ANewPath);
+    MoveEntry(AOldPath, ANewPath);
     Result := True;
   except
     Result := False;
@@ -834,6 +1425,215 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+destructor TExplorerShell.Destroy;
+begin
+  Lock.Free;
+  inherited;
+end;
+
+procedure TExplorerShell.Note(AOk: Boolean; const AErr: string);
+var
+  Done: Boolean;
+begin
+  Done := False;
+  Lock.Enter;
+  try
+    if not AOk then
+    begin
+      Ok := False;
+      if Err = '' then
+        Err := AErr;
+    end;
+    Dec(Left);
+    if Left <= 0 then
+      Done := True;
+  finally
+    Lock.Leave;
+  end;
+  if Done then
+    TThread.Queue(nil, FinishUI);
+end;
+
+procedure TExplorerShell.FinishUI;
+var
+  S: string;
+begin
+  try
+    FileOpTrackEnd(TrackId);
+    if Ok then
+    begin
+      PublishTopLevel(Kind, Snapshot, Dest);
+      { Удаление и раньше не звало OnItem: строки снимает публикация. }
+      if (Kind <> lokDelete) and Assigned(OnItem) then
+        for S in Snapshot do
+          OnItem(S, oisOk);
+    end
+    else
+      for S in Snapshot do
+        ProbeLivePath(S);
+    if Assigned(OnDone) then
+      OnDone(Ok, Err);
+  finally
+    Free;
+  end;
+end;
+
+procedure TExplorerShell.RunDisk;
+var
+  HrInit: HRESULT;
+  NeedUninit, Fine, Aborted: Boolean;
+  Code: Cardinal;
+  Msg: TMsg;
+  ErrText: string;
+begin
+  Fine := True;
+  ErrText := '';
+  HrInit := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+  NeedUninit := HrInit = S_OK;
+  try
+    try
+      { Очередь потока до диалога, иначе проводник не рисуется.
+        После возврата SHFileOperation свой цикл не крутим. }
+      PeekMessage(Msg, 0, 0, 0, PM_NOREMOVE);
+      if not ShellFileOpEx(Func, Disk, Dest, ShellFlags(AllowUndo), Code, Aborted) then
+      begin
+        Fine := False;
+        if Aborted or (Code = ERROR_CANCELLED) then
+          ErrText := L('op.cancelled')
+        else if FailText <> '' then
+          ErrText := FailText
+        else
+          ErrText := L('ops.delfail');
+      end;
+    except
+      on E: Exception do
+      begin
+        Fine := False;
+        ErrText := E.Message;
+      end;
+    end;
+  finally
+    if NeedUninit then
+      CoUninitialize;
+    Note(Fine, ErrText);
+  end;
+end;
+
+procedure TExplorerShell.RunOther;
+var
+  HrInit: HRESULT;
+  NeedUninit, Fine: Boolean;
+  Msg: TMsg;
+  ErrText, P, Z, Inner: string;
+  Zips, Rest: TList<string>;
+begin
+  Fine := True;
+  ErrText := '';
+  HrInit := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+  NeedUninit := HrInit = S_OK;
+  try
+    try
+      PeekMessage(Msg, 0, 0, 0, PM_NOREMOVE);
+      if Func = FO_DELETE then
+      begin
+        Zips := TList<string>.Create;
+        Rest := TList<string>.Create;
+        try
+          for P in Other do
+            if TryZipItem(P, Z, Inner) and (Inner <> '') then
+              Zips.Add(P)
+            else
+              Rest.Add(P);
+          if Zips.Count > 0 then
+            DeleteArchiveEntries(Zips.ToArray);
+          for P in Rest do
+            DeletePathCore(P, Permanent);
+        finally
+          Rest.Free;
+          Zips.Free;
+        end;
+      end
+      else if Func = FO_MOVE then
+      begin
+        for P in Other do
+        begin
+          CopyPathCore(P, Dest);
+          DeletePathCore(P, True);
+        end;
+      end
+      else
+        CopyVibeList(Other, Dest);
+    except
+      on E: Exception do
+      begin
+        Fine := False;
+        ErrText := E.Message;
+      end;
+    end;
+  finally
+    if NeedUninit then
+      CoUninitialize;
+    Note(Fine, ErrText);
+  end;
+end;
+
+procedure TExplorerShell.Start;
+var
+  Parts: Integer;
+begin
+  Ok := True;
+  Err := '';
+  Parts := 0;
+  if Length(Disk) > 0 then
+    Inc(Parts);
+  if Length(Other) > 0 then
+    Inc(Parts);
+  if Parts = 0 then
+  begin
+    FinishUI;
+    Exit;
+  end;
+  Lock := TCriticalSection.Create;
+  Left := Parts;
+  if Length(Disk) > 0 then
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        RunDisk;
+      end).Start;
+  if Length(Other) > 0 then
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        RunOther;
+      end).Start;
+end;
+
+procedure LaunchExplorerOp(AKind: TLiveOpKind; AFunc: UINT;
+  const ADisk, AOther, ASnapshot: TArray<string>; const ADest, AFail: string;
+  AAllowUndo, APermanent: Boolean; ATrack: Integer;
+  AOnDone: TFileOpDoneProc; AOnItem: TFileOpItemDoneProc);
+var
+  Job: TExplorerShell;
+begin
+  Job := TExplorerShell.Create;
+  Job.Kind := AKind;
+  Job.Func := AFunc;
+  Job.Disk := ADisk;
+  Job.Other := AOther;
+  Job.Snapshot := ASnapshot;
+  Job.Dest := ADest;
+  Job.FailText := AFail;
+  Job.AllowUndo := AAllowUndo;
+  Job.Permanent := APermanent;
+  Job.TrackId := ATrack;
+  Job.OnDone := AOnDone;
+  Job.OnItem := AOnItem;
+  Job.Start;
+end;
+{$ENDIF}
+
 type
   TListOpJob = class
     Sources: TArray<string>;
@@ -886,6 +1686,8 @@ var
   S: TOpItemStatus;
   Cb: TFileOpItemDoneProc;
 begin
+  if (AStatus in [oisError, oisSkipped]) and (APath <> '') then
+    ProbeLivePath(APath);
   if not Assigned(OnItem) then
     Exit;
   P := APath;
@@ -999,6 +1801,10 @@ begin
       else
         CreateArchiveFolder(ADestDir,
           TPath.GetFileName(ExcludeTrailingPathDelimiter(ASrc)));
+      if Move then
+        EmitLiveOp(lokMove, ASrc, Dest, True, 0, 0)
+      else
+        EmitLiveOp(lokCopy, ASrc, Dest, True, 0, 0);
     except
       on E: Exception do
       begin
@@ -1024,6 +1830,10 @@ begin
           DeletePathCore(ASrc, True);
       end;
       Result := oisOk;
+      if Move then
+        EmitLiveOp(lokMove, ASrc, Dest, False, -1, 0)
+      else
+        EmitLiveOp(lokCopy, ASrc, Dest, False, -1, 0);
     except
       on E: Exception do
       begin
@@ -1139,6 +1949,10 @@ begin
     if Move then
       DeletePathCore(AIt.SourcePath, True);
     Result := oisOk;
+    if Move then
+      EmitLiveOp(lokMove, AIt.SourcePath, Dest, False, AIt.SourceSize, AIt.SourceTime)
+    else
+      EmitLiveOp(lokCopy, AIt.SourcePath, Dest, False, AIt.SourceSize, AIt.SourceTime);
   except
     on E: Exception do
     begin
@@ -1374,8 +2188,6 @@ procedure CopyPathsAsync(const ASources: TArray<string>; const ADestDir: string;
 var
   Snapshot, Disk, Other: TArray<string>;
   Dest: string;
-  Ok: Boolean;
-  ErrMsg: string;
   TrackId: Integer;
 begin
   Snapshot := Copy(ASources);
@@ -1400,32 +2212,8 @@ begin
   begin
     if GFileOpMode = fomExplorer then
     begin
-      Ok := True;
-      ErrMsg := '';
-      try
-        try
-          if not ShellFileOp(FO_COPY, Disk, Dest, True) then
-          begin
-            Ok := False;
-            ErrMsg := L('ops.copyfail');
-          end
-          else
-            CopyVibeList(Other, Dest);
-        except
-          on E: Exception do
-          begin
-            Ok := False;
-            ErrMsg := E.Message;
-          end;
-        end;
-      finally
-        FileOpTrackEnd(TrackId);
-      end;
-      if Ok and Assigned(AOnItemDone) then
-        for var S in Snapshot do
-          AOnItemDone(S, oisOk);
-      if Assigned(AOnDone) then
-        AOnDone(Ok, ErrMsg);
+      LaunchExplorerOp(lokCopy, FO_COPY, Disk, Other, Snapshot, Dest,
+        L('ops.copyfail'), True, False, TrackId, AOnDone, AOnItemDone);
       Exit;
     end;
   end;
@@ -1465,6 +2253,11 @@ begin
           Err := E.Message;
         end;
       end;
+      if Fine then
+        PublishTopLevel(lokCopy, Snapshot, Dest)
+      else
+        for Src in Snapshot do
+          ProbeLivePath(Src);
       TThread.Queue(nil,
         procedure
         begin
@@ -1480,9 +2273,6 @@ procedure MovePathsAsync(const ASources: TArray<string>; const ADestDir: string;
 var
   Snapshot, Disk, Other: TArray<string>;
   Dest: string;
-  Ok: Boolean;
-  ErrMsg: string;
-  Src: string;
   TrackId: Integer;
 begin
   Snapshot := Copy(ASources);
@@ -1505,36 +2295,8 @@ begin
   begin
     if GFileOpMode = fomExplorer then
     begin
-      Ok := True;
-      ErrMsg := '';
-      try
-        try
-          if not ShellFileOp(FO_MOVE, Disk, Dest, True) then
-          begin
-            Ok := False;
-            ErrMsg := L('ops.movefail');
-          end
-          else
-            for Src in Other do
-            begin
-              CopyPathCore(Src, Dest);
-              DeletePathCore(Src, True);
-            end;
-        except
-          on E: Exception do
-          begin
-            Ok := False;
-            ErrMsg := E.Message;
-          end;
-        end;
-      finally
-        FileOpTrackEnd(TrackId);
-      end;
-      if Ok and Assigned(AOnItemDone) then
-        for var S in Snapshot do
-          AOnItemDone(S, oisOk);
-      if Assigned(AOnDone) then
-        AOnDone(Ok, ErrMsg);
+      LaunchExplorerOp(lokMove, FO_MOVE, Disk, Other, Snapshot, Dest,
+        L('ops.movefail'), True, False, TrackId, AOnDone, AOnItemDone);
       Exit;
     end;
   end;
@@ -1583,6 +2345,11 @@ begin
           Err := E.Message;
         end;
       end;
+      if Fine then
+        PublishTopLevel(lokMove, Snapshot, Dest)
+      else
+        for P in Snapshot do
+          ProbeLivePath(P);
       TThread.Queue(nil,
         procedure
         begin
@@ -1593,17 +2360,128 @@ begin
     end).Start;
 end;
 
+{$IFDEF MSWINDOWS}
+procedure NoteDiskFail(const AErr: string; APermanent: Boolean;
+  var AFirst: string);
+var
+  Msg: string;
+begin
+  Msg := AErr;
+  if (not APermanent) and (Msg <> L('op.cancelled')) and
+     (Msg <> L('op.noaccess')) then
+    Msg := L('ops.delfail');
+  if (AFirst = '') and (Msg <> '') then
+    AFirst := Msg;
+end;
+
+procedure CollectDeniedDeletes(const APaths: TArray<string>; APermanent: Boolean;
+  AElevate: TList<string>; var AFirst: string);
+var
+  P, Err: string;
+  Code: Cardinal;
+  Step: TDiskDeleteStep;
+begin
+  for P in APaths do
+  begin
+    if not DiskDeleteTarget(P) then
+    begin
+      try
+        DeletePathCore(P, APermanent);
+      except
+        on E: Exception do
+          NoteDiskFail(E.Message, APermanent, AFirst);
+      end;
+      Continue;
+    end;
+    if not DeleteTargetRemains(P) then
+      Continue;
+    Code := 0;
+    if TrySilentDiskDelete(P, APermanent, Code) then
+      Continue;
+    Step := AfterSilentDiskDelete(P, APermanent, Code, Err);
+    case Step of
+      ddsGone: ;
+      ddsElevate:
+        AElevate.Add(P);
+      ddsFailed:
+        NoteDiskFail(Err, APermanent, AFirst);
+    end;
+  end;
+end;
+
+procedure FinishDeniedDeletes(AElevate: TList<string>; APermanent: Boolean;
+  const AFirst: string);
+var
+  Cancelled: Boolean;
+  ElevErr: string;
+begin
+  Cancelled := False;
+  ElevErr := '';
+  if AElevate.Count > 0 then
+  begin
+    if not ElevateDeniedDeletes(AElevate.ToArray, APermanent, Cancelled, ElevErr) then
+    begin
+      if Cancelled and (AFirst = '') then
+        raise Exception.Create(L('op.cancelled'));
+      if (not Cancelled) and (AFirst = '') then
+        raise Exception.Create(ElevErr);
+    end;
+  end;
+  if AFirst <> '' then
+    raise Exception.Create(AFirst);
+end;
+
+procedure DeleteQuietList(const APaths: TArray<string>; APermanent: Boolean);
+var
+  Elevate: TList<string>;
+  FirstErr: string;
+  Code: Cardinal;
+  Aborted: Boolean;
+begin
+  if ShellFileOpEx(FO_DELETE, APaths, '', SilentDeleteFlags(not APermanent),
+       Code, Aborted) then
+    Exit;
+  if Aborted or (Code = ERROR_CANCELLED) then
+    raise Exception.Create(L('op.cancelled'));
+  Elevate := TList<string>.Create;
+  try
+    FirstErr := '';
+    CollectDeniedDeletes(APaths, APermanent, Elevate, FirstErr);
+    FinishDeniedDeletes(Elevate, APermanent, FirstErr);
+  finally
+    Elevate.Free;
+  end;
+end;
+
+procedure DeleteExplorerList(const APaths: TArray<string>; APermanent: Boolean);
+var
+  Code: Cardinal;
+  Aborted: Boolean;
+begin
+  { Один диалог проводника. Окно прав — то, что покажет он сам. }
+  if ShellFileOpEx(FO_DELETE, APaths, '', ShellFlags(not APermanent),
+       Code, Aborted) then
+    Exit;
+  if Aborted or (Code = ERROR_CANCELLED) then
+    raise Exception.Create(L('op.cancelled'));
+  raise Exception.Create(L('ops.delfail'));
+end;
+{$ENDIF}
+
 procedure DeleteDiskList(const APaths: TArray<string>; APermanent: Boolean);
 var
   P: string;
 begin
+  if Length(APaths) = 0 then
+    Exit;
 {$IFDEF MSWINDOWS}
-  if UseShellDiskOps and (Length(APaths) > 0) then
+  if UseShellDiskOps then
   begin
-    if ShellFileOp(FO_DELETE, APaths, '', not APermanent) then
-      Exit;
-    if not APermanent then
-      raise Exception.Create(L('ops.delfail'));
+    if GFileOpMode = fomExplorer then
+      DeleteExplorerList(APaths, APermanent)
+    else
+      DeleteQuietList(APaths, APermanent);
+    Exit;
   end;
 {$ENDIF}
   for P in APaths do
@@ -1615,8 +2493,6 @@ procedure DeletePathsAsync(const APaths: TArray<string>; AOnDone: TFileOpDonePro
 var
   Snapshot: TArray<string>;
   Disk, Other: TArray<string>;
-  Ok: Boolean;
-  ErrMsg: string;
   TrackId: Integer;
   Caller: TFileOpDoneProc;
 begin
@@ -1639,26 +2515,10 @@ begin
   TrackId := StartOpTrack(okDelete, Snapshot, '', False);
   SplitDiskSources(Snapshot, Disk, Other);
 {$IFDEF MSWINDOWS}
-  if UseShellDiskOps and (GFileOpMode = fomExplorer) and (Length(Disk) > 0) then
+  if UseShellDiskOps and (GFileOpMode = fomExplorer) then
   begin
-    Ok := True;
-    ErrMsg := '';
-    try
-      try
-        DeleteDiskList(Disk, APermanent);
-        DeleteDiskList(Other, APermanent);
-      except
-        on E: Exception do
-        begin
-          Ok := False;
-          ErrMsg := E.Message;
-        end;
-      end;
-    finally
-      FileOpTrackEnd(TrackId);
-    end;
-    if Assigned(AOnDone) then
-      AOnDone(Ok, ErrMsg);
+    LaunchExplorerOp(lokDelete, FO_DELETE, Disk, Other, Snapshot, '',
+      L('ops.delfail'), not APermanent, APermanent, TrackId, AOnDone, nil);
     Exit;
   end;
 {$ENDIF}
@@ -1718,6 +2578,11 @@ begin
         Regular.Free;
         ByZip.Free;
       end;
+      if Fine then
+        PublishTopLevel(lokDelete, Snapshot, '')
+      else
+        for P in Snapshot do
+          ProbeLivePath(P);
       TThread.Queue(nil,
         procedure
         begin

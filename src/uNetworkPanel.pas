@@ -24,9 +24,13 @@ type
     FDav: TWebDAVProvider;
     FHosts: TList<TNetworkHost>;
     FExtra: TList<TNetworkHost>;
+    FClassic: TClassicNet;
+    FClassicRows: TList<TClassicRow>;
+    FClassicStarted: Boolean;
     FHist: TStringList;
     FItems: TNetworkItemList;
     FSeq: Integer;
+    FBrowseSeq: Integer;
     FScanning: Boolean;
     FBrowsing: Boolean;
     FDidScan: Boolean;
@@ -34,11 +38,15 @@ type
     FError: string;
     FSubnet: string;
     FBrowsePath: string;
+    FOwner: NativeUInt;
+    FPing: TDictionary<string, string>;
     FOnChange: TNotifyEvent;
     FOnPrefs: TNotifyEvent;
+    procedure ApplyPing(var AEntry: TFileEntry; const AKey: string);
     procedure Changed;
     procedure PutHost(AList: TList<TNetworkHost>; const AHost: TNetworkHost);
     function HostSeen(const AAddr: string): Boolean;
+    function ClassicBlocks(const AHost: TNetworkHost): Boolean;
     function Remember(const APath: string): Boolean;
   public
     constructor Create;
@@ -46,15 +54,21 @@ type
     procedure CancelJobs;
     procedure Stop;
     procedure Scan(const ASubnet: string);
-    procedure Browse(const APath: string);
+    procedure Browse(const APath: string; APrompt: Boolean = True);
+    procedure TouchClassic;
+    procedure SetOwnerWindow(AOwner: NativeUInt);
     procedure AddAddress(const AText: string);
     procedure Forget(const APath: string);
+    procedure ClearHistory;
     function IsRecentRow(const APath: string): Boolean;
     procedure NoteOpened(const APath: string);
+    procedure NotePing(const AHost, AText, AAlso: string);
+    function HostByAddress(const AAddr: string; out AHost: TNetworkHost): Boolean;
     procedure LoadPrefs(const ASubnet, AHistory: string);
     procedure FillRoot(AList: TFileEntryList);
     procedure FillBrowse(AList: TFileEntryList);
     function StatusText(const AViewPath: string): string;
+    function TileLine: string;
     function HistoryText: string;
     function ResolvedSubnet: string;
     property Subnet: string read FSubnet;
@@ -106,10 +120,13 @@ end;
 function HostIconKey(const AHost: TNetworkHost): string;
 begin
   if AHost.IsRouter then
-    Exit('#router');
+    Exit('#stock:103');
+  if AHost.HasSMB or
+     ((Trim(AHost.Name) <> '') and not SameText(Trim(AHost.Name), AHost.Address)) then
+    Exit('#stock:94');
   if AHost.HasFTP and not AHost.HasSMB then
-    Exit('#ftp');
-  Result := '#computer';
+    Exit('#stock:51');
+  Result := '#stock:17';
 end;
 
 function HostOfPath(const APath: string): string;
@@ -139,8 +156,20 @@ begin
   E.Name := ATitle;
   if SameText(ATitle, 'Компьютеры') then
     E.DisplayName := L('net.computers')
+  else if SameText(ATitle, 'Сеть') then
+    E.DisplayName := L('net.section.net')
+  else if SameText(ATitle, 'Найденные') then
+    E.DisplayName := L('net.found')
   else if SameText(ATitle, 'Недавние') then
     E.DisplayName := L('net.recent')
+  else if SameText(ATitle, 'Админ') then
+    E.DisplayName := L('net.group.admin')
+  else if SameText(ATitle, 'Шари') then
+    E.DisplayName := L('net.group.shares')
+  else if SameText(ATitle, 'Принтеры') then
+    E.DisplayName := L('net.group.print')
+  else if SameText(ATitle, 'Другое') then
+    E.DisplayName := L('net.group.other')
   else
     E.DisplayName := ATitle;
   E.IconKey := '#nethead';
@@ -161,7 +190,13 @@ begin
   E.FreeBytes := 1;
   E.IconKey := HostIconKey(AHost);
   E.DisplayType := AHost.Address;
-  E.DisplaySize := FlagText(AHost);
+  if Trim(AHost.Vendor) <> '' then
+    E.DisplaySize := Trim(AHost.Vendor)
+  else
+    E.DisplaySize := L('net.vendor.unknown');
+  if FlagText(AHost) <> '' then
+    E.DisplaySize := E.DisplaySize + ' · ' + FlagText(AHost);
+  E.DisplayDate := AHost.Mac;
   E.IsHidden := ADim;
   AList.Add(E);
 end;
@@ -298,13 +333,16 @@ constructor TNetworkSession.Create;
 begin
   inherited Create;
   FDiscovery := TNetworkDiscovery.Create;
+  FClassic := TClassicNet.Create;
   FSmb := TSMBProvider.Create;
   FFtp := TFTPProvider.Create;
   FDav := TWebDAVProvider.Create;
   FHosts := TList<TNetworkHost>.Create;
+  FClassicRows := TList<TClassicRow>.Create;
   FExtra := TList<TNetworkHost>.Create;
   FHist := TStringList.Create;
   FHist.CaseSensitive := False;
+  FPing := TDictionary<string, string>.Create;
 end;
 
 destructor TNetworkSession.Destroy;
@@ -312,14 +350,81 @@ begin
   FOnChange := nil;
   FOnPrefs := nil;
   CancelJobs;
+  if FClassic <> nil then
+    FClassic.Cancel;
   FDiscovery.Free;
+  FClassic.Free;
   FSmb.Free;
   FFtp.Free;
   FDav.Free;
   FHosts.Free;
+  FClassicRows.Free;
   FExtra.Free;
   FHist.Free;
+  FPing.Free;
   inherited;
+end;
+
+procedure TNetworkSession.ApplyPing(var AEntry: TFileEntry; const AKey: string);
+var
+  Key, Text: string;
+begin
+  if (FPing = nil) or (AKey = '') then
+    Exit;
+  Key := AnsiLowerCase(Trim(AKey));
+  if not FPing.TryGetValue(Key, Text) or (Text = '') then
+    Exit;
+  { Код, не фраза: зміна мови перекладає рядок без нового пінгу. }
+  if Text = 'up' then
+    Text := L('panel.net.ping.up')
+  else if Text = 'down' then
+    Text := L('panel.net.ping.down');
+  if AEntry.DisplaySize = '' then
+    AEntry.DisplaySize := Text
+  else if Pos(Text, AEntry.DisplaySize) = 0 then
+    AEntry.DisplaySize := AEntry.DisplaySize + ' · ' + Text;
+end;
+
+procedure TNetworkSession.NotePing(const AHost, AText, AAlso: string);
+var
+  Key: string;
+begin
+  if (FPing = nil) or (AText = '') then
+    Exit;
+  Key := AnsiLowerCase(Trim(AHost));
+  if Key <> '' then
+    FPing.AddOrSetValue(Key, AText);
+  Key := AnsiLowerCase(Trim(AAlso));
+  if (Key <> '') and not SameText(Key, AnsiLowerCase(Trim(AHost))) then
+    FPing.AddOrSetValue(Key, AText);
+  if (Trim(AHost) = '') and (Trim(AAlso) = '') then
+    Exit;
+  Changed;
+end;
+
+function TNetworkSession.HostByAddress(const AAddr: string;
+  out AHost: TNetworkHost): Boolean;
+var
+  I: Integer;
+  Key: string;
+begin
+  Result := False;
+  AHost := Default(TNetworkHost);
+  Key := Trim(AAddr);
+  if Key = '' then
+    Exit;
+  for I := 0 to FHosts.Count - 1 do
+    if SameText(FHosts[I].Address, Key) or SameText(Trim(FHosts[I].Name), Key) then
+    begin
+      AHost := FHosts[I];
+      Exit(True);
+    end;
+  for I := 0 to FExtra.Count - 1 do
+    if SameText(FExtra[I].Address, Key) or SameText(Trim(FExtra[I].Name), Key) then
+    begin
+      AHost := FExtra[I];
+      Exit(True);
+    end;
 end;
 
 procedure TNetworkSession.Changed;
@@ -344,6 +449,21 @@ begin
   AList.Add(AHost);
 end;
 
+function ClassicRowHost(const ARow: TClassicRow): string;
+begin
+  if ARow.IsShare then
+    Result := HostOfPath(ARow.FullPath)
+  else
+    Result := VibeNetworkHost(ARow.FullPath);
+  if Result = '' then
+    Result := ARow.Name;
+end;
+
+function SameHostToken(const A, B: string): Boolean;
+begin
+  Result := (Trim(A) <> '') and (Trim(B) <> '') and SameText(Trim(A), Trim(B));
+end;
+
 function TNetworkSession.HostSeen(const AAddr: string): Boolean;
 var
   I: Integer;
@@ -352,16 +472,40 @@ begin
   if AAddr = '' then
     Exit;
   for I := 0 to FHosts.Count - 1 do
-    if SameText(FHosts[I].Address, AAddr) then
+    if SameText(FHosts[I].Address, AAddr) or
+       SameText(Trim(FHosts[I].Name), AAddr) then
       Exit(True);
   for I := 0 to FExtra.Count - 1 do
-    if SameText(FExtra[I].Address, AAddr) then
+    if SameText(FExtra[I].Address, AAddr) or
+       SameText(Trim(FExtra[I].Name), AAddr) then
+      Exit(True);
+  for I := 0 to FClassicRows.Count - 1 do
+    if SameText(ClassicRowHost(FClassicRows[I]), AAddr) or
+       SameText(FClassicRows[I].Name, AAddr) then
+      Exit(True);
+end;
+
+function TNetworkSession.ClassicBlocks(const AHost: TNetworkHost): Boolean;
+var
+  I: Integer;
+  Nm: string;
+begin
+  Result := False;
+  Nm := Trim(AHost.Name);
+  if SameText(Nm, AHost.Address) then
+    Nm := '';
+  for I := 0 to FClassicRows.Count - 1 do
+    if SameHostToken(ClassicRowHost(FClassicRows[I]), AHost.Address) or
+       SameHostToken(ClassicRowHost(FClassicRows[I]), Nm) or
+       SameHostToken(FClassicRows[I].Name, AHost.Address) or
+       SameHostToken(FClassicRows[I].Name, Nm) then
       Exit(True);
 end;
 
 procedure TNetworkSession.CancelJobs;
 begin
   Inc(FSeq);
+  Inc(FBrowseSeq);
   FScanning := False;
   FBrowsing := False;
   if FDiscovery <> nil then
@@ -375,16 +519,47 @@ begin
 end;
 
 procedure TNetworkSession.Stop;
-var
-  WasScan: Boolean;
 begin
-  if not FScanning and not FBrowsing then
+  if not FScanning then
     Exit;
-  WasScan := FScanning;
-  CancelJobs;
-  FError := L('op.cancelled');
-  FScanError := WasScan;
+  if FDiscovery <> nil then
+    FDiscovery.Cancel;
+  FScanning := False;
+  FDidScan := True;
+  FError := '';
+  FScanError := False;
   Changed;
+end;
+
+procedure TNetworkSession.SetOwnerWindow(AOwner: NativeUInt);
+begin
+  if AOwner <> 0 then
+    FOwner := AOwner;
+end;
+
+procedure TNetworkSession.TouchClassic;
+begin
+  if FClassicStarted or (FClassic = nil) then
+    Exit;
+  FClassicStarted := True;
+  FClassic.Start(
+    procedure(ARow: TClassicRow)
+    var
+      I: Integer;
+    begin
+      for I := 0 to FClassicRows.Count - 1 do
+        if SameText(FClassicRows[I].FullPath, ARow.FullPath) then
+          Exit;
+      FClassicRows.Add(ARow);
+      Changed;
+    end,
+    procedure(AErr: string)
+    begin
+      if AErr <> '' then
+        Changed
+      else
+        Changed;
+    end);
 end;
 
 procedure TNetworkSession.Scan(const ASubnet: string);
@@ -392,7 +567,9 @@ var
   Token: Integer;
   Use: string;
 begin
-  CancelJobs;
+  if FDiscovery <> nil then
+    FDiscovery.Cancel;
+  Inc(FSeq);
   Token := FSeq;
   Use := Trim(ASubnet);
   if Use = '' then
@@ -402,7 +579,6 @@ begin
   FError := '';
   FScanError := False;
   FScanning := True;
-  FBrowsing := False;
   FDidScan := False;
   Changed;
   FDiscovery.ScanAsync(Use,
@@ -418,42 +594,48 @@ begin
       if Token <> FSeq then
         Exit;
       FScanning := False;
-      if AErr = '' then
+      if (AErr = '') or SameText(AErr, L('op.cancelled')) then
       begin
         FDidScan := True;
         FError := '';
         FScanError := False;
-        if Assigned(FOnPrefs) then
+        if (AErr = '') and Assigned(FOnPrefs) then
           FOnPrefs(Self);
       end
       else
       begin
         FError := AErr;
         FScanError := True;
-        if not SameText(AErr, L('op.cancelled')) then
-          FDidScan := True;
+        FDidScan := True;
       end;
       Changed;
     end);
 end;
 
-procedure TNetworkSession.Browse(const APath: string);
+procedure TNetworkSession.Browse(const APath: string; APrompt: Boolean);
 var
   Token: Integer;
   Host, Target: string;
   Fs: TNetworkFileSystem;
   Known: TNetworkHost;
   I: Integer;
+  AllowPrompt: Boolean;
 begin
-  CancelJobs;
-  Token := FSeq;
+  Inc(FBrowseSeq);
+  Token := FBrowseSeq;
+  AllowPrompt := APrompt;
+  if FSmb <> nil then
+    FSmb.Cancel;
+  if FFtp <> nil then
+    FFtp.Cancel;
+  if FDav <> nil then
+    FDav.Cancel;
   if not SameText(FBrowsePath, APath) then
     SetLength(FItems, 0);
   FBrowsePath := APath;
   FError := '';
   FScanError := False;
   FBrowsing := True;
-  FScanning := False;
   Changed;
   Host := VibeNetworkHost(APath);
   Fs := FSmb;
@@ -495,7 +677,7 @@ begin
   BindNetworkBrowse(Fs, Target,
     procedure(AItems: TNetworkItemList)
     begin
-      if Token <> FSeq then
+      if Token <> FBrowseSeq then
         Exit;
       FBrowsing := False;
       FItems := AItems;
@@ -504,11 +686,19 @@ begin
         Changed;
     end,
     procedure(AErr: string)
+    var
+      Code: Cardinal;
     begin
-      if Token <> FSeq then
+      if Token <> FBrowseSeq then
         Exit;
+      if AllowPrompt and NetLogonCodeOf(AErr, Code) and (FOwner <> 0) and
+         PromptShareLogon(FOwner, Target, Code) then
+      begin
+        Browse(APath, False);
+        Exit;
+      end;
       FBrowsing := False;
-      FError := AErr;
+      FError := NetLogonPlain(AErr);
       FScanError := False;
       SetLength(FItems, 0);
       Changed;
@@ -717,6 +907,29 @@ begin
   end;
 end;
 
+function TNetworkSession.TileLine: string;
+var
+  Plain: string;
+begin
+  if FScanning then
+    Exit(L('drive.scanning'));
+  Plain := HumanNetError(FError);
+  if (FError <> '') and (SameText(Plain, L('drive.link')) or
+     SameText(Plain, L('net.unreachable')) or SameText(Plain, L('net.sockets'))) then
+    Exit(L('drive.link'));
+  Result := L('drive.env');
+end;
+
+procedure TNetworkSession.ClearHistory;
+begin
+  if FHist.Count = 0 then
+    Exit;
+  FHist.Clear;
+  if Assigned(FOnPrefs) then
+    FOnPrefs(Self);
+  Changed;
+end;
+
 function TNetworkSession.ResolvedSubnet: string;
 begin
   if FSubnet <> '' then
@@ -730,10 +943,10 @@ var
   ViewRoot: Boolean;
 begin
   ViewRoot := IsVibeNetworkRoot(AViewPath) or (Trim(AViewPath) = '');
-  if FScanning then
+  if FScanning and ViewRoot then
     Exit(LCount(FHosts.Count, 'net.scan.one', 'net.scan.few', 'net.scan.many'));
   if (FError <> '') and (FScanError or not ViewRoot) then
-    Exit(FError);
+    Exit(HumanNetError(FError));
   if FBrowsing and not ViewRoot then
     Exit(L('net.reading'));
   if ViewRoot then
@@ -752,8 +965,24 @@ var
   I: Integer;
   E: TFileEntry;
   Host: string;
-  Dim: Boolean;
+  Shown: Integer;
+  NetOpen, Recent: Boolean;
   HistName, HistIp, HistKind, HistIcon: string;
+
+  function ExtraHides(const AHost: TNetworkHost): Boolean;
+  var
+    N: Integer;
+    Nm: string;
+  begin
+    Result := False;
+    Nm := Trim(AHost.Name);
+    if SameText(Nm, AHost.Address) then
+      Nm := '';
+    for N := 0 to FExtra.Count - 1 do
+      if SameHostToken(FExtra[N].Address, AHost.Address) or
+         SameHostToken(FExtra[N].Address, Nm) then
+        Exit(True);
+  end;
 
   function SeenName(const AAddr: string): string;
   var
@@ -775,7 +1004,7 @@ var
     S, Body, Tail: string;
     P: Integer;
   begin
-    AIcon := '#computer';
+    AIcon := '#stock:94';
     AKind := L('net.node');
     AIp := '';
     AName := APath;
@@ -798,7 +1027,7 @@ var
           if AName = '' then
             AName := Body;
           AKind := L('net.share');
-          AIcon := '#dir';
+          AIcon := '#stock:51';
           Exit;
         end;
       end;
@@ -811,7 +1040,7 @@ var
       else
       begin
         AKind := 'FTP';
-        AIcon := '#ftp';
+        AIcon := '#stock:51';
       end;
       AIp := UrlHost(APath);
       AName := SeenName(AIp);
@@ -824,6 +1053,7 @@ var
     if StartsText('http://', APath) or StartsText('https://', APath) then
     begin
       AKind := 'Web';
+      AIcon := '#stock:17';
       AIp := UrlHost(APath);
       AName := SeenName(AIp);
       if AName = '' then
@@ -841,6 +1071,70 @@ var
       AName := APath;
   end;
 
+  function HistDup(const APath: string): Boolean;
+  var
+    H, Body: string;
+    P: Integer;
+  begin
+    if IsUncPath(APath) and not IsVibeNetworkPath(APath) then
+    begin
+      Body := ExcludeTrailingPathDelimiter(APath);
+      if Length(Body) > 2 then
+      begin
+        Delete(Body, 1, 2);
+        P := Pos('\', Body);
+        if (P > 1) and (Copy(Body, P + 1, MaxInt) <> '') then
+          Exit(False);
+      end;
+    end;
+    H := HostOfPath(APath);
+    if H = '' then
+      H := UrlHost(APath);
+    Result := (H <> '') and HostSeen(H);
+  end;
+
+  procedure StampLast(const AKey: string);
+  var
+    Row: TFileEntry;
+  begin
+    if (AList.Count = 0) or (Trim(AKey) = '') then
+      Exit;
+    { TList<запис> віддає копію: пінг треба записати назад. }
+    Row := AList[AList.Count - 1];
+    ApplyPing(Row, AKey);
+    AList[AList.Count - 1] := Row;
+  end;
+
+  procedure AddClassic(const ARow: TClassicRow);
+  var
+    Row: TFileEntry;
+    HostName: string;
+  begin
+    Row := Default(TFileEntry);
+    Row.Name := ARow.Name;
+    Row.DisplayName := ARow.Name;
+    Row.FullPath := ARow.FullPath;
+    Row.IsDirectory := True;
+    Row.FreeBytes := 1;
+    if ARow.IsShare then
+    begin
+      Row.IconKey := '#shell:51';
+      Row.NeedsCustomIcon := True;
+      Row.DisplayType := HostOfPath(ARow.FullPath);
+      Row.DisplaySize := L('net.share');
+    end
+    else
+    begin
+      Row.IconKey := '#stock:94';
+      HostName := VibeNetworkHost(ARow.FullPath);
+      if FourOctets(HostName) then
+        Row.DisplayType := HostName;
+    end;
+    AList.Add(Row);
+    if not ARow.IsShare then
+      StampLast(VibeNetworkHost(ARow.FullPath));
+  end;
+
 begin
   if AList = nil then
     Exit;
@@ -849,27 +1143,83 @@ begin
     begin
       Result := CompareText(IpSortKey(L.Address), IpSortKey(R.Address));
     end));
-  AddHead(AList, 'Компьютеры');
-  for I := 0 to FHosts.Count - 1 do
-    AddPc(AList, FHosts[I], False);
+  FClassicRows.Sort(TComparer<TClassicRow>.Construct(
+    function(const L, R: TClassicRow): Integer
+    begin
+      if L.IsShare <> R.IsShare then
+      begin
+        if L.IsShare then
+          Result := 1
+        else
+          Result := -1;
+      end
+      else
+        Result := CompareText(L.Name, R.Name);
+    end));
+  if FClassicRows.Count > 0 then
+  begin
+    AddHead(AList, 'Сеть');
+    for I := 0 to FClassicRows.Count - 1 do
+      AddClassic(FClassicRows[I]);
+  end;
+  NetOpen := FClassicRows.Count > 0;
   for I := 0 to FExtra.Count - 1 do
   begin
     Host := FExtra[I].Address;
-    Dim := False;
-    for var J := 0 to FHosts.Count - 1 do
-      if SameText(FHosts[J].Address, Host) then
-        Dim := True;
-    if (Host <> '') and not Dim then
-      AddPc(AList, FExtra[I], False);
+    if (Host = '') or ClassicBlocks(FExtra[I]) then
+      Continue;
+    if not NetOpen then
+    begin
+      AddHead(AList, 'Сеть');
+      NetOpen := True;
+    end;
+    E := Default(TFileEntry);
+    E.Name := Host;
+    E.DisplayName := Host;
+    E.FullPath := 'network://' + Host;
+    E.IsDirectory := True;
+    E.FreeBytes := 1;
+    E.IconKey := '#stock:94';
+    if FourOctets(Host) then
+      E.DisplayType := Host;
+    AList.Add(E);
+    StampLast(Host);
+  end;
+  Shown := 0;
+  for I := 0 to FHosts.Count - 1 do
+    if not ClassicBlocks(FHosts[I]) and not ExtraHides(FHosts[I]) then
+      Inc(Shown);
+  if FScanning or (Shown > 0) then
+  begin
+    AddHead(AList, 'Найденные');
+    for I := 0 to FHosts.Count - 1 do
+      if not ClassicBlocks(FHosts[I]) and not ExtraHides(FHosts[I]) then
+      begin
+        AddPc(AList, FHosts[I], False);
+        StampLast(FHosts[I].Address);
+      end;
   end;
   if FHist.Count = 0 then
     Exit;
-  AddHead(AList, 'Недавние');
+  Recent := False;
   for I := 0 to FHist.Count - 1 do
   begin
-    Host := HostOfPath(FHist[I]);
-    if StartsText('network://', FHist[I]) and (Host <> '') and HostSeen(Host) then
+    if HistDup(FHist[I]) then
       Continue;
+    if not Recent then
+    begin
+      AddHead(AList, 'Недавние');
+      if AList.Count > 0 then
+      begin
+        E := AList[AList.Count - 1];
+        E.FullPath := 'nethead://recent';
+        AList[AList.Count - 1] := E;
+      end;
+      Recent := True;
+    end;
+    Host := HostOfPath(FHist[I]);
+    if Host = '' then
+      Host := UrlHost(FHist[I]);
     DescribeHist(FHist[I], HistName, HistIp, HistKind, HistIcon);
     E := Default(TFileEntry);
     E.Name := HistName;
@@ -882,49 +1232,71 @@ begin
     E.DisplaySize := HistKind;
     E.IsHidden := FDidScan and (Host <> '') and not HostSeen(Host);
     AList.Add(E);
+    if not SameText(HistKind, L('net.share')) then
+    begin
+      if HistIp <> '' then
+        StampLast(HistIp)
+      else
+        StampLast(Host);
+    end;
   end;
 end;
 
 procedure TNetworkSession.FillBrowse(AList: TFileEntryList);
 var
-  I, P: Integer;
+  I, G: Integer;
   Item: TNetworkItem;
-  E: TFileEntry;
-  Caption, Tail: string;
-begin
-  if AList = nil then
-    Exit;
-  for I := 0 to High(FItems) do
+  Grouped: Boolean;
+  Buckets: array[0..3] of TList<Integer>;
+  Titles: array[0..3] of string;
+
+  function RowCaption(const AItem: TNetworkItem): string;
+  var
+    S: string;
+    Cut: Integer;
   begin
-    Item := FItems[I];
-    if (Item.Name = '.') or (Item.Name = '..') then
-      Continue;
+    S := ExcludeTrailingPathDelimiter(AItem.FullPath);
+    Cut := LastDelimiter('/\', S);
+    if (Cut > 0) and (Copy(S, Cut + 1, MaxInt) <> '') then
+      Result := Copy(S, Cut + 1, MaxInt)
+    else
+      Result := AItem.Name;
+    if Result = '' then
+      Result := AItem.FullPath;
+  end;
+
+  function BlobHas(const AItem: TNetworkItem; const ANeedle: string): Boolean;
+  begin
+    Result := Pos(ANeedle, LowerCase(AItem.Name + ' ' + AItem.Comment)) > 0;
+  end;
+
+  procedure AddFlat(const AItem: TNetworkItem);
+  var
+    E: TFileEntry;
+    Caption: string;
+  begin
     E := Default(TFileEntry);
-    Caption := Item.Name;
-    Tail := ExcludeTrailingPathDelimiter(Item.FullPath);
-    P := LastDelimiter('/\', Tail);
-    if (P > 0) and (Copy(Tail, P + 1, MaxInt) <> '') then
-      Caption := Copy(Tail, P + 1, MaxInt);
-    if Caption = '' then
-      Caption := Item.FullPath;
+    Caption := RowCaption(AItem);
     E.Name := Caption;
     E.DisplayName := Caption;
-    E.FullPath := Item.FullPath;
+    E.FullPath := AItem.FullPath;
     if E.FullPath = '' then
-      E.FullPath := Item.Name;
-    E.IsDirectory := Item.ItemType <> nitFile;
-    E.Size := Item.Size;
-    E.Modified := Item.ModifiedDate;
+      E.FullPath := AItem.Name;
+    E.IsDirectory := AItem.ItemType <> nitFile;
+    E.Size := AItem.Size;
+    E.Modified := AItem.ModifiedDate;
     if E.IsDirectory then
     begin
       E.FreeBytes := 1;
-      if Item.ItemType = nitServer then
-        E.IconKey := '#computer'
+      if AItem.ItemType = nitServer then
+        E.IconKey := '#stock:94'
+      else if AItem.ItemType = nitShare then
+        E.IconKey := '#stock:51'
       else
         E.IconKey := '#dir';
-      if Item.ItemType = nitShare then
+      if AItem.ItemType = nitShare then
         E.DisplayType := L('net.share')
-      else if Item.ItemType = nitServer then
+      else if AItem.ItemType = nitServer then
         E.DisplayType := L('net.node')
       else
         E.DisplayType := L('model.folder');
@@ -933,12 +1305,124 @@ begin
     begin
       E.Extension := ExtractFileExt(Caption);
       E.DisplayType := UpperCase(Copy(E.Extension, 2, 12));
-      if Item.Size > 0 then
-        E.DisplaySize := FormatFileSize(Item.Size);
+      if AItem.Size > 0 then
+        E.DisplaySize := FormatFileSize(AItem.Size);
     end;
-    if Item.ModifiedDate > 0 then
-      E.DisplayDate := FormatDateTime('dd.mm.yyyy HH:nn', Item.ModifiedDate);
+    if AItem.ModifiedDate > 0 then
+      E.DisplayDate := FormatDateTime('dd.mm.yyyy HH:nn', AItem.ModifiedDate);
     AList.Add(E);
+  end;
+
+  procedure SortBucket(ABucket: TList<Integer>);
+  var
+    A, B, Tmp: Integer;
+  begin
+    for A := 0 to ABucket.Count - 2 do
+      for B := A + 1 to ABucket.Count - 1 do
+        if CompareText(RowCaption(FItems[ABucket[A]]),
+             RowCaption(FItems[ABucket[B]])) > 0 then
+        begin
+          Tmp := ABucket[A];
+          ABucket[A] := ABucket[B];
+          ABucket[B] := Tmp;
+        end;
+  end;
+
+  procedure AddGrouped(const AItem: TNetworkItem; AGroup: Integer);
+  var
+    Row: TFileEntry;
+    Caption: string;
+  begin
+    Row := Default(TFileEntry);
+    Caption := RowCaption(AItem);
+    Row.Name := Caption;
+    Row.DisplayName := Caption;
+    Row.FullPath := AItem.FullPath;
+    if Row.FullPath = '' then
+      Row.FullPath := AItem.Name;
+    case AGroup of
+      0, 1:
+        begin
+          Row.IsDirectory := True;
+          Row.FreeBytes := 1;
+          Row.IconKey := '#stock:51';
+          if AGroup = 0 then
+            Row.DisplayType := L('net.admin')
+          else
+            Row.DisplayType := L('net.share');
+        end;
+      2:
+        begin
+          Row.IsDirectory := False;
+          Row.IconKey := '#shell:16';
+          Row.NeedsCustomIcon := True;
+          Row.DisplayType := Trim(AItem.Comment);
+        end;
+    else
+      Row.IsDirectory := False;
+      Row.NeedsCustomIcon := True;
+      if BlobHas(AItem, 'fax') or BlobHas(AItem, 'факс') then
+        Row.IconKey := '#shell:52'
+      else
+        Row.IconKey := '#shell:17';
+      Row.DisplayType := Trim(AItem.Comment);
+    end;
+    AList.Add(Row);
+  end;
+
+begin
+  if AList = nil then
+    Exit;
+  Grouped := Length(FItems) > 0;
+  for I := 0 to High(FItems) do
+  begin
+    Item := FItems[I];
+    if (Item.Name = '.') or (Item.Name = '..') then
+      Continue;
+    if (Item.ItemType = nitFile) or (Item.ItemType = nitDirectory) or
+       not (Item.FromShare or Item.FromWNet) then
+    begin
+      Grouped := False;
+      Break;
+    end;
+  end;
+  if not Grouped then
+  begin
+    for I := 0 to High(FItems) do
+    begin
+      if (FItems[I].Name = '.') or (FItems[I].Name = '..') then
+        Continue;
+      AddFlat(FItems[I]);
+    end;
+    Exit;
+  end;
+  for G := 0 to 3 do
+    Buckets[G] := nil;
+  for G := 0 to 3 do
+    Buckets[G] := TList<Integer>.Create;
+  try
+    for I := 0 to High(FItems) do
+    begin
+      if (FItems[I].Name = '.') or (FItems[I].Name = '..') then
+        Continue;
+      Buckets[HostResourceGroup(FItems[I])].Add(I);
+    end;
+    Titles[0] := 'Админ';
+    Titles[1] := 'Шари';
+    Titles[2] := 'Принтеры';
+    Titles[3] := 'Другое';
+    for G := 0 to 3 do
+    begin
+      if Buckets[G].Count = 0 then
+        Continue;
+      SortBucket(Buckets[G]);
+      AddHead(AList, Titles[G]);
+      for I := 0 to Buckets[G].Count - 1 do
+        AddGrouped(FItems[Buckets[G][I]], G);
+    end;
+  finally
+    for G := 0 to 3 do
+      Buckets[G].Free;
   end;
 end;
 

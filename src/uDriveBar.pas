@@ -30,6 +30,8 @@ type
     FTrack: TRectangle;
     FFill: TRectangle;
     FOnContext: TDriveClickEvent;
+    FPrefW: Single;
+    FLine: string;
     procedure HandleEnter(Sender: TObject);
     procedure HandleLeave(Sender: TObject);
     procedure HandleDown(Sender: TObject; Button: TMouseButton;
@@ -39,11 +41,15 @@ type
     procedure TrackResize(Sender: TObject);
     procedure ApplyVisual;
     procedure UpdateBar;
+    procedure ApplyTexts;
+    procedure CaptureNetwork;
     procedure LoadShellIcon;
   public
     constructor Create(AOwner: TComponent); override;
     procedure Bind(const AInfo: TDriveInfo; const AColors: TThemeColors;
       AActive: Boolean; ALite: Boolean = False);
+    procedure SetStatusLine(const AText: string);
+    function PreferredWidth: Single;
     procedure RefreshSpace;
     procedure Enrich;
     function IsActive: Boolean;
@@ -76,6 +82,7 @@ type
     FNeedRebuild: Boolean;
     FPopulated: Boolean;
     FReadyForFull: Boolean;
+    FRevealPending: Boolean;
     FSpaceIdx: Integer;
     FTimer: TTimer;
     {$IFDEF MSWINDOWS}
@@ -89,6 +96,7 @@ type
     procedure TimerTick(Sender: TObject);
     procedure Relayout;
     procedure ApplyActive;
+    procedure RevealActive;
     function CurrentMask: DWORD;
     function MakeNavButton(const ACaption: string; AOnClick: TNotifyEvent;
       out ALabel: TLabel): TRectangle;
@@ -115,6 +123,7 @@ type
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure ApplyLanguage;
     procedure SetShowNetwork(AValue: Boolean);
+    procedure SetNetworkLine(const AText: string);
     property ShowNetwork: Boolean read FShowNetwork write SetShowNetwork;
     property OnDriveClick: TDriveClickEvent read FOnDriveClick write FOnDriveClick;
     property OnDriveContext: TDriveClickEvent read FOnDriveContext write FOnDriveContext;
@@ -166,11 +175,6 @@ begin
   else
     Result := ICON_HDD;
   end;
-end;
-
-function KindCaption(AKind: TDriveKind): string;
-begin
-  Result := DriveKindCaption(AKind);
 end;
 
 function FormatDriveUsage(AUsed, ATotal: Int64): string;
@@ -276,60 +280,118 @@ begin
   FFill.Height :=4;
 end;
 
+procedure TDriveTile.ApplyTexts;
+var
+  Title, NewHint: string;
+begin
+  Title := TileTitle(FInfo);
+  if FTitle.Text <> Title then
+    FTitle.Text := Title;
+  NewHint := DrivePlaceHint(FInfo);
+  if Hint <> NewHint then
+    Hint := NewHint;
+  ShowHint := NewHint <> '';
+end;
+
+procedure TDriveTile.CaptureNetwork;
+begin
+  if FInfo.Kind = dkNetHood then
+    Exit;
+  if (FInfo.Kind <> dkNetwork) and not IsRemotePath(FInfo.Root) then
+    Exit;
+  FInfo.Kind := dkNetwork;
+  if FInfo.RemotePath = '' then
+    FInfo.RemotePath := MappedDriveUnc(FInfo.Root);
+end;
+
 procedure TDriveTile.Bind(const AInfo: TDriveInfo; const AColors: TThemeColors;
   AActive: Boolean; ALite: Boolean);
 var
   Used: Int64;
-  Title, Usage, NewHint: string;
+  Usage: string;
 begin
   FInfo := AInfo;
   FColors := AColors;
   FActive := AActive;
-  if not ALite then
+  CaptureNetwork;
+  if (not ALite) or (FInfo.Kind = dkNetwork) then
     LoadShellIcon
   else
     FIcon.Bitmap.SetSize(0, 0);
-  Title := TileTitle(AInfo);
-  if FTitle.Text <> Title then
-    FTitle.Text := Title;
-  if AInfo.Ready and (AInfo.TotalBytes > 0) then
+  if FInfo.Ready and (FInfo.TotalBytes > 0) then
   begin
-    Used := AInfo.TotalBytes - AInfo.FreeBytes;
+    Used := FInfo.TotalBytes - FInfo.FreeBytes;
     if Used < 0 then
       Used := 0;
-    Usage := FormatDriveUsage(Used, AInfo.TotalBytes);
+    Usage := FormatDriveUsage(Used, FInfo.TotalBytes);
   end
-  else if AInfo.Kind = dkNetHood then
-    Usage := L('drive.env')
-  else if AInfo.Kind = dkDevice then
+  else if FInfo.Kind = dkNetHood then
+  begin
+    if FLine <> '' then
+      Usage := FLine
+    else
+      Usage := L('drive.env');
+  end
+  else if FInfo.Kind = dkDevice then
     Usage := L('drive.device')
-  else if ALite then
+  else if ALite or (FInfo.Kind = dkNetwork) then
     Usage := ''
   else
     Usage := L('drive.nodata');
   if FUsage.Text <> Usage then
     FUsage.Text := Usage;
-  FTrack.Visible := AInfo.Ready and (AInfo.TotalBytes > 0);
-  NewHint := AInfo.Letter + ' ' + KindCaption(AInfo.Kind) + ' — ' + Usage;
-  if Hint <> NewHint then
-    Hint := NewHint;
-  ShowHint := True;
+  FTrack.Visible := FInfo.Ready and (FInfo.TotalBytes > 0);
+  ApplyTexts;
   ApplyVisual;
   UpdateBar;
+  if FInfo.Kind = dkNetHood then
+    SetStatusLine(Usage);
+end;
+
+procedure TDriveTile.SetStatusLine(const AText: string);
+var
+  Title, Line: string;
+  W: Single;
+begin
+  Line := Trim(AText);
+  if Line = '' then
+    Line := L('drive.env');
+  FLine := Line;
+  Title := FTitle.Text;
+  if Title = '' then
+    Title := TileTitle(FInfo);
+  FUsage.Text := Line;
+  FUsage.Align := TAlignLayout.Client;
+  FUsage.TextSettings.HorzAlign := TTextAlign.Leading;
+  FUsage.TextSettings.Trimming := TTextTrimming.Word;
+  FTitle.TextSettings.Trimming := TTextTrimming.Word;
+  FTrack.Visible := False;
+  W := 8 + 20 + 6 + Max(Length(Title) * 8.2, Length(Line) * 6.4) + 12;
+  if W < TILE_W then
+    W := TILE_W;
+  FPrefW := W;
+  Hint := Title + ' — ' + Line;
+  ShowHint := True;
+end;
+
+function TDriveTile.PreferredWidth: Single;
+begin
+  if FPrefW > TILE_W then
+    Result := FPrefW
+  else
+    Result := TILE_W;
 end;
 
 procedure TDriveTile.LoadShellIcon;
 var
   Bmp: FMX.Graphics.TBitmap;
 begin
-  if IsRemotePath(FInfo.Root) or (FInfo.Kind = dkNetwork) then
-  begin
-    FIcon.Bitmap.SetSize(0, 0);
-    Exit;
-  end;
   Bmp := nil;
   try
-    GetFileIconBitmap(FInfo.Root, True, Bmp);
+    if FInfo.Kind = dkNetwork then
+      GetNetworkDriveIconBitmap(Bmp, NetworkDriveConnected(FInfo.Root))
+    else
+      GetFileIconBitmap(FInfo.Root, True, Bmp);
     if Assigned(Bmp) and (Bmp.Width > 0) then
       FIcon.Bitmap.Assign(Bmp)
     else
@@ -343,8 +405,8 @@ procedure TDriveTile.Enrich;
 {$IFDEF MSWINDOWS}
 var
   LabelBuf: array[0..MAX_PATH] of Char;
+  FsBuf: array[0..63] of Char;
   Dummy: DWORD;
-  Title: string;
 begin
   if FInfo.Root = '' then
     Exit;
@@ -355,19 +417,25 @@ begin
     LoadShellIcon;
     Exit;
   end;
-  if IsRemotePath(FInfo.Root) then
+  if IsRemotePath(FInfo.Root) or (FInfo.Kind = dkNetwork) or
+     UiSkipNetworkTouch(FInfo.Root) then
   begin
-    FInfo.Kind := dkNetwork;
-    RefreshSpace;
+    CaptureNetwork;
+    ApplyTexts;
+    LoadShellIcon;
     Exit;
   end;
   FillChar(LabelBuf, SizeOf(LabelBuf), 0);
+  FillChar(FsBuf, SizeOf(FsBuf), 0);
   if GetVolumeInformation(PChar(FInfo.Root), LabelBuf, Length(LabelBuf),
-    nil, Dummy, Dummy, nil, 0) and (LabelBuf[0] <> #0) then
-    FInfo.VolumeName := string(LabelBuf);
-  Title := TileTitle(FInfo);
-  if FTitle.Text <> Title then
-    FTitle.Text := Title;
+    nil, Dummy, Dummy, FsBuf, Length(FsBuf)) then
+  begin
+    if LabelBuf[0] <> #0 then
+      FInfo.VolumeName := string(PChar(@LabelBuf[0]));
+    if FsBuf[0] <> #0 then
+      FInfo.FileSystem := string(PChar(@FsBuf[0]));
+  end;
+  ApplyTexts;
   LoadShellIcon;
   RefreshSpace;
 end;
@@ -385,15 +453,20 @@ var
 begin
   if FInfo.Root = '' then
     Exit;
-  if IsRemotePath(FInfo.Root) or (FInfo.Kind = dkNetwork) then
+  if IsRemotePath(FInfo.Root) or (FInfo.Kind = dkNetwork) or
+     UiSkipNetworkTouch(FInfo.Root) then
   begin
-    if FUsage.Text = '' then
-      FUsage.Text := '…';
     FTrack.Visible := False;
+    if FUsage.Text <> '' then
+      FUsage.Text := '';
+    ApplyTexts;
     Exit;
   end;
   if not GetDiskFreeSpaceEx(PChar(FInfo.Root), FreeForCaller, Total, @TotalFree) then
+  begin
+    ApplyTexts;
     Exit;
+  end;
   if (FInfo.TotalBytes <> Total) or (FInfo.FreeBytes <> TotalFree) then
   begin
     FInfo.TotalBytes := Total;
@@ -409,6 +482,7 @@ begin
   else
     FInfo.Ready := True;
   FTrack.Visible := FInfo.Ready and (FInfo.TotalBytes > 0);
+  ApplyTexts;
   ApplyVisual;
   UpdateBar;
 end;
@@ -464,7 +538,12 @@ begin
   end
   else
   begin
-    Fill.Color := FColors.ControlFill;
+    { Мика: плитка не закрывает прозрачную полосу дисков своим фоном. }
+    if (TAlphaColorRec(FColors.HeaderBackground).A < 255) and
+       not WindowChromeIsAcrylic then
+      Fill.Color := TAlphaColors.Null
+    else
+      Fill.Color := FColors.ControlFill;
     Stroke.Color := FColors.ControlStroke;
   end;
 
@@ -558,6 +637,7 @@ begin
   FNeedRebuild := False;
   FPopulated := False;
   FReadyForFull := False;
+  FRevealPending := False;
   FSpaceIdx := 0;
   FShowNetwork := False;
 
@@ -627,45 +707,111 @@ end;
 procedure TDriveBar.Relayout;
 var
   I: Integer;
-  X: Single;
+  X, TileW: Single;
 begin
   X := 0;
   for I := 0 to FTiles.Count - 1 do
   begin
-    FTiles[I].SetBounds(X, 0, TILE_W, TILE_H);
-    X := X + TILE_W + TILE_GAP;
+    TileW := FTiles[I].PreferredWidth;
+    FTiles[I].SetBounds(X, 0, TileW, TILE_H);
+    X := X + TileW + TILE_GAP;
   end;
   if X > 0 then
     X := X - TILE_GAP;
   FHost.Width := Max(X, 1);
   FHost.Height := TILE_H;
+  FRevealPending := True;
+  RevealActive;
   UpdateNavButtons;
+end;
+
+function DriveTileMatches(const AInfo: TDriveInfo; const ARoot: string): Boolean;
+var
+  TileRoot, Path: string;
+begin
+  Result := False;
+  if Trim(AInfo.Root) = '' then
+    Exit;
+  TileRoot := IncludeTrailingPathDelimiter(AInfo.Root);
+  Path := IncludeTrailingPathDelimiter(ARoot);
+  case AInfo.Kind of
+    dkNetHood:
+      Result := StartsText('\\', ARoot) or
+        StartsText('network://', ARoot) or StartsText('ftp://', ARoot) or
+        StartsText('ftps://', ARoot) or StartsText('http://', ARoot) or
+        StartsText('https://', ARoot) or SameText(ARoot, 'Сеть') or
+        SameText(ARoot, AInfo.Root) or SameText(ARoot, 'Network');
+    dkDevice:
+      Result := SameText(ExcludeTrailingPathDelimiter(ARoot),
+          ExcludeTrailingPathDelimiter(AInfo.Root)) or
+        StartsText(TileRoot, Path);
+  else
+    if IsVirtualShellPath(ARoot) or IsPortableDevicePath(ARoot) then
+      Result := False
+    else
+      Result := SameText(AInfo.Root,
+        IncludeTrailingPathDelimiter(ExtractFileDrive(ARoot)));
+  end;
 end;
 
 procedure TDriveBar.ApplyActive;
 var
-  I: Integer;
-  Root: string;
+  I, Best: Integer;
 begin
-  Root := FActiveRoot;
+  Best := -1;
   for I := 0 to FTiles.Count - 1 do
-    case FTiles[I].Info.Kind of
-      dkNetHood:
-        FTiles[I].SetActive(StartsText('\\', Root) or
-          StartsText('network://', Root) or StartsText('ftp://', Root) or
-          StartsText('ftps://', Root) or StartsText('http://', Root) or
-          StartsText('https://', Root) or SameText(Root, 'Сеть') or
-          SameText(Root, FTiles[I].Info.Root) or SameText(Root, 'Network'));
-      dkDevice:
-        FTiles[I].SetActive(SameText(Root, FTiles[I].Info.Root) or
-          StartsText(FTiles[I].Info.Root, Root));
-    else
-      if IsVirtualShellPath(Root) or IsPortableDevicePath(Root) then
-        FTiles[I].SetActive(False)
-      else
-        FTiles[I].SetActive(SameText(FTiles[I].Info.Root,
-          IncludeTrailingPathDelimiter(ExtractFileDrive(Root))));
+    if DriveTileMatches(FTiles[I].Info, FActiveRoot) then
+    begin
+      Best := I;
+      Break;
     end;
+  for I := 0 to FTiles.Count - 1 do
+    FTiles[I].SetActive(I = Best);
+  FRevealPending := True;
+  RevealActive;
+end;
+
+procedure TDriveBar.RevealActive;
+var
+  I: Integer;
+  ViewW, MaxX, Target: Single;
+begin
+  if not Assigned(FScroll) or not Assigned(FHost) then
+    Exit;
+  Target := 0;
+  for I := 0 to FTiles.Count - 1 do
+    if FTiles[I].IsActive then
+    begin
+      ViewW := FScroll.Width;
+      MaxX := Max(0, FHost.Width - ViewW);
+      Target := EnsureRange(FTiles[I].Position.X - 4, 0, MaxX);
+      Break;
+    end;
+  if (Abs(FScroll.ViewportPosition.X - Target) > 1) or
+     (Abs(FScroll.ViewportPosition.Y) > 1) then
+    FScroll.ViewportPosition := TPointF.Create(Target, 0);
+end;
+
+procedure TDriveBar.SetNetworkLine(const AText: string);
+var
+  I: Integer;
+  Need: Boolean;
+  Before, After: Single;
+begin
+  if FTiles = nil then
+    Exit;
+  Need := False;
+  for I := 0 to FTiles.Count - 1 do
+    if FTiles[I].Info.Kind = dkNetHood then
+    begin
+      Before := FTiles[I].Width;
+      FTiles[I].SetStatusLine(AText);
+      After := FTiles[I].PreferredWidth;
+      if Abs(After - Before) > 0.5 then
+        Need := True;
+    end;
+  if Need then
+    Relayout;
 end;
 
 procedure TDriveBar.SetShowNetwork(AValue: Boolean);
@@ -970,6 +1116,11 @@ end;
 
 procedure TDriveBar.ScrollResize(Sender: TObject);
 begin
+  if FRevealPending and Assigned(FScroll) and (FScroll.Width > 20) then
+  begin
+    RevealActive;
+    FRevealPending := False;
+  end;
   UpdateNavButtons;
 end;
 
@@ -1714,6 +1865,7 @@ var
   Home: TExplorerHome;
   Paths, Caps: TArray<string>;
   I, N: Integer;
+  HasBin: Boolean;
 begin
   if (ASettings = nil) or not ASettings.DockSeedPending then
     Exit;
@@ -1721,10 +1873,20 @@ begin
   N := Length(Home.Pinned);
   SetLength(Paths, N);
   SetLength(Caps, N);
+  HasBin := False;
   for I := 0 to N - 1 do
   begin
     Paths[I] := Home.Pinned[I].Path;
     Caps[I] := Home.Pinned[I].Caption;
+    if IsRecycleBinPath(Paths[I]) then
+      HasBin := True;
+  end;
+  if not HasBin then
+  begin
+    SetLength(Paths, N + 1);
+    SetLength(Caps, N + 1);
+    Paths[N] := RecycleBinPath;
+    Caps[N] := L('bin.title');
   end;
   ASettings.CommitDockSeed(Paths, Caps);
 end;

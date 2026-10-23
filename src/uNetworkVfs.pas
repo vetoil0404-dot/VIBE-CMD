@@ -22,6 +22,11 @@ type
     ModifiedDate: TDateTime;
     IsReadable: Boolean;
     IsWritable: Boolean;
+    Comment: string;
+    ResType: Cardinal;
+    ShareType: Cardinal;
+    FromShare: Boolean;
+    FromWNet: Boolean;
   end;
 
   TNetworkItemList = TArray<TNetworkItem>;
@@ -102,6 +107,9 @@ type
     HasSMB: Boolean;
     HasWebAdmin: Boolean;
     IsRouter: Boolean;
+    { 80 і 443 окремо: сторінка роутера — http, і лише 443 дає https. }
+    Port80: Boolean;
+    Port443: Boolean;
   end;
 
   // Пинг подсети, порты 21 / 445 / 80 / 443 и MAC. Только частные адреса, не шире 254 узлов.
@@ -117,6 +125,51 @@ type
       AOnDone: TProc<string>);
     procedure Cancel;
   end;
+
+  { Строка классической сети. Свой обход, сканер её не трогает. }
+  TClassicRow = record
+    Name: string;
+    FullPath: string;
+    IsShare: Boolean;
+  end;
+
+  TClassicNet = class
+  private
+    FSlot: INetSlot;
+    FJob: TNetJob;
+    FTask: ITask;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Start(AOnRow: TProc<TClassicRow>; AOnDone: TProc<string>);
+    procedure Cancel;
+  end;
+
+{ Текст «нет доступа» с кодом Windows после #1. На экране код снимается. }
+function NetLogonText(ACode: Cardinal): string;
+function NetLogonCodeOf(const AText: string; out ACode: Cardinal): Boolean;
+function NetLogonPlain(const AText: string): string;
+{ Одна строка. Сырой текст сокета становится «нет связи» или «нет доступа». }
+function HumanNetError(const AText: string): string;
+{ 0 — административные ($), 1 — шары, 2 — принтеры, 3 — факс, сканер и прочее. }
+function HostResourceGroup(const AItem: TNetworkItem): Integer;
+function UncServerRoot(const AUnc: string): string;
+function PromptShareLogon(AOwner: NativeUInt; const AUnc: string;
+  ACode: Cardinal): Boolean;
+{ Короткий пінг. Ім'я спочатку розбирається в IPv4. }
+function ProbeHostAlive(const AHost: string): Boolean;
+function RouterPageUrl(const AHost: TNetworkHost): string;
+{ Літера вже мапленої шари, інакше порожньо. Таблиця MPR, без опитування шари. }
+function MappedLetterFor(const AUnc: string): string;
+function MapNetworkShare(const AUnc, ALetter: string; ARestore: Boolean;
+  out ACode: Cardinal): Boolean;
+function UnmapNetworkShare(const ALetter: string; out ACode: Cardinal): Boolean;
+function PrinterIsQueued(const AUnc: string): Boolean;
+{ True — черга щойно створена. AAlready — вже була, другу не створюємо. }
+function ConnectPrinter(const AUnc: string; out AAlready: Boolean;
+  out ACode: Cardinal): Boolean;
+function MakeDefaultPrinter(const AUnc: string; out ACode: Cardinal): Boolean;
+function RemovePrinter(const AUnc: string; out ACode: Cardinal): Boolean;
 
 procedure BindNetworkBrowse(AFs: TNetworkFileSystem; const APath: string;
   const AApply: TProc<TNetworkItemList>; const AFail: TProc<string>);
@@ -150,8 +203,20 @@ const
   PING_MS = 200;
   PORT_MS = 200;
   SCAN_CAP = 254;
+  PRINTER_ENUM_LOCAL = 2;
+  PRINTER_ENUM_CONNECTIONS = 4;
+  { У Winapi.Windows немає ERROR_PRINTER_ALREADY_EXISTS. }
+  ERR_PRINTER_ALREADY = 1801;
 
 type
+  { Win32 PRINTER_INFO_4: два вказівники і DWORD, без хвостового вирівнювання. }
+  TPrinterInfo4 = packed record
+    pPrinterName: PChar;
+    pServerName: PChar;
+    Attributes: DWORD;
+  end;
+  PPrinterInfo4 = ^TPrinterInfo4;
+
   TNetSlot = class(TInterfacedObject, INetSlot)
   private
     FGen: Integer;
@@ -193,16 +258,297 @@ begin
   S := Trim(S);
   if S = '' then
     S := L('net.err');
-  if Length(S) > 300 then
-    S := Copy(S, 1, 300);
+  Result := HumanNetError(S);
+end;
+
+function HumanNetError(const AText: string): string;
+var
+  S, Low: string;
+begin
+  S := NetLogonPlain(AText);
+  S := StringReplace(S, #13#10, ' ', [rfReplaceAll]);
+  S := StringReplace(S, #10, ' ', [rfReplaceAll]);
+  S := StringReplace(S, #13, ' ', [rfReplaceAll]);
+  while Pos('  ', S) > 0 do
+    S := StringReplace(S, '  ', ' ', [rfReplaceAll]);
+  S := Trim(S);
+  Low := LowerCase(S);
+  if (Pos('socket', Low) > 0) or (Pos('10054', Low) > 0) or (Pos('10060', Low) > 0) or
+     (Pos('10061', Low) > 0) or (Pos('10053', Low) > 0) or (Pos('10051', Low) > 0) or
+     (Pos('10065', Low) > 0) or (Pos('connection reset', Low) > 0) or
+     (Pos('timed out', Low) > 0) or (Pos('timeout', Low) > 0) or
+     (Pos('# 100', Low) > 0) then
+  begin
+    if (Pos('access', Low) > 0) or (Pos('denied', Low) > 0) or
+       (Pos('logon', Low) > 0) or (Pos('password', Low) > 0) then
+      Exit(L('op.noaccess'));
+    Exit(L('drive.link'));
+  end;
+  if S = '' then
+    S := L('net.err');
+  if Length(S) > 180 then
+    S := Copy(S, 1, 180);
   Result := S;
+end;
+
+function NetLogonText(ACode: Cardinal): string;
+begin
+  Result := L('op.noaccess') + #1 + IntToStr(ACode);
+end;
+
+function NetLogonCodeOf(const AText: string; out ACode: Cardinal): Boolean;
+var
+  P: Integer;
+begin
+  ACode := 0;
+  Result := False;
+  P := Pos(#1, AText);
+  if (P <= 1) or (Copy(AText, 1, P - 1) <> L('op.noaccess')) then
+    Exit;
+  ACode := StrToIntDef(Copy(AText, P + 1, 12), 0);
+  Result := (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_LOGON_FAILURE) or
+    (ACode = ERROR_INVALID_PASSWORD) or
+    (ACode = ERROR_SESSION_CREDENTIAL_CONFLICT);
+end;
+
+function NetLogonPlain(const AText: string): string;
+var
+  P: Integer;
+begin
+  P := Pos(#1, AText);
+  if P > 0 then
+    Result := Copy(AText, 1, P - 1)
+  else
+    Result := AText;
+end;
+
+function UncServerRoot(const AUnc: string): string;
+var
+  S: string;
+  P: Integer;
+begin
+  Result := '';
+  S := Trim(AUnc);
+  if S = '' then
+    Exit;
+  if StartsText('network://', S) or StartsText('network:\\', S) then
+  begin
+    Delete(S, 1, 10);
+    while (S <> '') and ((S[1] = '/') or (S[1] = '\')) do
+      Delete(S, 1, 1);
+  end
+  else if S.StartsWith('\\') then
+    Delete(S, 1, 2)
+  else if Pos('://', S) > 0 then
+    Exit;
+  P := Pos('\', S);
+  if P = 0 then
+    P := Pos('/', S);
+  if P > 0 then
+    S := Copy(S, 1, P - 1);
+  P := Pos('@', S);
+  if P > 0 then
+    S := Copy(S, P + 1, MaxInt);
+  if (S <> '') and (S[1] <> '[') then
+  begin
+    P := Pos(':', S);
+    if P > 0 then
+      S := Copy(S, 1, P - 1);
+  end;
+  S := Trim(S);
+  if S = '' then
+    Exit;
+  Result := '\\' + S;
+end;
+
+function PromptShareLogon(AOwner: NativeUInt; const AUnc: string;
+  ACode: Cardinal): Boolean;
+var
+  Root: string;
+  Res: TNetResource;
+  Status: DWORD;
+begin
+  Result := False;
+  Root := UncServerRoot(AUnc);
+  if Root = '' then
+    Exit;
+  if ACode = ERROR_SESSION_CREDENTIAL_CONFLICT then
+    WNetCancelConnection2(PChar(Root), 0, False);
+  FillChar(Res, SizeOf(Res), 0);
+  Res.dwType := RESOURCETYPE_DISK;
+  Res.lpRemoteName := PChar(Root);
+  Status := WNetAddConnection3(HWND(AOwner), Res, nil, nil,
+    CONNECT_INTERACTIVE or CONNECT_PROMPT);
+  Result := Status = NO_ERROR;
+end;
+
+function RouterPageUrl(const AHost: TNetworkHost): string;
+begin
+  if (AHost.Address <> '') and AHost.Port443 and not AHost.Port80 then
+    Result := 'https://' + AHost.Address
+  else
+    Result := 'http://' + AHost.Address;
+end;
+
+function MappedLetterFor(const AUnc: string): string;
+var
+  C: Char;
+  Mask, Len: DWORD;
+  Buf: array[0..1023] of Char;
+  Want, Got: string;
+begin
+  Result := '';
+  Want := ExcludeTrailingPathDelimiter(Trim(AUnc));
+  if Want = '' then
+    Exit;
+  Mask := GetLogicalDrives;
+  for C := 'A' to 'Z' do
+  begin
+    if (Mask and (1 shl (Ord(C) - Ord('A')))) = 0 then
+      Continue;
+    Len := Length(Buf);
+    FillChar(Buf, SizeOf(Buf), 0);
+    if WNetGetConnection(PChar(string(C) + ':'), Buf, Len) <> NO_ERROR then
+      Continue;
+    Got := ExcludeTrailingPathDelimiter(string(PChar(@Buf[0])));
+    if SameText(Got, Want) then
+      Exit(string(C) + ':');
+  end;
+end;
+
+function MapNetworkShare(const AUnc, ALetter: string; ARestore: Boolean;
+  out ACode: Cardinal): Boolean;
+var
+  Res: TNetResource;
+  Local, Remote: string;
+  Flags: DWORD;
+begin
+  ACode := ERROR_INVALID_PARAMETER;
+  Result := False;
+  Remote := ExcludeTrailingPathDelimiter(Trim(AUnc));
+  if (ALetter = '') or (Remote = '') then
+    Exit;
+  Local := UpCase(ALetter[1]) + ':';
+  FillChar(Res, SizeOf(Res), 0);
+  Res.dwType := RESOURCETYPE_DISK;
+  Res.lpLocalName := PChar(Local);
+  Res.lpRemoteName := PChar(Remote);
+  Flags := 0;
+  if ARestore then
+    Flags := CONNECT_UPDATE_PROFILE;
+  { Пароль не передаємо і не пишемо: чужу шару питає системний діалог. }
+  ACode := WNetAddConnection2(Res, nil, nil, Flags);
+  Result := ACode = NO_ERROR;
+end;
+
+function UnmapNetworkShare(const ALetter: string; out ACode: Cardinal): Boolean;
+var
+  Local: string;
+begin
+  ACode := ERROR_INVALID_PARAMETER;
+  Result := False;
+  if ALetter = '' then
+    Exit;
+  Local := UpCase(ALetter[1]) + ':';
+  ACode := WNetCancelConnection2(PChar(Local), CONNECT_UPDATE_PROFILE, False);
+  Result := ACode = NO_ERROR;
+end;
+
+function EnumPrintersW(Flags: DWORD; Name: PChar; Level: DWORD; pPrinterEnum: Pointer;
+  cbBuf: DWORD; var pcbNeeded, pcReturned: DWORD): BOOL; stdcall;
+  external 'winspool.drv' name 'EnumPrintersW';
+function AddPrinterConnectionW(pName: PChar): BOOL; stdcall;
+  external 'winspool.drv' name 'AddPrinterConnectionW';
+function DeletePrinterConnectionW(pName: PChar): BOOL; stdcall;
+  external 'winspool.drv' name 'DeletePrinterConnectionW';
+function SetDefaultPrinterW(pszPrinter: PChar): BOOL; stdcall;
+  external 'winspool.drv' name 'SetDefaultPrinterW';
+
+function SameUnc(const A, B: string): Boolean;
+begin
+  Result := SameText(ExcludeTrailingPathDelimiter(Trim(A)),
+    ExcludeTrailingPathDelimiter(Trim(B)));
+end;
+
+function PrinterIsQueued(const AUnc: string): Boolean;
+var
+  Need, Got: DWORD;
+  Buf: TBytes;
+  P: PByte;
+  Info: PPrinterInfo4;
+  I: Integer;
+begin
+  Result := False;
+  if Trim(AUnc) = '' then
+    Exit;
+  Need := 0;
+  Got := 0;
+  EnumPrintersW(PRINTER_ENUM_LOCAL or PRINTER_ENUM_CONNECTIONS, nil, 4, nil, 0,
+    Need, Got);
+  if Need = 0 then
+    Exit;
+  SetLength(Buf, Need);
+  Got := 0;
+  if not EnumPrintersW(PRINTER_ENUM_LOCAL or PRINTER_ENUM_CONNECTIONS, nil, 4,
+       @Buf[0], Length(Buf), Need, Got) then
+    Exit;
+  P := @Buf[0];
+  for I := 0 to Integer(Got) - 1 do
+  begin
+    Info := PPrinterInfo4(P);
+    if (Info <> nil) and (Info.pPrinterName <> nil) and
+       SameUnc(string(Info.pPrinterName), AUnc) then
+      Exit(True);
+    Inc(P, SizeOf(TPrinterInfo4));
+  end;
+end;
+
+function ConnectPrinter(const AUnc: string; out AAlready: Boolean;
+  out ACode: Cardinal): Boolean;
+begin
+  AAlready := False;
+  ACode := 0;
+  Result := False;
+  if Trim(AUnc) = '' then
+    Exit;
+  if PrinterIsQueued(AUnc) then
+  begin
+    AAlready := True;
+    Exit;
+  end;
+  if AddPrinterConnectionW(PChar(AUnc)) then
+    Exit(True);
+  ACode := GetLastError;
+  if ACode = ERR_PRINTER_ALREADY then
+  begin
+    AAlready := True;
+    ACode := 0;
+  end;
+end;
+
+function MakeDefaultPrinter(const AUnc: string; out ACode: Cardinal): Boolean;
+begin
+  ACode := 0;
+  Result := (Trim(AUnc) <> '') and SetDefaultPrinterW(PChar(AUnc));
+  if not Result then
+    ACode := GetLastError;
+end;
+
+function RemovePrinter(const AUnc: string; out ACode: Cardinal): Boolean;
+begin
+  ACode := 0;
+  Result := (Trim(AUnc) <> '') and DeletePrinterConnectionW(PChar(AUnc));
+  if not Result then
+    ACode := GetLastError;
 end;
 
 function NetStatusText(AStatus: DWORD): string;
 begin
+  if (AStatus = ERROR_ACCESS_DENIED) or (AStatus = ERROR_LOGON_FAILURE) or
+     (AStatus = ERROR_INVALID_PASSWORD) or
+     (AStatus = ERROR_SESSION_CREDENTIAL_CONFLICT) then
+    Exit(NetLogonText(AStatus));
   case AStatus of
-    ERROR_ACCESS_DENIED:
-      Result := L('op.noaccess');
     ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME:
       Result := L('net.path.missing');
     ERROR_NO_NETWORK, ERROR_NO_NET_OR_BAD_PATH:
@@ -619,6 +965,9 @@ end;
 
 const
   STYPE_DISKTREE = 0;
+  STYPE_PRINTQ = 1;
+  STYPE_DEVICE = 2;
+  STYPE_IPC = 3;
   STYPE_SPECIAL = $80000000;
   NET_MAX_PREFERRED = DWORD($FFFFFFFF);
   NERR_SUCCESS = 0;
@@ -651,90 +1000,29 @@ type
 function NetServerGetInfo(ServerName: PWideChar; Level: DWORD; var Buf: Pointer): DWORD; stdcall;
   external 'netapi32.dll' name 'NetServerGetInfo';
 
-function ListDiskShares(const AServer: string; AJob: TNetJob;
-  out AStatus: DWORD): Boolean;
+function HostResourceGroup(const AItem: TNetworkItem): Integer;
 var
-  Buf: Pointer;
-  Read, Total, Resume: DWORD;
-  Info: PShareInfo1;
-  I: Integer;
-  Kind: DWORD;
-  Item: TNetworkItem;
-  Server, ShareName: string;
+  Name, Blob: string;
+  Kind: Cardinal;
 begin
-  Result := False;
-  AStatus := 0;
-  if (AJob = nil) or (AJob.Items = nil) then
-    Exit;
-  Server := ExcludeTrailingPathDelimiter(Trim(AServer));
-  if not Server.StartsWith('\\') then
-    Server := '\\' + Server;
-  if Server = '\\' then
-    Exit;
-  Resume := 0;
-  repeat
-    if AJob.Stopped then
-      Exit;
-    Buf := nil;
-    Read := 0;
-    Total := 0;
-    AStatus := NetShareEnum(PWideChar(Server), 1, Buf, NET_MAX_PREFERRED,
-      @Read, @Total, @Resume);
-    if (AStatus <> NERR_SUCCESS) and (AStatus <> ERROR_MORE_DATA) then
-    begin
-      if Buf <> nil then
-        NetApiBufferFree(Buf);
-      Exit;
-    end;
-    Result := True;
-    Info := PShareInfo1(Buf);
-    for I := 0 to Integer(Read) - 1 do
-    begin
-      if AJob.Stopped then
-        Break;
-      Kind := Info.ShareType and not STYPE_SPECIAL;
-      if (Kind = STYPE_DISKTREE) and (Info.NetName <> nil) then
-      begin
-        ShareName := Trim(Info.NetName);
-        if ShareName <> '' then
-        begin
-          Item := Default(TNetworkItem);
-          Item.Name := ShareName;
-          Item.FullPath := Server + '\' + ShareName;
-          Item.ItemType := nitShare;
-          Item.IsReadable := True;
-          Item.IsWritable := True;
-          AJob.Items.Add(Item);
-        end;
-      end;
-      Inc(Info);
-    end;
-    if Buf <> nil then
-      NetApiBufferFree(Buf);
-  until AStatus <> ERROR_MORE_DATA;
-end;
-
-procedure KeepHostShares(const AServer: string; AItems: TList<TNetworkItem>);
-var
-  I: Integer;
-  Root, Path: string;
-  Item: TNetworkItem;
-begin
-  if AItems = nil then
-    Exit;
-  Root := IncludeTrailingPathDelimiter(ExcludeTrailingPathDelimiter(AServer));
-  for I := AItems.Count - 1 downto 0 do
-  begin
-    Item := AItems[I];
-    Path := Item.FullPath;
-    if not StartsText(Root, Path) then
-      AItems.Delete(I)
-    else if SameText(ExcludeTrailingPathDelimiter(Path),
-            ExcludeTrailingPathDelimiter(AServer)) then
-      AItems.Delete(I)
-    else if not (Item.ItemType in [nitShare, nitDirectory, nitFile]) then
-      AItems.Delete(I);
-  end;
+  Name := Trim(AItem.Name);
+  Blob := LowerCase(Name + ' ' + AItem.Comment);
+  if (Name <> '') and (Name[Length(Name)] = '$') then
+    Exit(0);
+  if (Pos('fax', Blob) > 0) or (Pos('факс', Blob) > 0) or
+     (Pos('scanner', Blob) > 0) or (Pos('сканер', Blob) > 0) or
+     (Pos('сканув', Blob) > 0) then
+    Exit(3);
+  Kind := AItem.ShareType and $7FFFFFFF;
+  if (AItem.ResType = RESOURCETYPE_PRINT) or
+     (AItem.FromShare and (Kind = STYPE_PRINTQ)) then
+    Exit(2);
+  if AItem.FromShare and (Kind = STYPE_IPC) then
+    Exit(0);
+  if (AItem.ResType = RESOURCETYPE_DISK) or
+     (AItem.FromShare and (Kind = STYPE_DISKTREE)) then
+    Exit(1);
+  Result := 3;
 end;
 
 function NetbiosName(const AIp: string): string;
@@ -955,6 +1243,173 @@ begin
     end);
 end;
 
+function NodeJunk(const ASeed: TNetSeed): Boolean;
+var
+  Blob: string;
+begin
+  Blob := LowerCase(ASeed.Remote + '|' + ASeed.Comment + '|' + ASeed.Provider);
+  Result := (Pos('dlna', Blob) > 0) or (Pos('youtube', Blob) > 0) or
+    (Pos('wsd', Blob) > 0) or (Pos('function discovery', Blob) > 0) or
+    (Pos('web client', Blob) > 0) or (Pos('terminal services', Blob) > 0) or
+    (Pos('media device', Blob) > 0) or (Pos('multimedia', Blob) > 0) or
+    (Pos('медиаустрой', Blob) > 0) or (Pos('мультимедиа', Blob) > 0) or
+    (Pos('устройства мультимедиа', Blob) > 0);
+end;
+
+function HostItemExists(AJob: TNetJob; const APath, AName: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if (AJob = nil) or (AJob.Items = nil) then
+    Exit;
+  for I := 0 to AJob.Items.Count - 1 do
+    if SameText(AJob.Items[I].FullPath, APath) or
+       ((AName <> '') and SameText(AJob.Items[I].Name, AName)) then
+      Exit(True);
+end;
+
+procedure AddHostItem(AJob: TNetJob; const AName, APath, AComment: string;
+  ARes, AShare: Cardinal; AFromShare, AFromWNet: Boolean);
+var
+  Item: TNetworkItem;
+begin
+  if (AJob = nil) or (AJob.Items = nil) or (AName = '') or (APath = '') then
+    Exit;
+  if HostItemExists(AJob, APath, AName) then
+    Exit;
+  Item := Default(TNetworkItem);
+  Item.Name := AName;
+  Item.FullPath := APath;
+  Item.Comment := AComment;
+  Item.ResType := ARes;
+  Item.ShareType := AShare;
+  Item.FromShare := AFromShare;
+  Item.FromWNet := AFromWNet;
+  Item.ItemType := nitShare;
+  Item.IsReadable := True;
+  Item.IsWritable := ARes <> RESOURCETYPE_PRINT;
+  AJob.Items.Add(Item);
+end;
+
+function ListHostResources(const AServer: string; AJob: TNetJob;
+  out AStatus: DWORD): Boolean;
+var
+  Buf: Pointer;
+  Read, Total, Resume, Kind: DWORD;
+  Info: PShareInfo1;
+  I: Integer;
+  Server, ShareName, Remark, Path: string;
+  Res: Cardinal;
+  Parent: TNetResource;
+  Seeds: TArray<TNetSeed>;
+  Seed: TNetSeed;
+  Got: Boolean;
+begin
+  Result := False;
+  AStatus := NO_ERROR;
+  if (AJob = nil) or (AJob.Items = nil) then
+    Exit;
+  Server := ExcludeTrailingPathDelimiter(Trim(AServer));
+  if not Server.StartsWith('\\') then
+    Server := '\\' + Server;
+  if Server = '\\' then
+    Exit;
+  Got := False;
+  Resume := 0;
+  repeat
+    if AJob.Stopped then
+      Exit;
+    Buf := nil;
+    Read := 0;
+    Total := 0;
+    AStatus := NetShareEnum(PWideChar(Server), 1, Buf, NET_MAX_PREFERRED,
+      @Read, @Total, @Resume);
+    if (AStatus <> NERR_SUCCESS) and (AStatus <> ERROR_MORE_DATA) then
+    begin
+      if Buf <> nil then
+        NetApiBufferFree(Buf);
+      Break;
+    end;
+    Got := True;
+    Info := PShareInfo1(Buf);
+    for I := 0 to Integer(Read) - 1 do
+    begin
+      if AJob.Stopped then
+        Break;
+      if Info.NetName <> nil then
+      begin
+        ShareName := Trim(Info.NetName);
+        Remark := '';
+        if Info.Remark <> nil then
+          Remark := Trim(Info.Remark);
+        Kind := Info.ShareType and not STYPE_SPECIAL;
+        if Kind = STYPE_PRINTQ then
+          Res := RESOURCETYPE_PRINT
+        else if (Kind = STYPE_DISKTREE) or (Kind = STYPE_IPC) then
+          Res := RESOURCETYPE_DISK
+        else
+          Res := 0;
+        if ShareName <> '' then
+          AddHostItem(AJob, ShareName, Server + '\' + ShareName, Remark, Res,
+            Info.ShareType, True, False);
+      end;
+      Inc(Info);
+    end;
+    if Buf <> nil then
+      NetApiBufferFree(Buf);
+  until AStatus <> ERROR_MORE_DATA;
+  if AJob.Stopped then
+    Exit;
+  FillChar(Parent, SizeOf(Parent), 0);
+  Parent.dwScope := RESOURCE_GLOBALNET;
+  Parent.dwType := RESOURCETYPE_ANY;
+  Parent.dwDisplayType := RESOURCEDISPLAYTYPE_SERVER;
+  Parent.dwUsage := 0;
+  Parent.lpRemoteName := PChar(Server);
+  Seeds := ReadSeeds(@Parent, AJob, 0, Kind);
+  if (not Got) and (AJob.Items.Count = 0) and (Kind <> NO_ERROR) and
+     (Kind <> ERROR_NO_MORE_ITEMS) then
+    AStatus := Kind;
+  for I := 0 to High(Seeds) do
+  begin
+    if AJob.Stopped then
+      Break;
+    Seed := Seeds[I];
+    if NodeJunk(Seed) then
+      Continue;
+    Path := ExcludeTrailingPathDelimiter(Trim(Seed.Remote));
+    if (Path = '') or SameText(Path, Server) then
+      Continue;
+    ShareName := '';
+    if Path <> '' then
+    begin
+      ShareName := Path;
+      if LastDelimiter('\', ShareName) > 0 then
+        ShareName := Copy(ShareName, LastDelimiter('\', ShareName) + 1, MaxInt);
+      ShareName := Trim(ShareName);
+    end;
+    if ShareName = '' then
+      ShareName := Trim(Seed.Comment);
+    if ShareName = '' then
+      Continue;
+    Remark := Trim(Seed.Comment);
+    if SameText(Remark, ShareName) then
+      Remark := '';
+    AddHostItem(AJob, ShareName, Path, Remark, Seed.ResType, 0, False, True);
+  end;
+  Result := AJob.Items.Count > 0;
+  if Got and (AStatus = ERROR_MORE_DATA) then
+    AStatus := NO_ERROR;
+  if Result then
+    AStatus := NO_ERROR
+  else if Got then
+  begin
+    AStatus := NO_ERROR;
+    Result := True;
+  end;
+end;
+
 procedure SmbBrowse(AJob: TNetJob; const APath: string);
 var
   Seeds: TArray<TNetSeed>;
@@ -985,30 +1440,13 @@ begin
     Match := ExcludeTrailingPathDelimiter(Tail);
     if not Copy(Match, 3, MaxInt).Contains('\') then
     begin
-      // WNet по IP часто молчит. Шары диска читает NetShareEnum.
-      if not ListDiskShares(Match, AJob, Status) then
+      { Диск, IPC$, принтеры и то, что реально отдал WNet. DLNA сюда не входит. }
+      if not ListHostResources(Match, AJob, Status) then
       begin
         if AJob.Stopped then
           Exit;
-        if Status = ERROR_ACCESS_DENIED then
-          AJob.Error := NetStatusText(Status)
-        else
-        begin
-          FillChar(Parent, SizeOf(Parent), 0);
-          Parent.dwScope := RESOURCE_GLOBALNET;
-          Parent.dwType := RESOURCETYPE_DISK;
-          Parent.dwDisplayType := RESOURCEDISPLAYTYPE_SERVER;
-          Parent.dwUsage := 0;
-          Parent.lpRemoteName := PChar(Match);
-          Seeds := ReadSeeds(@Parent, AJob, 0, Status);
-          if (Status <> NO_ERROR) and (Length(Seeds) = 0) then
-            AJob.Error := NetStatusText(Status)
-          else
-          begin
-            FillFromSeeds(Seeds, AJob.Items);
-            KeepHostShares(Match, AJob.Items);
-          end;
-        end;
+        if (AJob.Items = nil) or (AJob.Items.Count = 0) then
+          AJob.Error := NetStatusText(Status);
       end;
       Exit;
     end;
@@ -1793,7 +2231,8 @@ begin
     Exit('Google');
   if (P = '00-17-88') or (P = 'B0-C5-54') then
     Exit('Philips Hue');
-  Result := L('net.vendor.unknown');
+  { Порожньо: підпис «невідомий» ставить список уже поточною мовою. }
+  Result := '';
 end;
 
 function IcmpCreateFile: THandle; stdcall; external 'iphlpapi.dll' name 'IcmpCreateFile';
@@ -1803,7 +2242,7 @@ function IcmpSendEcho(IcmpHandle: THandle; DestinationAddress: ULONG;
   ReplyBuffer: Pointer; ReplySize: DWORD; Timeout: DWORD): DWORD; stdcall;
   external 'iphlpapi.dll' name 'IcmpSendEcho';
 
-function PingHost(const AIp: string): Boolean;
+function PingHost(const AIp: string; ATimeout: DWORD = PING_MS): Boolean;
 var
   Icmp: THandle;
   Dest: u_long;
@@ -1822,9 +2261,49 @@ begin
   try
     Req := 'VIBE';
     Result := IcmpSendEcho(Icmp, Dest, PAnsiChar(Req), Length(Req), nil,
-      @Reply[0], SizeOf(Reply), PING_MS) > 0;
+      @Reply[0], SizeOf(Reply), ATimeout) > 0;
   finally
     IcmpCloseHandle(Icmp);
+  end;
+end;
+
+function HostToIPv4(const AHost: string): string;
+var
+  H: PHostEnt;
+  Addr: TInAddr;
+  P: PAnsiChar;
+begin
+  Result := Trim(AHost);
+  if Result = '' then
+    Exit;
+  if Cardinal(inet_addr(MarshaledAString(AnsiString(Result)))) <> Cardinal(INADDR_NONE) then
+    Exit;
+  H := gethostbyname(MarshaledAString(AnsiString(Result)));
+  if (H = nil) or (H^.h_addr_list = nil) then
+    Exit('');
+  P := H^.h_addr_list^;
+  if P = nil then
+    Exit('');
+  Move(P^, Addr, SizeOf(Addr));
+  Result := string(inet_ntoa(Addr));
+end;
+
+function ProbeHostAlive(const AHost: string): Boolean;
+var
+  Data: TWSAData;
+  Started: Boolean;
+  Ip: string;
+begin
+  Result := False;
+  Started := WSAStartup($0202, Data) = 0;
+  try
+    Ip := HostToIPv4(AHost);
+    if Ip = '' then
+      Exit;
+    Result := PingHost(Ip, 800);
+  finally
+    if Started then
+      WSACleanup;
   end;
 end;
 
@@ -1986,18 +2465,26 @@ begin
             Host.Address := Ip;
             Host.HasFTP := PortOpen(Ip, 21);
             Host.HasSMB := PortOpen(Ip, 445);
-            Host.HasWebAdmin := PortOpen(Ip, 80) or PortOpen(Ip, 443);
+            Host.Port80 := PortOpen(Ip, 80);
+            Host.Port443 := PortOpen(Ip, 443);
+            Host.HasWebAdmin := Host.Port80 or Host.Port443;
             Host.Mac := HostMac(Ip);
             if Host.Mac <> '' then
-              Host.Vendor := OuiVendor(Host.Mac)
-            else
-              Host.Vendor := L('net.vendor.unknown');
-            if not Job.Stopped then
-              Host.Name := NetbiosName(Ip);
+              Host.Vendor := OuiVendor(Host.Mac);
             if Octets(Ip, A, B, C, D) and (D = 1) then
               Host.IsRouter := True;
+            { Строка с IP сразу. Имя дорисовывается в ту же запись. }
             SaveFoundHost(Found, FoundLock, Host);
             QueueNetHost(Slot, Gen, OnHost, Host);
+            if Job.Stopped then
+              Exit;
+            Extra := NetbiosName(Ip);
+            if (Extra <> '') and not Job.Stopped then
+            begin
+              Host.Name := Extra;
+              SaveFoundHost(Found, FoundLock, Host);
+              QueueNetHost(Slot, Gen, OnHost, Host);
+            end;
             if Job.Stopped then
               Exit;
             if Host.HasSMB and HostNameBlank(Host) then
@@ -2076,6 +2563,257 @@ begin
         FoundLock.Free;
         Found.Free;
       end;
+    end);
+end;
+
+procedure QueueClassicRow(ASlot: INetSlot; AGen: Integer;
+  AOnRow: TProc<TClassicRow>; const ARow: TClassicRow);
+var
+  One: TClassicRow;
+  Cb: TProc<TClassicRow>;
+  G: Integer;
+  Sl: INetSlot;
+begin
+  if not Assigned(AOnRow) or (ARow.FullPath = '') then
+    Exit;
+  One := ARow;
+  Cb := AOnRow;
+  G := AGen;
+  Sl := ASlot;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if (Sl <> nil) and not Sl.Accept(G) then
+        Exit;
+      Cb(One);
+    end);
+end;
+
+function ClassicBlob(const ASeed: TNetSeed): string;
+begin
+  Result := LowerCase(ASeed.Remote + '|' + ASeed.Comment + '|' + ASeed.Provider);
+end;
+
+function ClassicJunk(const ASeed: TNetSeed): Boolean;
+var
+  Blob: string;
+begin
+  if ASeed.ResType = RESOURCETYPE_PRINT then
+    Exit(True);
+  Blob := ClassicBlob(ASeed);
+  Result := (Pos('dlna', Blob) > 0) or (Pos('youtube', Blob) > 0) or
+    (Pos('wsd', Blob) > 0) or (Pos('function discovery', Blob) > 0) or
+    (Pos('web client', Blob) > 0) or (Pos('terminal services', Blob) > 0) or
+    (Pos('media device', Blob) > 0) or (Pos('multimedia', Blob) > 0) or
+    (Pos('медиаустрой', Blob) > 0) or (Pos('мультимедиа', Blob) > 0) or
+    (Pos('устройства мультимедиа', Blob) > 0);
+end;
+
+function ClassicServerName(const ARemote: string): string;
+var
+  S: string;
+  P: Integer;
+begin
+  S := Trim(ARemote);
+  if S.StartsWith('\\') then
+    Delete(S, 1, 2);
+  P := Pos('\', S);
+  if P > 0 then
+    S := Copy(S, 1, P - 1);
+  Result := Trim(S);
+end;
+
+function ClassicShareName(const ARemote: string): string;
+var
+  S: string;
+  P: Integer;
+begin
+  S := ExcludeTrailingPathDelimiter(Trim(ARemote));
+  P := LastDelimiter('\', S);
+  if P > 0 then
+    Result := Trim(Copy(S, P + 1, MaxInt))
+  else
+    Result := '';
+end;
+
+function ClassicIsShare(const ASeed: TNetSeed): Boolean;
+begin
+  Result := (ASeed.Display = RESOURCEDISPLAYTYPE_SHARE) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_SHAREADMIN);
+  if not Result then
+    Exit;
+  if ASeed.ResType = RESOURCETYPE_PRINT then
+    Exit(False);
+  Result := (ASeed.ResType = RESOURCETYPE_DISK) or (ASeed.ResType = RESOURCETYPE_ANY);
+  if Result then
+    Result := ClassicShareName(ASeed.Remote) <> '';
+end;
+
+function ClassicIsContainer(const ASeed: TNetSeed): Boolean;
+begin
+  if (ASeed.Display = RESOURCEDISPLAYTYPE_SERVER) or
+     (ASeed.Display = RESOURCEDISPLAYTYPE_SHARE) or
+     (ASeed.Display = RESOURCEDISPLAYTYPE_SHAREADMIN) or
+     (ASeed.Display = RESOURCEDISPLAYTYPE_FILE) or
+     (ASeed.Display = RESOURCEDISPLAYTYPE_DIRECTORY) then
+    Exit(False);
+  Result := ((ASeed.Usage and RESOURCEUSAGE_CONTAINER) <> 0) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_DOMAIN) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_GROUP) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_NETWORK) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_ROOT) or
+    (ASeed.Display = RESOURCEDISPLAYTYPE_GENERIC);
+end;
+
+constructor TClassicNet.Create;
+begin
+  inherited Create;
+  FSlot := TNetSlot.Create;
+end;
+
+destructor TClassicNet.Destroy;
+begin
+  Cancel;
+  if FSlot <> nil then
+    FSlot.Kill;
+  FSlot := nil;
+  FTask := nil;
+  inherited;
+end;
+
+procedure TClassicNet.Cancel;
+begin
+  if FSlot <> nil then
+    FSlot.NextGen;
+  if FTask <> nil then
+  begin
+    FTask.Cancel;
+    FTask := nil;
+  end;
+  if FJob <> nil then
+    FJob.RequestCancel;
+end;
+
+procedure WalkClassic(AJob: TNetJob; ASlot: INetSlot; AGen: Integer;
+  AOnRow: TProc<TClassicRow>; AVisited: TStringList; AParent: PNetResource;
+  ADepth: Integer);
+var
+  Seeds: TArray<TNetSeed>;
+  Status: DWORD;
+  I: Integer;
+  Seed: TNetSeed;
+  Row: TClassicRow;
+  Host, Share, Key, Remote, Provider: string;
+  Child: TNetResource;
+begin
+  if (AJob = nil) or (ADepth > 4) or AJob.Stopped then
+    Exit;
+  Seeds := ReadSeeds(AParent, AJob, 0, Status);
+  for I := 0 to High(Seeds) do
+  begin
+    if AJob.Stopped then
+      Exit;
+    Seed := Seeds[I];
+    if ClassicJunk(Seed) then
+      Continue;
+    if Seed.Display = RESOURCEDISPLAYTYPE_SERVER then
+    begin
+      Host := ClassicServerName(Seed.Remote);
+      if Host = '' then
+        Host := Trim(Seed.Comment);
+      if Host = '' then
+        Continue;
+      Row := Default(TClassicRow);
+      Row.Name := Host;
+      Row.FullPath := 'network://' + Host;
+      Row.IsShare := False;
+      QueueClassicRow(ASlot, AGen, AOnRow, Row);
+      Continue;
+    end;
+    if ClassicIsShare(Seed) then
+    begin
+      Share := ClassicShareName(Seed.Remote);
+      Row := Default(TClassicRow);
+      Row.Name := Share;
+      Row.FullPath := ExcludeTrailingPathDelimiter(Seed.Remote);
+      Row.IsShare := True;
+      QueueClassicRow(ASlot, AGen, AOnRow, Row);
+      Continue;
+    end;
+    if not ClassicIsContainer(Seed) then
+      Continue;
+    Remote := Seed.Remote;
+    Provider := Seed.Provider;
+    Key := Remote;
+    if Key = '' then
+      Key := Provider + '/' + Seed.Comment;
+    if Key = '' then
+      Continue;
+    if (AVisited <> nil) and (AVisited.IndexOf(Key) >= 0) then
+      Continue;
+    if AVisited <> nil then
+      AVisited.Add(Key);
+    FillChar(Child, SizeOf(Child), 0);
+    Child.dwScope := RESOURCE_GLOBALNET;
+    Child.dwType := Seed.ResType;
+    Child.dwDisplayType := Seed.Display;
+    Child.dwUsage := Seed.Usage;
+    if Remote <> '' then
+      Child.lpRemoteName := PChar(Remote);
+    if Provider <> '' then
+      Child.lpProvider := PChar(Provider);
+    WalkClassic(AJob, ASlot, AGen, AOnRow, AVisited, @Child, ADepth + 1);
+  end;
+end;
+
+procedure TClassicNet.Start(AOnRow: TProc<TClassicRow>; AOnDone: TProc<string>);
+var
+  Job: TNetJob;
+  OnRow: TProc<TClassicRow>;
+  OnDone: TProc<string>;
+begin
+  if FJob <> nil then
+    FJob.RequestCancel;
+  if FTask <> nil then
+    FTask.Cancel;
+  if FSlot <> nil then
+    FSlot.NextGen;
+  OnRow := AOnRow;
+  OnDone := AOnDone;
+  Job := TNetJob.Create(FSlot, FSlot.NextGen);
+  FJob := Job;
+  FTask := TTask.Run(
+    procedure
+    var
+      Gen: Integer;
+      Slot: INetSlot;
+      Visited: TStringList;
+      Err: string;
+    begin
+      Err := '';
+      Gen := Job.Gen;
+      Slot := Job.Slot;
+      Visited := TStringList.Create;
+      Visited.CaseSensitive := False;
+      try
+        try
+          WalkClassic(Job, Slot, Gen, OnRow, Visited, nil, 0);
+        except
+          on E: Exception do
+            if Err = '' then
+              Err := CleanError(E.Message);
+        end;
+      finally
+        Visited.Free;
+      end;
+      if Assigned(OnDone) then
+        TThread.Queue(nil,
+          procedure
+          begin
+            if (Slot <> nil) and not Slot.Accept(Gen) then
+              Exit;
+            OnDone(Err);
+          end);
     end);
 end;
 

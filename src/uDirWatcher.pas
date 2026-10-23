@@ -34,6 +34,9 @@ type
 
 implementation
 
+uses
+  uFileModel;
+
 type
   TDirWatchThread = class(TThread)
   private
@@ -170,7 +173,6 @@ end;
 procedure TDirWatcher.Watch(const APath: string);
 var
   Norm: string;
-  Remote: Boolean;
 begin
   Norm := ExcludeTrailingPathDelimiter(APath);
   if SameText(Norm, FPath) and Assigned(FThread) then
@@ -181,23 +183,16 @@ begin
   FRemote := False;
   if FPath = '' then
     Exit;
-  try
-    Remote := (Length(Norm) >= 2) and (Norm[1] = '\') and (Norm[2] = '\');
-{$IFDEF MSWINDOWS}
-    if not Remote and (Length(Norm) >= 2) and (Norm[2] = ':') then
-      Remote := GetDriveType(PChar(UpperCase(Norm[1]) + ':\')) = DRIVE_REMOTE;
-{$ENDIF}
-  except
-    Remote := False;
-  end;
-  FRemote := Remote;
-  if not Remote then
+  if UiSkipNetworkTouch(FPath) then
   begin
-    if not TDirectory.Exists(FPath) then
-    begin
-      FPath := '';
-      Exit;
-    end;
+    FRemote := True;
+    FPath := '';
+    Exit;
+  end;
+  if not TDirectory.Exists(FPath) then
+  begin
+    FPath := '';
+    Exit;
   end;
 
   FStopEvent.ResetEvent;

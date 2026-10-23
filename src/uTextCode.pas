@@ -51,7 +51,7 @@ implementation
 
 uses
   System.IOUtils, System.Math, System.IniFiles, System.StrUtils, System.Character,
-  uDocumentData, uLang;
+  uDocumentData, uLang, uAppSettings;
 
 const
   ListedExt: array[0..50] of string = (
@@ -112,8 +112,7 @@ end;
 
 function SettingsIni: string;
 begin
-  Result := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0))) +
-    'VibeSetting.ini';
+  Result := ActiveSettingsIni;
 end;
 
 function LoadTextViewIsCode(const AExt: string): Boolean;

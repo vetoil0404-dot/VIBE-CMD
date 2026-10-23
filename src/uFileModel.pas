@@ -32,6 +32,7 @@ function SplitArchivePath(const APath: string; out AArchive, AInner: string): Bo
 function IsBrowsablePath(const APath: string): Boolean;
 function IsUncPath(const APath: string): Boolean;
 function IsRemotePath(const APath: string): Boolean;
+function IsWin32FsPath(const APath: string): Boolean;
 { Виртуальный корень панели «Сеть»: network://, Сеть, ftp:// и http(s)://.
   UNC со шарой сюда не входит — его читает обычный список. }
 function IsVibeNetworkPath(const APath: string): Boolean;
@@ -63,6 +64,10 @@ type
     Root: string;
     Letter: string;
     VolumeName: string;
+    { NTFS, FAT32, exFAT. Пусто, пока том не опрошен. }
+    FileSystem: string;
+    { UNC подключенного диска. Для Z: это весь путь, не буква. }
+    RemotePath: string;
     Kind: TDriveKind;
     TotalBytes: Int64;
     FreeBytes: Int64;
@@ -90,6 +95,8 @@ type
     Origin: string;
     { Реальный файл внутри Корзины, если оболочка его отдала. Для превью. }
     ContentPath: string;
+    { Рядок вставлено своєю операцією. Злиття списку його не затирає. }
+    LivePin: Boolean;
     function IsDimmed: Boolean;
     class function FromPath(const APath: string): TFileEntry; static;
     class function FromSearchRec(const APath: string; const ASearchRec: TSearchRec): TFileEntry; static;
@@ -112,12 +119,15 @@ type
     FBranch: Boolean;
     FErrSent: Boolean;
     FProbeGate: TEvent;
+    FDiscard: Boolean;
     procedure SendError(const AMsg: string);
     procedure EmitSlice(AList: TFileEntryList; AFrom: Integer; ADone: Boolean);
     procedure NoteProgress(ACount: Integer);
   protected
     procedure Execute; override;
   public
+    { Поток создан, но чтение этой папки уже ведёт другой. Не трогать шару. }
+    Discard: Boolean;
     destructor Destroy; override;
     constructor Create(const APath: string; AOnDone: TProc<TFileEntryList>;
       AOnError: TProc<string>; AShowHidden: Boolean = False;
@@ -131,7 +141,19 @@ procedure PrepareFileEntry(var AEntry: TFileEntry);
 function IsCompatibilityJunction(AAttr: Integer): Boolean;
 function FormatFileSize(Size: Int64): string;
 function DriveKindCaption(AKind: TDriveKind): string;
+function DrivePlaceName(const AInfo: TDriveInfo): string;
 function DrivePlaceTitle(const AInfo: TDriveInfo): string;
+function DrivePlaceHint(const AInfo: TDriveInfo): string;
+function MappedDriveUnc(const ARoot: string): string;
+{ Локальная таблица MPR, без опроса шары. False — диск с красным крестом. }
+function NetworkDriveConnected(const ARoot: string): Boolean;
+function ProbeDirectoryOpen(const APath: string; ATimeoutMs: DWORD): Boolean; overload;
+function ProbeDirectoryOpen(const APath: string; ATimeoutMs: DWORD;
+  out AWin32: DWORD): Boolean; overload;
+function TryClaimPathRead(const APath: string; AOwner: TThread): Boolean;
+procedure ReleasePathRead(const APath: string; AOwner: TThread);
+function PathReadBusy(const APath: string): Boolean;
+function UiSkipNetworkTouch(const APath: string): Boolean;
 function FormatDrivePair(ALeft, ARight: Int64): string;
 function FormatDriveFreeUsed(AFree, ATotal: Int64): string;
 function CollectAllPlaces(AIncludeNetwork: Boolean): TArray<TDriveInfo>;
@@ -174,8 +196,18 @@ var
   GPidlMap: TDictionary<string, TBytes>;
   GDriveTypeLock: TCriticalSection;
   GDriveTypeCache: TDictionary<string, Cardinal>;
+  GDriveTypePending: TDictionary<string, Boolean>;
+  GLiveReadLock: TCriticalSection;
+  GLiveReads: TDictionary<string, TThread>;
 
 type
+  TProbeOpen = class
+    Path: string;
+    Handle: THandle;
+    Win32: DWORD;
+    Done: TEvent;
+  end;
+
   TSharedFileStream = class(THandleStream)
   public
     destructor Destroy; override;
@@ -1218,6 +1250,64 @@ begin
     Result := UpperCase(S[1]) + ':\';
 end;
 
+function DriveTypeCached(const ARoot: string; out AType: Cardinal): Boolean;
+begin
+  Result := False;
+  AType := 0;
+  if (ARoot = '') or not Assigned(GDriveTypeLock) or not Assigned(GDriveTypeCache) then
+    Exit;
+  GDriveTypeLock.Enter;
+  try
+    Result := GDriveTypeCache.TryGetValue(ARoot, AType);
+  finally
+    GDriveTypeLock.Leave;
+  end;
+end;
+
+procedure StoreDriveType(const ARoot: string; AType: Cardinal);
+begin
+  if (ARoot = '') or not Assigned(GDriveTypeLock) or not Assigned(GDriveTypeCache) then
+    Exit;
+  GDriveTypeLock.Enter;
+  try
+    GDriveTypeCache.AddOrSetValue(ARoot, AType);
+    if Assigned(GDriveTypePending) then
+      GDriveTypePending.Remove(ARoot);
+  finally
+    GDriveTypeLock.Leave;
+  end;
+end;
+
+procedure EnsureDriveTypeAsync(const ARoot: string);
+var
+  Root: string;
+  DT: Cardinal;
+begin
+  Root := ARoot;
+  if Root = '' then
+    Exit;
+  if DriveTypeCached(Root, DT) then
+    Exit;
+  if not Assigned(GDriveTypeLock) or not Assigned(GDriveTypePending) then
+    Exit;
+  GDriveTypeLock.Enter;
+  try
+    if GDriveTypePending.ContainsKey(Root) then
+      Exit;
+    GDriveTypePending.Add(Root, True);
+  finally
+    GDriveTypeLock.Leave;
+  end;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Kind: Cardinal;
+    begin
+      Kind := GetDriveType(PChar(Root));
+      StoreDriveType(Root, Kind);
+    end).Start;
+end;
+
 function IsRemotePath(const APath: string): Boolean;
 {$IFDEF MSWINDOWS}
 var
@@ -1231,31 +1321,166 @@ begin
   Root := DriveRootOf(APath);
   if Root = '' then
     Exit(False);
-  DT := 0;
-  if Assigned(GDriveTypeLock) and Assigned(GDriveTypeCache) then
+  if DriveTypeCached(Root, DT) then
+    Exit(DT = DRIVE_REMOTE);
+  if TThread.CurrentThread.ThreadID = MainThreadID then
   begin
-    GDriveTypeLock.Enter;
-    try
-      if GDriveTypeCache.TryGetValue(Root, DT) then
-        Exit(DT = DRIVE_REMOTE);
-    finally
-      GDriveTypeLock.Leave;
-    end;
+    EnsureDriveTypeAsync(Root);
+    Exit(False);
   end;
   DT := GetDriveType(PChar(Root));
-  if Assigned(GDriveTypeLock) and Assigned(GDriveTypeCache) then
-  begin
-    GDriveTypeLock.Enter;
-    try
-      GDriveTypeCache.AddOrSetValue(Root, DT);
-    finally
-      GDriveTypeLock.Leave;
-    end;
-  end;
+  StoreDriveType(Root, DT);
   Result := DT = DRIVE_REMOTE;
 {$ELSE}
   Result := False;
 {$ENDIF}
+end;
+
+function UiSkipNetworkTouch(const APath: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Root: string;
+  DT: Cardinal;
+{$ENDIF}
+begin
+  Result := False;
+  if APath = '' then
+    Exit;
+  if IsUncPath(APath) then
+    Exit(True);
+{$IFDEF MSWINDOWS}
+  if IsRemotePath(APath) then
+    Exit(True);
+  Root := DriveRootOf(APath);
+  if Root = '' then
+    Exit;
+  if DriveTypeCached(Root, DT) then
+    Exit(DT = DRIVE_REMOTE);
+  if TThread.CurrentThread.ThreadID = MainThreadID then
+  begin
+    EnsureDriveTypeAsync(Root);
+    Result := True;
+  end;
+{$ENDIF}
+end;
+
+function LiveReadKey(const APath: string): string;
+begin
+  Result := AnsiLowerCase(ExcludeTrailingPathDelimiter(APath));
+end;
+
+function TryClaimPathRead(const APath: string; AOwner: TThread): Boolean;
+var
+  Key: string;
+begin
+  Result := False;
+  Key := LiveReadKey(APath);
+  if (Key = '') or (AOwner = nil) or not Assigned(GLiveReadLock) then
+    Exit;
+  GLiveReadLock.Enter;
+  try
+    if not Assigned(GLiveReads) then
+      Exit;
+    if GLiveReads.ContainsKey(Key) then
+      Exit;
+    GLiveReads.Add(Key, AOwner);
+    Result := True;
+  finally
+    GLiveReadLock.Leave;
+  end;
+end;
+
+procedure ReleasePathRead(const APath: string; AOwner: TThread);
+var
+  Key: string;
+  Owner: TThread;
+begin
+  Key := LiveReadKey(APath);
+  if (Key = '') or not Assigned(GLiveReadLock) or not Assigned(GLiveReads) then
+    Exit;
+  GLiveReadLock.Enter;
+  try
+    if GLiveReads.TryGetValue(Key, Owner) and (Owner = AOwner) then
+      GLiveReads.Remove(Key);
+  finally
+    GLiveReadLock.Leave;
+  end;
+end;
+
+function PathReadBusy(const APath: string): Boolean;
+var
+  Key: string;
+begin
+  Result := False;
+  Key := LiveReadKey(APath);
+  if (Key = '') or not Assigned(GLiveReadLock) or not Assigned(GLiveReads) then
+    Exit;
+  GLiveReadLock.Enter;
+  try
+    Result := GLiveReads.ContainsKey(Key);
+  finally
+    GLiveReadLock.Leave;
+  end;
+end;
+
+function ProbeDirectoryOpen(const APath: string; ATimeoutMs: DWORD): Boolean; overload;
+var
+  Code: DWORD;
+begin
+  Result := ProbeDirectoryOpen(APath, ATimeoutMs, Code);
+end;
+
+function ProbeDirectoryOpen(const APath: string; ATimeoutMs: DWORD;
+  out AWin32: DWORD): Boolean; overload;
+var
+  Job: TProbeOpen;
+  Thr: TThread;
+  Fn: function(hThread: THandle): BOOL; stdcall;
+begin
+  Result := False;
+  AWin32 := 0;
+  if APath = '' then
+    Exit;
+  Job := TProbeOpen.Create;
+  Job.Path := APath;
+  Job.Handle := INVALID_HANDLE_VALUE;
+  Job.Win32 := 0;
+  Job.Done := TEvent.Create(nil, True, False, '');
+  Thr := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      Job.Handle := CreateFile(PChar(Job.Path), FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+        nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+      if (Job.Handle = INVALID_HANDLE_VALUE) or (Job.Handle = 0) then
+        Job.Win32 := GetLastError;
+      if Assigned(Job.Done) then
+        Job.Done.SetEvent;
+    end);
+  Thr.FreeOnTerminate := False;
+  try
+    Thr.Start;
+    if Job.Done.WaitFor(ATimeoutMs) <> wrSignaled then
+    begin
+      Fn := GetProcAddress(GetModuleHandle('kernel32.dll'), 'CancelSynchronousIo');
+      if Assigned(Fn) then
+        Fn(Thr.Handle);
+      Job.Done.WaitFor(5000);
+    end;
+    Thr.WaitFor;
+  finally
+    Thr.Free;
+  end;
+  if (Job.Handle <> INVALID_HANDLE_VALUE) and (Job.Handle <> 0) then
+  begin
+    CloseHandle(Job.Handle);
+    AWin32 := 0;
+    Result := True;
+  end
+  else
+    AWin32 := Job.Win32;
+  Job.Done.Free;
+  Job.Free;
 end;
 
 function IsListablePath(const APath: string): Boolean;
@@ -1266,6 +1491,7 @@ begin
   if not Result then
     Exit;
   if IsVibeNetworkPath(APath) or IsUncPath(APath) or IsRemotePath(APath) or
+     UiSkipNetworkTouch(APath) or
      IsVirtualShellPath(APath) or IsPortableDevicePath(APath) or
      IsThisPCPath(APath) then
     Exit(True);
@@ -1278,6 +1504,7 @@ begin
   if not Result then
     Exit;
   if IsVibeNetworkPath(APath) or IsUncPath(APath) or IsRemotePath(APath) or
+     UiSkipNetworkTouch(APath) or
      IsVirtualShellPath(APath) or IsPortableDevicePath(APath) or
      IsThisPCPath(APath) then
     Exit(True);
@@ -1574,9 +1801,61 @@ begin
   end;
 end;
 
+function MappedDriveUncRaw(const ARoot: string; out AConnected: Boolean): string;
+var
+  LocalName: string;
+  Buf: array[0..1023] of Char;
+  Len: DWORD;
+  Code: DWORD;
+begin
+  Result := '';
+  AConnected := False;
+  if (Length(ARoot) < 2) or (ARoot[2] <> ':') then
+    Exit;
+  LocalName := UpCase(ARoot[1]) + ':';
+  Len := Length(Buf);
+  FillChar(Buf, SizeOf(Buf), 0);
+  Code := WNetGetConnection(PChar(LocalName), Buf, Len);
+  AConnected := Code = NO_ERROR;
+  if Buf[0] <> #0 then
+    Result := ExcludeTrailingPathDelimiter(string(PChar(@Buf[0])));
+end;
+
+function NetworkDriveConnected(const ARoot: string): Boolean;
+var
+  Unc: string;
+  DT: Cardinal;
+  Root: string;
+begin
+  Result := True;
+  if IsUncPath(ARoot) then
+    Exit;
+  if (Length(ARoot) < 2) or (ARoot[2] <> ':') then
+    Exit;
+  Root := DriveRootOf(ARoot);
+  if not DriveTypeCached(Root, DT) then
+  begin
+    EnsureDriveTypeAsync(Root);
+    Exit(True);
+  end;
+  if DT <> DRIVE_REMOTE then
+    Exit(True);
+  Unc := MappedDriveUncRaw(ARoot, Result);
+end;
+
+function MappedDriveUnc(const ARoot: string): string;
+var
+  Connected: Boolean;
+begin
+  if IsUncPath(ARoot) then
+    Exit(ExcludeTrailingPathDelimiter(ARoot));
+  Result := MappedDriveUncRaw(ARoot, Connected);
+end;
+
 function QueryDrive(const ARoot: string; AType: UINT): TDriveInfo;
 var
   LabelBuf: array[0..MAX_PATH] of Char;
+  FsBuf: array[0..63] of Char;
   Dummy: DWORD;
   Total, FreeForCaller, TotalFree: Int64;
 begin
@@ -1600,14 +1879,23 @@ begin
 
   if AType = DRIVE_REMOTE then
   begin
+    { Метка и свободное место ходят на шару и могут подвесить интерфейс.
+      Имя и путь берутся из локальной таблицы подключений. }
+    Result.RemotePath := MappedDriveUnc(Result.Root);
     Result.Ready := True;
     Exit;
   end;
 
   FillChar(LabelBuf, SizeOf(LabelBuf), 0);
+  FillChar(FsBuf, SizeOf(FsBuf), 0);
   if GetVolumeInformation(PChar(Result.Root), LabelBuf, Length(LabelBuf),
-    nil, Dummy, Dummy, nil, 0) then
-    Result.VolumeName := string(LabelBuf);
+    nil, Dummy, Dummy, FsBuf, Length(FsBuf)) then
+  begin
+    if LabelBuf[0] <> #0 then
+      Result.VolumeName := string(PChar(@LabelBuf[0]));
+    if FsBuf[0] <> #0 then
+      Result.FileSystem := string(PChar(@FsBuf[0]));
+  end;
 
   if GetDiskFreeSpaceEx(PChar(Result.Root), FreeForCaller, Total, @TotalFree) then
   begin
@@ -1845,6 +2133,16 @@ end;
 function CollectDriveLetters: TArray<TDriveInfo>;
 begin
   SetLength(Result, 0);
+end;
+
+function MappedDriveUnc(const ARoot: string): string;
+begin
+  Result := '';
+end;
+
+function NetworkDriveConnected(const ARoot: string): Boolean;
+begin
+  Result := True;
 end;
 
 function CollectAllPlaces(AIncludeNetwork: Boolean): TArray<TDriveInfo>;
@@ -2651,7 +2949,8 @@ begin
   begin
     AEntry.IconKey := '#dir';
     { На шаре не тянуть SHGetFileInfo по полному UNC — только тип #dir. }
-    AEntry.NeedsCustomIcon := not IsRemotePath(AEntry.FullPath);
+    AEntry.NeedsCustomIcon := not IsRemotePath(AEntry.FullPath) and
+      not UiSkipNetworkTouch(AEntry.FullPath);
     AEntry.DisplayName := AEntry.Name;
     if AEntry.Extension <> '' then
       AEntry.DisplayType := AEntry.Extension
@@ -2818,22 +3117,75 @@ begin
   end;
 end;
 
+function UncLeafName(const AUnc: string): string;
+var
+  S: string;
+begin
+  S := ExcludeTrailingPathDelimiter(Trim(AUnc));
+  if S = '' then
+    Exit('');
+  Result := ExtractFileName(S);
+end;
+
+function DrivePlaceName(const AInfo: TDriveInfo): string;
+begin
+  if AInfo.Kind = dkNetHood then
+    Exit(L('drive.network'));
+  if AInfo.Kind = dkNetwork then
+  begin
+    Result := UncLeafName(AInfo.RemotePath);
+    if Result = '' then
+      Result := Trim(AInfo.VolumeName);
+    if Result = '' then
+      Result := DriveKindCaption(dkNetwork);
+    Exit;
+  end;
+  Result := Trim(AInfo.VolumeName);
+  if Result = '' then
+    Result := DriveKindCaption(AInfo.Kind);
+end;
+
 function DrivePlaceTitle(const AInfo: TDriveInfo): string;
 var
   Name: string;
 begin
-  if AInfo.Kind = dkNetHood then
-    Name := L('drive.network')
-  else
-  begin
-    Name := Trim(AInfo.VolumeName);
-    if Name = '' then
-      Name := DriveKindCaption(AInfo.Kind);
-  end;
+  Name := DrivePlaceName(AInfo);
   if AInfo.Letter <> '' then
     Result := AInfo.Letter + '  ' + Name
   else
     Result := Name;
+end;
+
+function DrivePlaceHint(const AInfo: TDriveInfo): string;
+var
+  Head, Fs, FreeText: string;
+begin
+  if AInfo.Kind = dkNetwork then
+  begin
+    if AInfo.RemotePath <> '' then
+      Result := AInfo.RemotePath
+    else
+      Result := AInfo.Root;
+    Exit;
+  end;
+  if AInfo.Kind = dkNetHood then
+    Exit(L('drive.network'));
+  if AInfo.Letter <> '' then
+    Head := AInfo.Letter
+  else
+    Head := DrivePlaceName(AInfo);
+  Fs := Trim(AInfo.FileSystem);
+  if Fs = '' then
+    Fs := DriveKindCaption(AInfo.Kind);
+  if Fs <> '' then
+    Head := Head + ' ' + Fs;
+  FreeText := '';
+  if AInfo.Ready and (AInfo.TotalBytes > 0) then
+    FreeText := Lf('drive.free', [FormatFileSize(AInfo.FreeBytes)]);
+  if FreeText <> '' then
+    Result := Head + ' — ' + FreeText
+  else
+    Result := Head;
 end;
 
 function FormatDrivePair(ALeft, ARight: Int64): string;
@@ -3083,6 +3435,8 @@ begin
   FBranch := ABranch;
   FErrSent := False;
   FProbeGate := nil;
+  FDiscard := False;
+  Discard := False;
 end;
 
 destructor TDirLoadThread.Destroy;
@@ -3163,8 +3517,11 @@ end;
 
 function NetErrorText(ACode: DWORD): string;
 begin
-  if (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_NETWORK_ACCESS_DENIED) or
-     (ACode = ERROR_LOGON_FAILURE) then
+  if (ACode = ERROR_ACCESS_DENIED) or (ACode = ERROR_LOGON_FAILURE) or
+     (ACode = ERROR_INVALID_PASSWORD) or
+     (ACode = ERROR_SESSION_CREDENTIAL_CONFLICT) then
+    Result := L('op.noaccess') + #1 + IntToStr(ACode)
+  else if (ACode = ERROR_NETWORK_ACCESS_DENIED) then
     Result := L('op.noaccess')
   else if NetIsOfflineCode(ACode) then
     Result := L('model.server.down')
@@ -3184,6 +3541,7 @@ var
   NeedCom: Boolean;
   Remote: Boolean;
   RC, LastChunk, ErrCode: Integer;
+  ProbeErr: DWORD;
   LastEmit: Cardinal;
   Batch: TProc;
 begin
@@ -3210,6 +3568,8 @@ begin
       end;
   try
     try
+      if Discard or FDiscard then
+        Exit;
       if FBranch then
       begin
         if SplitArchivePath(FPath, Arc, Inner) then
@@ -3239,18 +3599,17 @@ begin
       begin
         if Remote then
         begin
-          FProbeGate := TEvent.Create(nil, True, False, '');
-          TThread.CreateAnonymousThread(
-            procedure
-            begin
-              if Assigned(FProbeGate) and
-                 (FProbeGate.WaitFor(4000) <> wrSignaled) then
-                if not Terminated then
-                begin
-                  Terminate;
-                  SendError(L('model.server.down'));
-                end;
-            end).Start;
+          if not ProbeDirectoryOpen(FPath, 2500, ProbeErr) then
+          begin
+            if (ProbeErr = ERROR_ACCESS_DENIED) or (ProbeErr = ERROR_LOGON_FAILURE) or
+               (ProbeErr = ERROR_INVALID_PASSWORD) or
+               (ProbeErr = ERROR_SESSION_CREDENTIAL_CONFLICT) or
+               (ProbeErr = ERROR_NETWORK_ACCESS_DENIED) then
+              SendError(NetErrorText(ProbeErr))
+            else
+              SendError(L('model.server.down'));
+            Exit;
+          end;
         end;
         RC := System.SysUtils.FindFirst(TPath.Combine(FPath, '*.*'), faAnyFile, SearchRec);
 {$IFDEF MSWINDOWS}
@@ -3407,6 +3766,7 @@ begin
         SendError(E.Message);
     end;
   finally
+    ReleasePathRead(FPath, Self);
     if Assigned(FProbeGate) then
       FProbeGate.SetEvent;
     Entries.Free;
@@ -3423,8 +3783,32 @@ initialization
   GPidlMap := TDictionary<string, TBytes>.Create;
   GDriveTypeLock := TCriticalSection.Create;
   GDriveTypeCache := TDictionary<string, Cardinal>.Create;
+  GDriveTypePending := TDictionary<string, Boolean>.Create;
+  GLiveReadLock := TCriticalSection.Create;
+  GLiveReads := TDictionary<string, TThread>.Create;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Mask: DWORD;
+      I: Integer;
+      Root: string;
+      DT: Cardinal;
+    begin
+      Mask := GetLogicalDrives;
+      for I := 0 to 25 do
+      begin
+        if (Mask and (1 shl I)) = 0 then
+          Continue;
+        Root := Char(Ord('A') + I) + ':\';
+        DT := GetDriveType(PChar(Root));
+        StoreDriveType(Root, DT);
+      end;
+    end).Start;
 
 finalization
+  FreeAndNil(GLiveReads);
+  FreeAndNil(GLiveReadLock);
+  FreeAndNil(GDriveTypePending);
   FreeAndNil(GDriveTypeCache);
   FreeAndNil(GDriveTypeLock);
   FreeAndNil(GPidlMap);

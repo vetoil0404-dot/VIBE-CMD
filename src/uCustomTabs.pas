@@ -409,10 +409,10 @@ var
   CloseBtn: TRectangle;
   Shade: Byte;
 begin
-  if TAlphaColorRec(FThemeColors.HeaderBackground).A < 255 then
+  if WindowChromeIsAcrylic then
   begin
     { Акрил: полоса прозрачная, неактивная вкладка — тёмная вуаль.
-      Наведение ослабляет тень, активная остаётся чистым стеклом. }
+      Ползунок мики оставляет у вкладки её собственную заливку. }
     if AIsActive then
       ATabRect.Fill.Color := TAlphaColors.Null
     else
@@ -1246,16 +1246,24 @@ begin
       end;
       IconImg.WrapMode := TImageWrapMode.Fit;
       IconImg.HitTest := False;
-      if not IsRemotePath(FIconPaths[I]) then
-      begin
-        IconBmp := nil;
-        try
+      IconBmp := nil;
+      try
+        if IsVibeNetworkRoot(FIconPaths[I]) or
+           SameText(FIconPaths[I], NetworkFolderPath) then
+          GetFileIconBitmap(NetworkFolderPath, True, IconBmp)
+        else if IsRemotePath(FIconPaths[I]) then
+        begin
+          if IsDriveRoot(FIconPaths[I]) then
+            GetNetworkDriveIconBitmap(IconBmp, NetworkDriveConnected(FIconPaths[I]))
+          else
+            GetNetworkFolderIconBitmap(IconBmp);
+        end
+        else
           GetFileIconBitmap(FIconPaths[I], True, IconBmp);
-          if Assigned(IconBmp) then
-            IconImg.Bitmap.Assign(IconBmp);
-        finally
-          IconBmp.Free;
-        end;
+        if Assigned(IconBmp) then
+          IconImg.Bitmap.Assign(IconBmp);
+      finally
+        IconBmp.Free;
       end;
     end;
 

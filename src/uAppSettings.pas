@@ -2,6 +2,7 @@
 
 {
   Хранение и загрузка пользовательских настроек в VibeSetting.ini рядом с exe.
+  /ini= подменяет этот файл до создания настроек. Чужой запуск ini не меняет.
   Поддерживаются вкладки обеих панелей, вид/зум/сортировка каждой вкладки
   и геометрия окна. Старый формат (один Path на панель) читается как одна вкладка.
 }
@@ -45,16 +46,25 @@ type
   private
     FFileName: string;
     FIniSource: string;
-    function BoolToStr(B: Boolean): string;
+    FPrefsDirty: Boolean;
+    FPrefsWorker: Boolean;
+    FPrefsLock: TCriticalSection;
+    FPrefsEvent: TEvent;
+    FPending: TObject;
     function StrToBoolDef(const S: string; Def: Boolean): Boolean;
     function DefaultTab(const APath: string): TTabState;
     procedure LoadSide(Ini: TIniFile; const ASection: string; var ASide: TSideState);
-    procedure SaveSide(Ini: TIniFile; const ASection: string; const ASide: TSideState);
+    procedure PrefsWorker;
   public
     Theme: TAppTheme;
     WindowMaterial: TWindowMaterial;
     { -1 выкл, 0..359 градус Hue. Красит только wmNormal. }
     ColorTint: Integer;
+    { 0 непрозрачно, 1..100 процент. Normal — только фон окна и
+      заголовок (то, что красит оттенок); на 100 это четверть
+      прежней альфы. Acrylic умножает свою альфу на тот же предел.
+      Mica ослабляет вкладки, диски, крошки, заголовок и статус. }
+    Transparency: Integer;
     { Код файла lang\*.ini или 'system'. Ini: Main/Language. }
     Language: string;
     QuickViewEnabled: Boolean;
@@ -113,6 +123,7 @@ type
     SearchHistory: TArray<string>;
 
     constructor Create;
+    destructor Destroy; override;
     procedure Load;
     { Первый запуск: пины и daCenter в ту же секцию Dock. Пустой набор не пишет ini. }
     procedure CommitDockSeed(const APaths, ACaptions: TArray<string>);
@@ -124,18 +135,41 @@ type
     procedure SaveSearchHistory;
     { Только секция Dock — в фоне, без блокировки UI. }
     procedure SaveDockAsync;
-    { Только настройки диалога, без геометрии и вкладок. }
+    { Снимок настроек и одна запись в фоне. UI этот файл не ждёт. }
     procedure SaveAsync;
+    { Дождаться фоновой записи. Выход и закрытие диалога терять правку не должны. }
+    procedure FlushPrefs;
+    function PrefsDirty: Boolean;
+    procedure MarkPrefsDirty;
   end;
 
 function SingleInstanceWanted: Boolean;
+{ Пусто — VibeSetting.ini рядом с exe. /ini= задаёт путь до загрузки сессии. }
+procedure SetSettingsIniOverride(const APath: string);
+function ActiveSettingsIni: string;
 function ReadFontPhrase: string;
 procedure WriteFontPhrase(const AText: string);
+{ Первый фиксированный том, A→Z. Без ini панели открываются на нём, не на диске exe. }
+function DefaultStartupDrive: string;
+{ Настоящая сборка NT. Граница Windows 11 — 22000. }
+function WindowsBuild: Cardinal;
+{ 10 или 11. У обеих Major = 10, граница — сборка 22000. }
+function WindowsVersion: Integer;
+{ На Windows 10 нет ни мики, ни акрила: любое значение сводится к обычному окну. }
+function MaterialForWindows(AMaterial: TWindowMaterial): TWindowMaterial;
 
 implementation
 
+{$IFDEF MSWINDOWS}
+uses
+  Winapi.Windows;
+{$ENDIF}
+
+procedure UpdateIni(const AFile: string; const AEdit: TProc<TCustomIniFile>); forward;
+
 var
   GSettingsSaveLock: TCriticalSection;
+  GSettingsIniOverride: string;
 
 const
   DEFAULT_ZOOM = 100;
@@ -147,11 +181,17 @@ begin
   inherited Create;
   if GSettingsSaveLock = nil then
     GSettingsSaveLock := TCriticalSection.Create;
-  FFileName := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
+  FPrefsLock := TCriticalSection.Create;
+  FPrefsEvent := TEvent.Create(nil, True, True, '');
+  if GSettingsIniOverride <> '' then
+    FFileName := GSettingsIniOverride
+  else
+    FFileName := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
 
   Theme := atSystem;
   WindowMaterial := wmNormal;
   ColorTint := -1;
+  Transparency := 0;
   Language := 'system';
   QuickViewEnabled := True;
   FollowCursor := True;
@@ -195,11 +235,86 @@ begin
   WindowPosSaved := False;
   SplitterPos := 0.5;
 
-  Root := ExtractFileDrive(ParamStr(0)) + '\';
+  Root := DefaultStartupDrive;
   Left.ActiveTab := 0;
   SetLength(Left.Tabs, 1);
   Left.Tabs[0] := DefaultTab(Root);
   Right := Left;
+end;
+
+destructor TAppSettings.Destroy;
+begin
+  try
+    if FPrefsLock <> nil then
+      FlushPrefs;
+  except
+  end;
+  FPending.Free;
+  FPrefsEvent.Free;
+  FPrefsLock.Free;
+  inherited;
+end;
+
+function DefaultStartupDrive: string;
+{$IFDEF MSWINDOWS}
+var
+  Mask: DWORD;
+  I: Integer;
+  Root, Other: string;
+  Kind: UINT;
+{$ENDIF}
+begin
+  Result := 'C:\';
+{$IFDEF MSWINDOWS}
+  Other := '';
+  Mask := GetLogicalDrives;
+  for I := 0 to 25 do
+  begin
+    if (Mask and (1 shl I)) = 0 then
+      Continue;
+    Root := Char(Ord('A') + I) + ':\';
+    Kind := GetDriveType(PChar(Root));
+    if Kind = DRIVE_FIXED then
+      Exit(Root);
+    if (Other = '') and (Kind <> DRIVE_NO_ROOT_DIR) and (Kind <> DRIVE_UNKNOWN) then
+      Other := Root;
+  end;
+  if Other <> '' then
+    Result := Other;
+{$ENDIF}
+end;
+
+function WindowsBuild: Cardinal;
+var
+  RtlGetVersion: function(var Info: TOSVersionInfoExW): LongInt; stdcall;
+  Info: TOSVersionInfoExW;
+begin
+  { TOSVersion на части процессов остаётся ниже 22000, и Windows 11
+    принимается за Windows 10. RtlGetVersion отдаёт настоящую сборку. }
+  Result := TOSVersion.Build;
+  @RtlGetVersion := GetProcAddress(GetModuleHandle('ntdll.dll'), 'RtlGetVersion');
+  if not Assigned(RtlGetVersion) then
+    Exit;
+  FillChar(Info, SizeOf(Info), 0);
+  Info.dwOSVersionInfoSize := SizeOf(Info);
+  if RtlGetVersion(Info) = 0 then
+    Result := Info.dwBuildNumber;
+end;
+
+function WindowsVersion: Integer;
+begin
+  Result := 10;
+  if WindowsBuild >= 22000 then
+    Result := 11
+  else if TOSVersion.Major > 10 then
+    Result := TOSVersion.Major;
+end;
+
+function MaterialForWindows(AMaterial: TWindowMaterial): TWindowMaterial;
+begin
+  Result := AMaterial;
+  if WindowsVersion < 11 then
+    Result := wmNormal;
 end;
 
 function EncodeTabCursor(const APath: string): string;
@@ -229,16 +344,23 @@ begin
   Result.CursorPath := '';
 end;
 
-function TAppSettings.BoolToStr(B: Boolean): string;
+function IniBoolStr(B: Boolean): string;
 begin
-  if B then Result := '1' else Result := '0';
+  if B then
+    Result := '1'
+  else
+    Result := '0';
 end;
 
 function TAppSettings.StrToBoolDef(const S: string; Def: Boolean): Boolean;
 begin
-  if S = '1' then Result := True
-  else if S = '0' then Result := False
-  else Result := Def;
+  { «-1» пишет SysUtils.BoolToStr(True). Так уже лежит SortAsc сессии. }
+  if (S = '1') or (S = '-1') or SameText(S, 'true') then
+    Result := True
+  else if (S = '0') or SameText(S, 'false') then
+    Result := False
+  else
+    Result := Def;
 end;
 
 procedure TAppSettings.LoadSide(Ini: TIniFile; const ASection: string; var ASide: TSideState);
@@ -255,7 +377,7 @@ begin
     for I := 0 to TabCount - 1 do
     begin
       TabSec := ASection + 'Tab' + IntToStr(I);
-      ASide.Tabs[I] := DefaultTab(ExtractFileDrive(ParamStr(0)) + '\');
+      ASide.Tabs[I] := DefaultTab(DefaultStartupDrive);
       ASide.Tabs[I].Path := Ini.ReadString(TabSec, 'Path', ASide.Tabs[I].Path);
       ASide.Tabs[I].ViewMode := TPanelViewMode(Ini.ReadInteger(TabSec, 'ViewMode', 0));
       LegacyZoom := Ini.ReadInteger(TabSec, 'Zoom', DEFAULT_ZOOM);
@@ -286,7 +408,7 @@ begin
   if Length(ASide.Tabs) = 0 then
   begin
     SetLength(ASide.Tabs, 1);
-    ASide.Tabs[0] := DefaultTab(ExtractFileDrive(ParamStr(0)) + '\');
+    ASide.Tabs[0] := DefaultTab(DefaultStartupDrive);
   end;
   if (ASide.ActiveTab < 0) or (ASide.ActiveTab >= Length(ASide.Tabs)) then
     ASide.ActiveTab := 0;
@@ -311,7 +433,7 @@ begin
   end;
 end;
 
-procedure WriteSide(Ini: TIniFile; const ASection: string; const ASide: TSideState);
+procedure WriteSide(Ini: TCustomIniFile; const ASection: string; const ASide: TSideState);
 var
   I: Integer;
   TabSec: string;
@@ -324,7 +446,7 @@ begin
     Ini.WriteInteger(ASection, 'ViewMode', Ord(ASide.Tabs[ASide.ActiveTab].ViewMode));
     Ini.WriteInteger(ASection, 'Zoom', ASide.Tabs[ASide.ActiveTab].ZoomDetails);
     Ini.WriteInteger(ASection, 'SortColumn', ASide.Tabs[ASide.ActiveTab].SortField);
-    Ini.WriteString(ASection, 'SortAsc', BoolToStr(ASide.Tabs[ASide.ActiveTab].SortAsc));
+    Ini.WriteString(ASection, 'SortAsc', IniBoolStr(ASide.Tabs[ASide.ActiveTab].SortAsc));
   end;
 
   for I := 0 to High(ASide.Tabs) do
@@ -335,7 +457,7 @@ begin
     Ini.WriteInteger(TabSec, 'ZoomDetails', ASide.Tabs[I].ZoomDetails);
     Ini.WriteInteger(TabSec, 'ZoomTiles', ASide.Tabs[I].ZoomTiles);
     Ini.WriteInteger(TabSec, 'SortField', ASide.Tabs[I].SortField);
-    Ini.WriteString(TabSec, 'SortAsc', BoolToStr(ASide.Tabs[I].SortAsc));
+    Ini.WriteString(TabSec, 'SortAsc', IniBoolStr(ASide.Tabs[I].SortAsc));
     Ini.WriteString(TabSec, 'CursorPath', EncodeTabCursor(ASide.Tabs[I].CursorPath));
   end;
 
@@ -345,11 +467,6 @@ begin
     Ini.WriteString(ASection, 'DriveLastRoot' + IntToStr(I), ASide.DriveLast[I].Root);
     Ini.WriteString(ASection, 'DriveLastPath' + IntToStr(I), ASide.DriveLast[I].Path);
   end;
-end;
-
-procedure TAppSettings.SaveSide(Ini: TIniFile; const ASection: string; const ASide: TSideState);
-begin
-  WriteSide(Ini, ASection, ASide);
 end;
 
 procedure TAppSettings.Load;
@@ -363,6 +480,9 @@ begin
   Source := FFileName;
   if not FileExists(Source) then
   begin
+    { /ini= не подменяет соседний VibeSetting.ini и TCClone.ini. }
+    if GSettingsIniOverride <> '' then
+      Exit;
     Source := ExtractFilePath(ParamStr(0)) + 'TCClone.ini';
     if not FileExists(Source) then
       Exit;
@@ -372,20 +492,24 @@ begin
   Ini := TIniFile.Create(Source);
   try
     Theme := TAppTheme(Ini.ReadInteger('Main', 'Theme', Ord(atSystem)));
-    WindowMaterial := TWindowMaterial(EnsureRange(
-      Ini.ReadInteger('Appearance', 'Material', Ord(wmNormal)), 0, 2));
+    WindowMaterial := MaterialForWindows(TWindowMaterial(EnsureRange(
+      Ini.ReadInteger('Appearance', 'Material', Ord(wmNormal)), 0, 2)));
     ColorTint := Ini.ReadInteger('Appearance', 'ColorHue', -1);
     Language := NormalizeLanguage(Ini.ReadString('Main', 'Language', 'system'));
     if (ColorTint < 0) or (ColorTint > 359) then
       ColorTint := -1;
+    Transparency := Ini.ReadInteger('Appearance', 'Transparency', 0);
+    if (Transparency < 0) or (Transparency > 100) then
+      Transparency := 0;
     QuickViewEnabled := True;
     FollowCursor := StrToBoolDef(Ini.ReadString('View', 'FollowCursor', '1'), True);
-    if SameText(Ini.ReadString('Select', 'MouseMode', 'vibe'), 'explorer') then
+    { Нет ключа — как в конструкторе. SaveSession эти поля не пишет. }
+    if SameText(Ini.ReadString('Select', 'MouseMode', 'explorer'), 'explorer') then
       MouseSelectMode := msmExplorer
     else
       MouseSelectMode := msmVibe;
     WindowAnimate := True;
-    ShowNetworkButton := StrToBoolDef(Ini.ReadString('Main', 'ShowNetwork', '0'), False);
+    ShowNetworkButton := StrToBoolDef(Ini.ReadString('Main', 'ShowNetwork', '1'), True);
     NetworkLastSubnet := Ini.ReadString('Network', 'LastSubnet', '');
     NetworkHistory := Ini.ReadString('Network', 'History', '');
     ShowHiddenFiles := StrToBoolDef(Ini.ReadString('Main', 'ShowHidden', '0'), False);
@@ -413,12 +537,12 @@ begin
     ShowDock := StrToBoolDef(Ini.ReadString('Layout', 'Dock', '1'), True);
     ShowMidBar := StrToBoolDef(Ini.ReadString('Layout', 'MidBar', '1'), True);
     ShowDriveBar := StrToBoolDef(Ini.ReadString('Layout', 'DriveBar', '1'), True);
-    ShowDriveHome := StrToBoolDef(Ini.ReadString('Layout', 'DriveHome', '0'), False);
+    ShowDriveHome := StrToBoolDef(Ini.ReadString('Layout', 'DriveHome', '1'), True);
     ShowBreadcrumbs := True;
     ShowStatusBar := StrToBoolDef(Ini.ReadString('Layout', 'StatusBar', '1'), True);
     ShowFnBar := StrToBoolDef(Ini.ReadString('Layout', 'FnBar', '1'), True);
     ShowQuickAccess := StrToBoolDef(Ini.ReadString('Layout', 'QuickAccess', '1'), True);
-    ShowCommandLine := StrToBoolDef(Ini.ReadString('Layout', 'CommandLine', '0'), False);
+    ShowCommandLine := StrToBoolDef(Ini.ReadString('Layout', 'CommandLine', '1'), True);
 
     ListFontFamily := Ini.ReadString('Appearance', 'FontFamily', ListFontFamily);
     ListFontSize := Ini.ReadInteger('Appearance', 'FontSize', ListFontSize);
@@ -443,7 +567,7 @@ begin
 
     ThumbCacheEnabled := StrToBoolDef(Ini.ReadString('Performance', 'Thumbs', '1'), True);
     ThumbCacheMaxItems := Ini.ReadInteger('Performance', 'ThumbMaxItems', ThumbCacheMaxItems);
-    FileOpMode := TFileOpMode(EnsureRange(Ini.ReadInteger('FileOps', 'Mode', Ord(fomVibe)), 0, 2));
+    FileOpMode := TFileOpMode(EnsureRange(Ini.ReadInteger('FileOps', 'Mode', Ord(fomExplorer)), 0, 2));
     if ThumbCacheMaxItems < 50 then ThumbCacheMaxItems := 50;
     if ThumbCacheMaxItems > 4000 then ThumbCacheMaxItems := 4000;
 
@@ -505,11 +629,32 @@ begin
   end;
 end;
 
+procedure UpdateIni(const AFile: string; const AEdit: TProc<TCustomIniFile>);
+var
+  Ini: TMemIniFile;
+begin
+  { Один раз прочитали файл, поправили в памяти, один раз записали.
+    TIniFile на каждый ключ зовёт WritePrivateProfileString и переписывает файл. }
+  if GSettingsSaveLock <> nil then
+    GSettingsSaveLock.Enter;
+  try
+    Ini := TMemIniFile.Create(AFile);
+    try
+      AEdit(Ini);
+      Ini.UpdateFile;
+    finally
+      Ini.Free;
+    end;
+  finally
+    if GSettingsSaveLock <> nil then
+      GSettingsSaveLock.Leave;
+  end;
+end;
+
 procedure TAppSettings.CommitDockSeed(const APaths, ACaptions: TArray<string>);
 const
   KindFolder = 1;
 var
-  Ini: TIniFile;
   Fn: string;
   I, N: Integer;
 begin
@@ -548,35 +693,43 @@ begin
     Fn := FIniSource
   else
     Fn := FFileName;
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(Fn);
-    try
+  UpdateIni(Fn,
+    procedure(Ini: TCustomIniFile)
+    var
+      J: Integer;
+    begin
       Ini.WriteInteger('Dock', 'Align', Ord(daCenter));
-      Ini.WriteString('Dock', 'ShowSeps', BoolToStr(DockShowSeparators));
+      Ini.WriteString('Dock', 'ShowSeps', IniBoolStr(DockShowSeparators));
       Ini.WriteInteger('Dock', 'Count', N);
-      for I := 0 to N - 1 do
+      for J := 0 to N - 1 do
       begin
-        Ini.WriteString('Dock', 'Item' + IntToStr(I), DockItems[I]);
-        Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
-        Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), DockKinds[I]);
-        Ini.WriteString('Dock', 'Caption' + IntToStr(I), DockCaptions[I]);
-        Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
-        Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
+        Ini.WriteString('Dock', 'Item' + IntToStr(J), DockItems[J]);
+        Ini.WriteFloat('Dock', 'X' + IntToStr(J), 0);
+        Ini.WriteInteger('Dock', 'Kind' + IntToStr(J), DockKinds[J]);
+        Ini.WriteString('Dock', 'Caption' + IntToStr(J), DockCaptions[J]);
+        Ini.WriteString('Dock', 'Icon' + IntToStr(J), '');
+        Ini.WriteString('Dock', 'IconLock' + IntToStr(J), '0');
       end;
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
-  end;
+    end);
   DockSeedPending := False;
+end;
+
+procedure SetSettingsIniOverride(const APath: string);
+begin
+  GSettingsIniOverride := APath;
+end;
+
+function ActiveSettingsIni: string;
+begin
+  if GSettingsIniOverride <> '' then
+    Exit(GSettingsIniOverride);
+  Result := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
 end;
 
 function BehaviorIniPath: string;
 begin
+  if GSettingsIniOverride <> '' then
+    Exit(GSettingsIniOverride);
   Result := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
   if not FileExists(Result) and
      FileExists(ExtractFilePath(ParamStr(0)) + 'TCClone.ini') then
@@ -585,7 +738,7 @@ end;
 
 function FontIniPath: string;
 begin
-  Result := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
+  Result := ActiveSettingsIni;
 end;
 
 function ReadFontPhrase: string;
@@ -611,22 +764,12 @@ begin
 end;
 
 procedure WriteFontPhrase(const AText: string);
-var
-  Ini: TIniFile;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(FontIniPath);
-    try
+  UpdateIni(FontIniPath,
+    procedure(Ini: TCustomIniFile)
+    begin
       Ini.WriteString('Font', 'Phrase', AText);
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
-  end;
+    end);
 end;
 
 function SingleInstanceWanted: Boolean;
@@ -648,182 +791,277 @@ end;
 
 procedure TAppSettings.SaveBehavior;
 var
-  Ini: TIniFile;
+  Fn: string;
+  Auto, Single: Boolean;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(FFileName);
-    try
-      Ini.WriteString('Behavior', 'AutoStart', BoolToStr(AutoStart));
-      Ini.WriteString('Behavior', 'SingleInstance', BoolToStr(SingleInstance));
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
-  end;
+  Fn := FFileName;
+  Auto := AutoStart;
+  Single := SingleInstance;
+  UpdateIni(Fn,
+    procedure(Ini: TCustomIniFile)
+    begin
+      Ini.WriteString('Behavior', 'AutoStart', IniBoolStr(Auto));
+      Ini.WriteString('Behavior', 'SingleInstance', IniBoolStr(Single));
+    end);
 end;
 
 procedure TAppSettings.SaveNetwork;
 var
-  Ini: TIniFile;
+  Fn, Subnet, Hist: string;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(FFileName);
-    try
-      Ini.WriteString('Network', 'LastSubnet', NetworkLastSubnet);
-      Ini.WriteString('Network', 'History', NetworkHistory);
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
+  Fn := FFileName;
+  Subnet := NetworkLastSubnet;
+  Hist := NetworkHistory;
+  UpdateIni(Fn,
+    procedure(Ini: TCustomIniFile)
+    begin
+      Ini.WriteString('Network', 'LastSubnet', Subnet);
+      Ini.WriteString('Network', 'History', Hist);
+    end);
+end;
+
+type
+  TPrefsSnap = class
+  public
+    FileName: string;
+    Theme: TAppTheme;
+    WindowMaterial: TWindowMaterial;
+    ColorTint: Integer;
+    Transparency: Integer;
+    Language: string;
+    ShowNetworkButton: Boolean;
+    NetworkLastSubnet: string;
+    NetworkHistory: string;
+    ShowHiddenFiles: Boolean;
+    ShowFolderSizes: Boolean;
+    ShowDock: Boolean;
+    ShowMidBar: Boolean;
+    ShowDriveBar: Boolean;
+    ShowDriveHome: Boolean;
+    ShowStatusBar: Boolean;
+    ShowFnBar: Boolean;
+    ShowQuickAccess: Boolean;
+    ShowCommandLine: Boolean;
+    FollowCursor: Boolean;
+    MouseSelectMode: TMouseSelectMode;
+    ListFontFamily: string;
+    ListFontSize: Integer;
+    ShowTabIcons: Boolean;
+    EqualTabWidth: Boolean;
+    DockSeedPending: Boolean;
+    DockAlign: TDockAlign;
+    DockShowSeparators: Boolean;
+    DockItems: TArray<string>;
+    DockItemX: TArray<Single>;
+    DockKinds: TArray<Integer>;
+    DockCaptions: TArray<string>;
+    DockIcons: TArray<string>;
+    DockIconLocked: TArray<Boolean>;
+    AutoStart: Boolean;
+    SingleInstance: Boolean;
+    FileOpMode: TFileOpMode;
   end;
+
+procedure WriteDockKeys(Ini: TCustomIniFile; AWithAlign: Boolean; AAlign: Integer;
+  ASeps: Boolean; const Items: TArray<string>; const Xs: TArray<Single>;
+  const Kinds: TArray<Integer>; const Caps, Icons: TArray<string>;
+  const Locks: TArray<Boolean>);
+var
+  I: Integer;
+begin
+  if AWithAlign then
+  begin
+    Ini.WriteInteger('Dock', 'Align', AAlign);
+    Ini.WriteString('Dock', 'ShowSeps', IniBoolStr(ASeps));
+  end;
+  Ini.WriteInteger('Dock', 'Count', Length(Items));
+  for I := 0 to High(Items) do
+  begin
+    Ini.WriteString('Dock', 'Item' + IntToStr(I), Items[I]);
+    if I <= High(Xs) then
+      Ini.WriteFloat('Dock', 'X' + IntToStr(I), Xs[I])
+    else
+      Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
+    if I <= High(Kinds) then
+      Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), Kinds[I])
+    else
+      Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), -1);
+    if I <= High(Caps) then
+      Ini.WriteString('Dock', 'Caption' + IntToStr(I), Caps[I])
+    else
+      Ini.WriteString('Dock', 'Caption' + IntToStr(I), '');
+    if I <= High(Icons) then
+      Ini.WriteString('Dock', 'Icon' + IntToStr(I), Icons[I])
+    else
+      Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
+    if (I <= High(Locks)) and Locks[I] then
+      Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '1')
+    else
+      Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
+  end;
+end;
+
+function CapturePrefs(S: TAppSettings): TPrefsSnap;
+begin
+  Result := TPrefsSnap.Create;
+  Result.FileName := S.FFileName;
+  Result.Theme := S.Theme;
+  Result.WindowMaterial := S.WindowMaterial;
+  Result.ColorTint := S.ColorTint;
+  Result.Transparency := S.Transparency;
+  Result.Language := NormalizeLanguage(S.Language);
+  Result.ShowNetworkButton := S.ShowNetworkButton;
+  Result.NetworkLastSubnet := S.NetworkLastSubnet;
+  Result.NetworkHistory := S.NetworkHistory;
+  Result.ShowHiddenFiles := S.ShowHiddenFiles;
+  Result.ShowFolderSizes := S.ShowFolderSizes;
+  Result.ShowDock := S.ShowDock;
+  Result.ShowMidBar := S.ShowMidBar;
+  Result.ShowDriveBar := S.ShowDriveBar;
+  Result.ShowDriveHome := S.ShowDriveHome;
+  Result.ShowStatusBar := S.ShowStatusBar;
+  Result.ShowFnBar := S.ShowFnBar;
+  Result.ShowQuickAccess := S.ShowQuickAccess;
+  Result.ShowCommandLine := S.ShowCommandLine;
+  Result.FollowCursor := S.FollowCursor;
+  Result.MouseSelectMode := S.MouseSelectMode;
+  Result.ListFontFamily := S.ListFontFamily;
+  Result.ListFontSize := S.ListFontSize;
+  Result.ShowTabIcons := S.ShowTabIcons;
+  Result.EqualTabWidth := S.EqualTabWidth;
+  Result.DockSeedPending := S.DockSeedPending;
+  Result.DockAlign := S.DockAlign;
+  Result.DockShowSeparators := S.DockShowSeparators;
+  Result.DockItems := Copy(S.DockItems);
+  Result.DockItemX := Copy(S.DockItemX);
+  Result.DockKinds := Copy(S.DockKinds);
+  Result.DockCaptions := Copy(S.DockCaptions);
+  Result.DockIcons := Copy(S.DockIcons);
+  Result.DockIconLocked := Copy(S.DockIconLocked);
+  Result.AutoStart := S.AutoStart;
+  Result.SingleInstance := S.SingleInstance;
+  Result.FileOpMode := S.FileOpMode;
+end;
+
+procedure WritePrefs(Snap: TPrefsSnap);
+begin
+  UpdateIni(Snap.FileName,
+    procedure(Ini: TCustomIniFile)
+    begin
+      Ini.WriteInteger('Main', 'Theme', Ord(Snap.Theme));
+      Ini.WriteString('Main', 'Language', Snap.Language);
+      Ini.WriteInteger('Appearance', 'Material', Ord(Snap.WindowMaterial));
+      if (Snap.ColorTint < 0) or (Snap.ColorTint > 359) then
+        Ini.WriteInteger('Appearance', 'ColorHue', -1)
+      else
+        Ini.WriteInteger('Appearance', 'ColorHue', Snap.ColorTint);
+      if (Snap.Transparency < 0) or (Snap.Transparency > 100) then
+        Ini.WriteInteger('Appearance', 'Transparency', 0)
+      else
+        Ini.WriteInteger('Appearance', 'Transparency', Snap.Transparency);
+      Ini.WriteString('Main', 'ShowNetwork', IniBoolStr(Snap.ShowNetworkButton));
+      Ini.WriteString('Network', 'LastSubnet', Snap.NetworkLastSubnet);
+      Ini.WriteString('Network', 'History', Snap.NetworkHistory);
+      Ini.WriteString('Main', 'ShowHidden', IniBoolStr(Snap.ShowHiddenFiles));
+      Ini.WriteString('Main', 'ShowFolderSize', IniBoolStr(Snap.ShowFolderSizes));
+      Ini.WriteString('Layout', 'Dock', IniBoolStr(Snap.ShowDock));
+      Ini.WriteString('Layout', 'MidBar', IniBoolStr(Snap.ShowMidBar));
+      Ini.WriteString('Layout', 'DriveBar', IniBoolStr(Snap.ShowDriveBar));
+      Ini.WriteString('Layout', 'DriveHome', IniBoolStr(Snap.ShowDriveHome));
+      Ini.WriteString('Layout', 'StatusBar', IniBoolStr(Snap.ShowStatusBar));
+      Ini.WriteString('Layout', 'FnBar', IniBoolStr(Snap.ShowFnBar));
+      Ini.WriteString('Layout', 'QuickAccess', IniBoolStr(Snap.ShowQuickAccess));
+      Ini.WriteString('Layout', 'CommandLine', IniBoolStr(Snap.ShowCommandLine));
+      Ini.WriteString('View', 'FollowCursor', IniBoolStr(Snap.FollowCursor));
+      if Snap.MouseSelectMode = msmExplorer then
+        Ini.WriteString('Select', 'MouseMode', 'explorer')
+      else
+        Ini.WriteString('Select', 'MouseMode', 'vibe');
+      Ini.WriteString('Appearance', 'FontFamily', Snap.ListFontFamily);
+      Ini.WriteInteger('Appearance', 'FontSize', Snap.ListFontSize);
+      Ini.WriteString('Appearance', 'TabIcons', IniBoolStr(Snap.ShowTabIcons));
+      Ini.WriteString('Appearance', 'EqualTabWidth', IniBoolStr(Snap.EqualTabWidth));
+      if not Snap.DockSeedPending then
+        WriteDockKeys(Ini, True, Ord(Snap.DockAlign), Snap.DockShowSeparators,
+          Snap.DockItems, Snap.DockItemX, Snap.DockKinds, Snap.DockCaptions,
+          Snap.DockIcons, Snap.DockIconLocked);
+      Ini.WriteString('Behavior', 'AutoStart', IniBoolStr(Snap.AutoStart));
+      Ini.WriteString('Behavior', 'SingleInstance', IniBoolStr(Snap.SingleInstance));
+      Ini.WriteInteger('FileOps', 'Mode', Ord(Snap.FileOpMode));
+    end);
 end;
 
 procedure TAppSettings.SaveSettings;
 var
-  Ini: TIniFile;
+  Snap: TPrefsSnap;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
+  Snap := CapturePrefs(Self);
   try
-    Ini := TIniFile.Create(FFileName);
-    try
-      Ini.WriteInteger('Main', 'Theme', Ord(Theme));
-      Ini.WriteString('Main', 'Language', NormalizeLanguage(Language));
-      Ini.WriteInteger('Appearance', 'Material', Ord(WindowMaterial));
-      if (ColorTint < 0) or (ColorTint > 359) then
-        Ini.WriteInteger('Appearance', 'ColorHue', -1)
-      else
-        Ini.WriteInteger('Appearance', 'ColorHue', ColorTint);
-      Ini.WriteString('Main', 'ShowNetwork', BoolToStr(ShowNetworkButton));
-      Ini.WriteString('Network', 'LastSubnet', NetworkLastSubnet);
-      Ini.WriteString('Network', 'History', NetworkHistory);
-      Ini.WriteString('Main', 'ShowHidden', BoolToStr(ShowHiddenFiles));
-      Ini.WriteString('Main', 'ShowFolderSize', BoolToStr(ShowFolderSizes));
-
-      Ini.WriteString('Layout', 'Dock', BoolToStr(ShowDock));
-      Ini.WriteString('Layout', 'MidBar', BoolToStr(ShowMidBar));
-      Ini.WriteString('Layout', 'DriveBar', BoolToStr(ShowDriveBar));
-      Ini.WriteString('Layout', 'DriveHome', BoolToStr(ShowDriveHome));
-      Ini.WriteString('Layout', 'StatusBar', BoolToStr(ShowStatusBar));
-      Ini.WriteString('Layout', 'FnBar', BoolToStr(ShowFnBar));
-      Ini.WriteString('Layout', 'QuickAccess', BoolToStr(ShowQuickAccess));
-      Ini.WriteString('Layout', 'CommandLine', BoolToStr(ShowCommandLine));
-      Ini.WriteString('View', 'FollowCursor', BoolToStr(FollowCursor));
-      if MouseSelectMode = msmExplorer then
-        Ini.WriteString('Select', 'MouseMode', 'explorer')
-      else
-        Ini.WriteString('Select', 'MouseMode', 'vibe');
-
-      Ini.WriteString('Appearance', 'FontFamily', ListFontFamily);
-      Ini.WriteInteger('Appearance', 'FontSize', ListFontSize);
-      Ini.WriteString('Appearance', 'TabIcons', BoolToStr(ShowTabIcons));
-      Ini.WriteString('Appearance', 'EqualTabWidth', BoolToStr(EqualTabWidth));
-      if not DockSeedPending then
-      begin
-        Ini.WriteInteger('Dock', 'Align', Ord(DockAlign));
-        Ini.WriteString('Dock', 'ShowSeps', BoolToStr(DockShowSeparators));
-        Ini.WriteInteger('Dock', 'Count', Length(DockItems));
-        for var I := 0 to High(DockItems) do
-        begin
-          Ini.WriteString('Dock', 'Item' + IntToStr(I), DockItems[I]);
-          if I <= High(DockItemX) then
-            Ini.WriteFloat('Dock', 'X' + IntToStr(I), DockItemX[I])
-          else
-            Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
-          if I <= High(DockKinds) then
-            Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), DockKinds[I])
-          else
-            Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), -1);
-          if I <= High(DockCaptions) then
-            Ini.WriteString('Dock', 'Caption' + IntToStr(I), DockCaptions[I])
-          else
-            Ini.WriteString('Dock', 'Caption' + IntToStr(I), '');
-          if I <= High(DockIcons) then
-            Ini.WriteString('Dock', 'Icon' + IntToStr(I), DockIcons[I])
-          else
-            Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
-          if (I <= High(DockIconLocked)) and DockIconLocked[I] then
-            Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '1')
-          else
-            Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
-        end;
-      end;
-
-      Ini.WriteString('Behavior', 'AutoStart', BoolToStr(AutoStart));
-      Ini.WriteString('Behavior', 'SingleInstance', BoolToStr(SingleInstance));
-      Ini.WriteInteger('FileOps', 'Mode', Ord(FileOpMode));
-    finally
-      Ini.Free;
-    end;
+    WritePrefs(Snap);
   finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
+    Snap.Free;
+  end;
+  if FPrefsLock = nil then
+  begin
+    FPrefsDirty := False;
+    Exit;
+  end;
+  FPrefsLock.Enter;
+  try
+    if not FPrefsWorker then
+      FPrefsDirty := False;
+  finally
+    FPrefsLock.Leave;
   end;
 end;
 
 procedure TAppSettings.SaveSession;
 var
-  Ini: TIniFile;
+  Fn, Hist: string;
+  Active, Wl, Wt, Ww, Wh: Integer;
+  Maxed, Seed: Boolean;
+  Split: Single;
+  LeftS, RightS: TSideState;
+  Items, Caps, Icons: TArray<string>;
+  Xs: TArray<Single>;
+  Kinds: TArray<Integer>;
+  Locks: TArray<Boolean>;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(FFileName);
-    try
-      Ini.WriteInteger('Main', 'ActivePanel', ActivePanel);
-      Ini.WriteString('Main', 'SearchHistory', string.Join(#9, SearchHistory));
+  Fn := FFileName;
+  Active := ActivePanel;
+  Hist := string.Join(#9, SearchHistory);
+  Wl := WindowLeft;
+  Wt := WindowTop;
+  Ww := WindowWidth;
+  Wh := WindowHeight;
+  Maxed := WindowMaximized;
+  Split := SplitterPos;
+  LeftS := Left;
+  RightS := Right;
+  Seed := DockSeedPending;
+  Items := Copy(DockItems);
+  Xs := Copy(DockItemX);
+  Kinds := Copy(DockKinds);
+  Caps := Copy(DockCaptions);
+  Icons := Copy(DockIcons);
+  Locks := Copy(DockIconLocked);
+  UpdateIni(Fn,
+    procedure(Ini: TCustomIniFile)
+    begin
+      Ini.WriteInteger('Main', 'ActivePanel', Active);
+      Ini.WriteString('Main', 'SearchHistory', Hist);
       { Отрицательные Left/Top пишем как есть. }
-      Ini.WriteInteger('Window', 'Left', WindowLeft);
-      Ini.WriteInteger('Window', 'Top', WindowTop);
-      Ini.WriteInteger('Window', 'Width', WindowWidth);
-      Ini.WriteInteger('Window', 'Height', WindowHeight);
-      Ini.WriteString('Window', 'Maximized', BoolToStr(WindowMaximized));
-      Ini.WriteFloat('Window', 'SplitterPos', SplitterPos);
-      SaveSide(Ini, 'LeftPanel', Left);
-      SaveSide(Ini, 'RightPanel', Right);
-      if not DockSeedPending then
-      begin
-        Ini.WriteInteger('Dock', 'Count', Length(DockItems));
-        for var I := 0 to High(DockItems) do
-        begin
-          Ini.WriteString('Dock', 'Item' + IntToStr(I), DockItems[I]);
-          if I <= High(DockItemX) then
-            Ini.WriteFloat('Dock', 'X' + IntToStr(I), DockItemX[I])
-          else
-            Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
-          if I <= High(DockKinds) then
-            Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), DockKinds[I])
-          else
-            Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), -1);
-          if I <= High(DockCaptions) then
-            Ini.WriteString('Dock', 'Caption' + IntToStr(I), DockCaptions[I])
-          else
-            Ini.WriteString('Dock', 'Caption' + IntToStr(I), '');
-          if I <= High(DockIcons) then
-            Ini.WriteString('Dock', 'Icon' + IntToStr(I), DockIcons[I])
-          else
-            Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
-          if (I <= High(DockIconLocked)) and DockIconLocked[I] then
-            Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '1')
-          else
-            Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
-        end;
-      end;
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
-  end;
+      Ini.WriteInteger('Window', 'Left', Wl);
+      Ini.WriteInteger('Window', 'Top', Wt);
+      Ini.WriteInteger('Window', 'Width', Ww);
+      Ini.WriteInteger('Window', 'Height', Wh);
+      Ini.WriteString('Window', 'Maximized', IniBoolStr(Maxed));
+      Ini.WriteFloat('Window', 'SplitterPos', Split);
+      WriteSide(Ini, 'LeftPanel', LeftS);
+      WriteSide(Ini, 'RightPanel', RightS);
+      if not Seed then
+        WriteDockKeys(Ini, False, 0, False, Items, Xs, Kinds, Caps, Icons, Locks);
+    end);
 end;
 
 procedure TAppSettings.SaveSessionAsync;
@@ -858,92 +1096,40 @@ begin
   Locks := Copy(DockIconLocked);
   TThread.CreateAnonymousThread(
     procedure
-    var
-      Ini: TIniFile;
-      I: Integer;
     begin
-      if GSettingsSaveLock = nil then
-        Exit;
-      GSettingsSaveLock.Enter;
       try
-        try
-          Ini := TIniFile.Create(Fn);
-          try
+        UpdateIni(Fn,
+          procedure(Ini: TCustomIniFile)
+          begin
             Ini.WriteInteger('Main', 'ActivePanel', Active);
             Ini.WriteString('Main', 'SearchHistory', Hist);
-            { Отрицательные Left/Top пишем как есть. }
             Ini.WriteInteger('Window', 'Left', Wl);
             Ini.WriteInteger('Window', 'Top', Wt);
             Ini.WriteInteger('Window', 'Width', Ww);
             Ini.WriteInteger('Window', 'Height', Wh);
-            Ini.WriteString('Window', 'Maximized', BoolToStr(Maxed));
+            Ini.WriteString('Window', 'Maximized', IniBoolStr(Maxed));
             Ini.WriteFloat('Window', 'SplitterPos', Split);
             WriteSide(Ini, 'LeftPanel', LeftS);
             WriteSide(Ini, 'RightPanel', RightS);
             if not Seed then
-            begin
-              Ini.WriteInteger('Dock', 'Count', Length(Items));
-              for I := 0 to High(Items) do
-              begin
-                Ini.WriteString('Dock', 'Item' + IntToStr(I), Items[I]);
-                if I <= High(Xs) then
-                  Ini.WriteFloat('Dock', 'X' + IntToStr(I), Xs[I])
-                else
-                  Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
-                if I <= High(Kinds) then
-                  Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), Kinds[I])
-                else
-                  Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), -1);
-                if I <= High(Caps) then
-                  Ini.WriteString('Dock', 'Caption' + IntToStr(I), Caps[I])
-                else
-                  Ini.WriteString('Dock', 'Caption' + IntToStr(I), '');
-                if I <= High(Icons) then
-                  Ini.WriteString('Dock', 'Icon' + IntToStr(I), Icons[I])
-                else
-                  Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
-                if (I <= High(Locks)) and Locks[I] then
-                  Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '1')
-                else
-                  Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
-              end;
-            end;
-          finally
-            Ini.Free;
-          end;
-        except
-        end;
-      finally
-        GSettingsSaveLock.Leave;
+              WriteDockKeys(Ini, False, 0, False, Items, Xs, Kinds, Caps, Icons, Locks);
+          end);
+      except
       end;
     end).Start;
 end;
 
-function SettingsBoolStr(B: Boolean): string;
-begin
-  if B then
-    Result := '1'
-  else
-    Result := '0';
-end;
-
 procedure TAppSettings.SaveSearchHistory;
 var
-  Ini: TIniFile;
+  Fn, Hist: string;
 begin
-  if GSettingsSaveLock <> nil then
-    GSettingsSaveLock.Enter;
-  try
-    Ini := TIniFile.Create(FFileName);
-    try
-      Ini.WriteString('Main', 'SearchHistory', string.Join(#9, SearchHistory));
-    finally
-      Ini.Free;
-    end;
-  finally
-    if GSettingsSaveLock <> nil then
-      GSettingsSaveLock.Leave;
-  end;
+  Fn := FFileName;
+  Hist := string.Join(#9, SearchHistory);
+  UpdateIni(Fn,
+    procedure(Ini: TCustomIniFile)
+    begin
+      Ini.WriteString('Main', 'SearchHistory', Hist);
+    end);
 end;
 
 procedure TAppSettings.SaveDockAsync;
@@ -971,65 +1157,153 @@ begin
 
   TThread.CreateAnonymousThread(
     procedure
-    var
-      Ini: TIniFile;
-      I: Integer;
     begin
-      if GSettingsSaveLock = nil then
-        Exit;
-      GSettingsSaveLock.Enter;
       try
-        Ini := TIniFile.Create(Fn);
-        try
-          Ini.WriteInteger('Dock', 'Align', AlignOrd);
-          Ini.WriteString('Dock', 'ShowSeps', SettingsBoolStr(Seps));
-          Ini.WriteInteger('Dock', 'Count', Length(Items));
-          for I := 0 to High(Items) do
+        UpdateIni(Fn,
+          procedure(Ini: TCustomIniFile)
           begin
-            Ini.WriteString('Dock', 'Item' + IntToStr(I), Items[I]);
-            if I <= High(Xs) then
-              Ini.WriteFloat('Dock', 'X' + IntToStr(I), Xs[I])
-            else
-              Ini.WriteFloat('Dock', 'X' + IntToStr(I), 0);
-            if I <= High(Kinds) then
-              Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), Kinds[I])
-            else
-              Ini.WriteInteger('Dock', 'Kind' + IntToStr(I), -1);
-            if I <= High(Caps) then
-              Ini.WriteString('Dock', 'Caption' + IntToStr(I), Caps[I])
-            else
-              Ini.WriteString('Dock', 'Caption' + IntToStr(I), '');
-            if I <= High(Icons) then
-              Ini.WriteString('Dock', 'Icon' + IntToStr(I), Icons[I])
-            else
-              Ini.WriteString('Dock', 'Icon' + IntToStr(I), '');
-            if (I <= High(Locks)) and Locks[I] then
-              Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '1')
-            else
-              Ini.WriteString('Dock', 'IconLock' + IntToStr(I), '0');
-          end;
-        finally
-          Ini.Free;
-        end;
-      finally
-        GSettingsSaveLock.Leave;
+            WriteDockKeys(Ini, True, AlignOrd, Seps, Items, Xs, Kinds, Caps,
+              Icons, Locks);
+          end);
+      except
       end;
     end).Start;
 end;
 
 
-procedure TAppSettings.SaveAsync;
+function TAppSettings.PrefsDirty: Boolean;
 begin
-  { Данные уже в полях Self; пишем под тем же lock, что и Save. }
-  TThread.CreateAnonymousThread(
-    procedure
-    begin
+  if FPrefsLock = nil then
+    Exit(FPrefsDirty);
+  FPrefsLock.Enter;
+  try
+    Result := FPrefsDirty or FPrefsWorker or (FPending <> nil);
+  finally
+    FPrefsLock.Leave;
+  end;
+end;
+
+procedure TAppSettings.MarkPrefsDirty;
+begin
+  if FPrefsLock = nil then
+  begin
+    FPrefsDirty := True;
+    Exit;
+  end;
+  FPrefsLock.Enter;
+  try
+    FPrefsDirty := True;
+  finally
+    FPrefsLock.Leave;
+  end;
+end;
+
+procedure TAppSettings.PrefsWorker;
+var
+  Snap: TPrefsSnap;
+  OK, Again: Boolean;
+begin
+  try
+    repeat
+      FPrefsLock.Enter;
       try
-        SaveSettings;
-      except
-        { диск/права — не роняем UI }
+        Snap := TPrefsSnap(FPending);
+        FPending := nil;
+      finally
+        FPrefsLock.Leave;
       end;
-    end).Start;
+      OK := Snap = nil;
+      if Snap <> nil then
+      begin
+        try
+          try
+            WritePrefs(Snap);
+            OK := True;
+          except
+            OK := False;
+          end;
+        finally
+          Snap.Free;
+        end;
+      end;
+      FPrefsLock.Enter;
+      try
+        Again := FPending <> nil;
+        if not Again then
+        begin
+          FPrefsWorker := False;
+          if OK then
+            FPrefsDirty := False;
+          if FPrefsEvent <> nil then
+            FPrefsEvent.SetEvent;
+        end;
+      finally
+        FPrefsLock.Leave;
+      end;
+    until not Again;
+  except
+    if FPrefsLock <> nil then
+    begin
+      FPrefsLock.Enter;
+      try
+        FPrefsWorker := False;
+        if FPrefsEvent <> nil then
+          FPrefsEvent.SetEvent;
+      finally
+        FPrefsLock.Leave;
+      end;
+    end;
+  end;
+end;
+
+procedure TAppSettings.SaveAsync;
+var
+  Snap: TPrefsSnap;
+  Start: Boolean;
+begin
+  Snap := CapturePrefs(Self);
+  if FPrefsLock = nil then
+  begin
+    try
+      WritePrefs(Snap);
+    finally
+      Snap.Free;
+    end;
+    FPrefsDirty := False;
+    Exit;
+  end;
+  FPrefsLock.Enter;
+  try
+    FPending.Free;
+    FPending := Snap;
+    FPrefsDirty := True;
+    Start := not FPrefsWorker;
+    FPrefsWorker := True;
+    if FPrefsEvent <> nil then
+      FPrefsEvent.ResetEvent;
+  finally
+    FPrefsLock.Leave;
+  end;
+  if Start then
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        PrefsWorker;
+      end).Start;
+end;
+
+procedure TAppSettings.FlushPrefs;
+begin
+  if not PrefsDirty then
+    Exit;
+  SaveAsync;
+  if FPrefsEvent <> nil then
+    FPrefsEvent.WaitFor(4000);
+  if PrefsDirty then
+  try
+    SaveSettings;
+  except
+  end;
 end;
 
 

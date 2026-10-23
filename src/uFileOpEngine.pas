@@ -72,6 +72,9 @@ type
     FAutoRename: Boolean;
     FOverwriteOlder: Boolean;
     FErrorList: TStringList;
+    FElevate: TStringList;
+    FElevateFiles: TList<Integer>;
+    FElevateCancelled: Boolean;
     FFatal: Boolean;
     FConflict: TFileOpConflictInfo;
     FConflictChoice: TConflictChoice;
@@ -91,9 +94,12 @@ type
     procedure ProcessPath(const ASrc, ADestDir: string);
     function CopyOneFile(const ASrc, ADst: string): Boolean;
     procedure CopyOneDir(const ASrc, ADst: string; AMove: Boolean);
-    procedure DeleteTree(const APath: string);
     procedure NoteError(const APath, AMsg: string);
     procedure IncDone;
+    procedure AddDoneCount(ACount: Integer);
+    procedure HoldDelete(const APath: string; AFiles: Integer);
+    procedure DeleteDiskRoot(const ASrc: string);
+    procedure FlushElevate;
     procedure IncSkipped;
     function CountFilesQuick(const APath: string): Integer;
     function TryRemoveEmptyDir(const APath: string): Boolean;
@@ -555,6 +561,8 @@ begin
   FPauseEvent := TEvent.Create(nil, True, True, '');
   FConflictEvent := TEvent.Create(nil, False, False, '');
   FErrorList := TStringList.Create;
+  FElevate := TStringList.Create;
+  FElevateFiles := TList<Integer>.Create;
   FSnap.Kind := AKind;
   FSnap.Phase := opIdle;
   FSnap.DestPath := ADest;
@@ -571,6 +579,8 @@ begin
   end;
   FreeAndNil(FConflictEvent);
   FreeAndNil(FPauseEvent);
+  FreeAndNil(FElevateFiles);
+  FreeAndNil(FElevate);
   FreeAndNil(FErrorList);
   FreeAndNil(FLock);
   inherited;
@@ -855,6 +865,24 @@ begin
   until not TFile.Exists(Result) and not TDirectory.Exists(Result);
 end;
 
+procedure EmitLive(AKind: TLiveOpKind; const ASrc, ADst: string;
+  AOk, AIsDir: Boolean; ASize: Int64; AModified: TDateTime);
+var
+  Info: TLiveOpInfo;
+begin
+  if not AOk then
+    Exit;
+  Info := Default(TLiveOpInfo);
+  Info.Kind := AKind;
+  Info.Source := ASrc;
+  Info.Dest := ADst;
+  Info.Ok := True;
+  Info.IsDir := AIsDir;
+  Info.Size := ASize;
+  Info.Modified := AModified;
+  PublishLiveOp(Info);
+end;
+
 procedure TFileOpEngine.NoteError(const APath, AMsg: string);
 begin
   FLock.Enter;
@@ -866,15 +894,117 @@ begin
   finally
     FLock.Leave;
   end;
+  ProbeLivePath(APath);
 end;
 
 procedure TFileOpEngine.IncDone;
 begin
+  AddDoneCount(1);
+end;
+
+procedure TFileOpEngine.AddDoneCount(ACount: Integer);
+begin
+  if ACount < 1 then
+    Exit;
   FLock.Enter;
   try
-    Inc(FSnap.FilesDone);
+    Inc(FSnap.FilesDone, ACount);
+    if (FSnap.FilesTotal > 0) and (FSnap.FilesDone > FSnap.FilesTotal) then
+      FSnap.FilesDone := FSnap.FilesTotal;
   finally
     FLock.Leave;
+  end;
+end;
+
+procedure TFileOpEngine.HoldDelete(const APath: string; AFiles: Integer);
+begin
+  if (APath = '') or (FElevate = nil) or (FElevateFiles = nil) then
+    Exit;
+  if AFiles < 1 then
+    AFiles := 1;
+  FElevate.Add(APath);
+  FElevateFiles.Add(AFiles);
+end;
+
+procedure TFileOpEngine.DeleteDiskRoot(const ASrc: string);
+var
+  N: Integer;
+  Code: Cardinal;
+  Err: string;
+  Step: TDiskDeleteStep;
+begin
+  N := CountFilesQuick(ASrc);
+  if N <= 0 then
+    N := 1;
+  Code := 0;
+  Err := '';
+  if TrySilentDiskDelete(ASrc, FPermanent, Code) then
+    Step := ddsGone
+  else
+    Step := AfterSilentDiskDelete(ASrc, FPermanent, Code, Err);
+  case Step of
+    ddsGone:
+      begin
+        EmitLive(lokDelete, ASrc, '', True, False, -1, 0);
+        AddDoneCount(N);
+      end;
+    ddsElevate:
+      HoldDelete(ASrc, N);
+    ddsFailed:
+      begin
+        if Err = '' then
+          Err := L('op.noaccess');
+        NoteError(ASrc, Err);
+      end;
+  end;
+end;
+
+procedure TFileOpEngine.FlushElevate;
+var
+  I, N: Integer;
+  Paths: TArray<string>;
+  Cancelled: Boolean;
+  Err: string;
+begin
+  if (FElevate = nil) or (FElevate.Count = 0) then
+    Exit;
+  SetLength(Paths, FElevate.Count);
+  for I := 0 to FElevate.Count - 1 do
+    Paths[I] := FElevate[I];
+  Cancelled := False;
+  Err := '';
+  if not ElevateDeniedDeletes(Paths, FPermanent, Cancelled, Err) then
+  begin
+    for I := 0 to High(Paths) do
+      if not DeleteTargetRemains(Paths[I]) then
+      begin
+        EmitLive(lokDelete, Paths[I], '', True, False, -1, 0);
+        if I < FElevateFiles.Count then
+          N := FElevateFiles[I]
+        else
+          N := 1;
+        AddDoneCount(N);
+      end;
+    if Cancelled then
+    begin
+      FElevateCancelled := True;
+      Exit;
+    end;
+    if Err = '' then
+      Err := L('op.noaccess');
+    for I := 0 to High(Paths) do
+      if DeleteTargetRemains(Paths[I]) then
+        NoteError(Paths[I], Err);
+    Exit;
+  end;
+  for I := 0 to High(Paths) do
+  begin
+    EmitLive(lokDelete, Paths[I], '', True, False, -1, 0);
+    if I < FElevateFiles.Count then
+      N := FElevateFiles[I]
+    else
+      N := 1;
+    AddDoneCount(N);
   end;
 end;
 
@@ -894,6 +1024,8 @@ var
   S: TOpItemStatus;
   Cb: TFileOpItemDoneProc;
 begin
+  if (AStatus in [oisError, oisSkipped]) and (APath <> '') then
+    ProbeLivePath(APath);
   if not Assigned(OnItemDone) or (APath = '') then
     Exit;
   P := APath;
@@ -1154,6 +1286,8 @@ var
   Choice: TConflictChoice;
   Dest: string;
   Err: Cardinal;
+  LiveTime: TDateTime;
+  LiveKind: TLiveOpKind;
 {$IFDEF MSWINDOWS}
   HIn, HOut: THandle;
 {$ENDIF}
@@ -1306,6 +1440,16 @@ begin
     except
     end;
     Result := True;
+    try
+      LiveTime := TFile.GetLastWriteTime(Dest);
+    except
+      LiveTime := 0;
+    end;
+    if FKind = okMove then
+      LiveKind := lokMove
+    else
+      LiveKind := lokCopy;
+    EmitLive(LiveKind, ASrc, Dest, True, False, Total, LiveTime);
     NotifyItem(ASrc, oisOk);
   except
     on E: EAbort do
@@ -1358,6 +1502,10 @@ begin
     end;
   end;
   ForceDirectories(Dest);
+  if AMove then
+    EmitLive(lokMove, ASrc, Dest, True, True, 0, 0)
+  else
+    EmitLive(lokCopy, ASrc, Dest, True, True, 0, 0);
   try
     for F in TDirectory.GetFiles(ASrc) do
     begin
@@ -1393,48 +1541,6 @@ begin
       NoteError(ASrc, E.Message);
       if FFatal then
         raise;
-    end;
-  end;
-end;
-
-procedure TFileOpEngine.DeleteTree(const APath: string);
-var
-  F, D: string;
-  Sz: Int64;
-begin
-  CheckWait;
-  Publish(APath, 0, 0);
-  if TDirectory.Exists(APath) then
-  begin
-    try
-      for F in TDirectory.GetFiles(APath) do
-        DeleteTree(F);
-      for D in TDirectory.GetDirectories(APath) do
-        DeleteTree(D);
-      TryRemoveEmptyDir(APath);
-    except
-      on E: EAbort do
-        raise;
-      on E: Exception do
-        NoteError(APath, E.Message);
-    end;
-  end
-  else if TFile.Exists(APath) then
-  begin
-    Sz := 0;
-    try
-      Sz := TFile.GetSize(APath);
-    except
-    end;
-    try
-      ClearReadonly(APath);
-      TFile.Delete(APath);
-      IncDone;
-      if Sz > 0 then
-        AddBytes(Sz);
-    except
-      on E: Exception do
-        NoteError(APath, E.Message);
     end;
   end;
 end;
@@ -1496,7 +1602,7 @@ end;
 procedure TFileOpEngine.ProcessPath(const ASrc, ADestDir: string);
 var
   Name, Dst: string;
-  Moved: Boolean;
+  Moved, WasDir, DiskDelete: Boolean;
   N: Integer;
   Sz: Int64;
 begin
@@ -1563,25 +1669,32 @@ begin
     Exit;
   end;
 
-  if not TFile.Exists(ASrc) and not TDirectory.Exists(ASrc) then
+  { Диск удаляем тихой оболочкой даже если ACL прячет атрибуты. }
+  DiskDelete := False;
+  if FKind = okDelete then
+    DiskDelete := DiskDeleteTarget(ASrc);
+  if not DiskDelete then
   begin
-    try
-      if Assigned(FSpecialCopy) and (FKind in [okCopy, okMove, okArchive]) then
-      begin
-        FSpecialCopy(ASrc, ADestDir);
-        if (FKind = okMove) and not FCancel then
-          DeletePathSync(ASrc, True);
-      end
-      else if Assigned(FSpecialCopy) and (FKind = okDelete) then
-        FSpecialCopy(ASrc, '');
-      IncDone;
-    except
-      on E: EAbort do
-        raise;
-      on E: Exception do
-        NoteError(ASrc, E.Message);
+    if not TFile.Exists(ASrc) and not TDirectory.Exists(ASrc) then
+    begin
+      try
+        if Assigned(FSpecialCopy) and (FKind in [okCopy, okMove, okArchive]) then
+        begin
+          FSpecialCopy(ASrc, ADestDir);
+          if (FKind = okMove) and not FCancel then
+            DeletePathSync(ASrc, True);
+        end
+        else if Assigned(FSpecialCopy) and (FKind = okDelete) then
+          FSpecialCopy(ASrc, '');
+        IncDone;
+      except
+        on E: EAbort do
+          raise;
+        on E: Exception do
+          NoteError(ASrc, E.Message);
+      end;
+      Exit;
     end;
-    Exit;
   end;
 
   case FKind of
@@ -1604,9 +1717,11 @@ begin
             Sz := TFile.GetSize(ASrc);
           except
           end;
+          WasDir := TDirectory.Exists(ASrc);
           Moved := RenameFile(ASrc, Dst);
           if Moved then
           begin
+            EmitLive(lokMove, ASrc, Dst, True, WasDir, Sz, 0);
             if N <= 0 then
               N := 1;
             FLock.Enter;
@@ -1639,34 +1754,22 @@ begin
     okDelete:
       begin
         Publish(ASrc, 0, 0);
-        if not FPermanent then
+        if DiskDeleteTarget(ASrc) then
+          DeleteDiskRoot(ASrc)
+        else
         begin
           N := CountFilesQuick(ASrc);
-          Sz := 0;
-          if TFile.Exists(ASrc) then
+          if N <= 0 then
+            N := 1;
           try
-            Sz := TFile.GetSize(ASrc);
-          except
-          end;
-          try
-            DeletePathSync(ASrc, False);
-            if N <= 0 then
-              N := 1;
-            FLock.Enter;
-            try
-              Inc(FSnap.FilesDone, N);
-            finally
-              FLock.Leave;
-            end;
-            if Sz > 0 then
-              AddBytes(Sz);
+            DeletePathSync(ASrc, FPermanent);
+            EmitLive(lokDelete, ASrc, '', True, False, -1, 0);
+            AddDoneCount(N);
           except
             on E: Exception do
               NoteError(ASrc, E.Message);
           end;
-        end
-        else
-          DeleteTree(ASrc);
+        end;
       end;
     okArchive:
       begin
@@ -1695,6 +1798,11 @@ var
 begin
   Ok := True;
   Err := '';
+  FElevateCancelled := False;
+  if FElevate <> nil then
+    FElevate.Clear;
+  if FElevateFiles <> nil then
+    FElevateFiles.Clear;
   SetArchiveHooks(
     procedure(const AName: string; ADelta, AFileSize: Int64)
     begin
@@ -1793,9 +1901,23 @@ begin
         end;
       end;
     end;
+    if (FKind = okDelete) and (FElevate <> nil) and (FElevate.Count > 0) then
+    begin
+      if FCancel then
+        Abort
+      else
+        FlushElevate;
+    end;
     FLock.Enter;
     try
-      if FSnap.Errors > 0 then
+      if FElevateCancelled and (FSnap.Errors = 0) then
+      begin
+        Ok := False;
+        Err := L('op.cancelled');
+        FSnap.Phase := opCancel;
+        FSnap.Status := Err;
+      end
+      else if FSnap.Errors > 0 then
       begin
         Ok := False;
         Err := Lf('op.errors', [FSnap.Errors]);
