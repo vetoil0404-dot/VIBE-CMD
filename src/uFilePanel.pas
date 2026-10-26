@@ -83,9 +83,12 @@ type
     RefreshPending: Boolean;
     PendingSelect: string;
     PendingKeepSel: Boolean;
+    PendingHoldScroll: Boolean;
     Offline: Boolean;
     WaitShared: Boolean;
     KeepLive: Boolean;
+    { Обновление каталога наблюдателем: не прокручивать к курсору. }
+    HoldScroll: Boolean;
   end;
 
   TFilePanel = class(TLayout, ISelectionAdapter)
@@ -197,6 +200,14 @@ type
     FParentRetryRect: TRectF;
     FRefreshPending: Boolean;
     FKeepLiveNext: Boolean;
+    FHoldScrollNext: Boolean;
+    FSuppressKeepFocus: Integer;
+    { Пока каталог обновляется сам: не возвращать вид к курсору. }
+    FLockScroll: Boolean;
+    FLockScrollY: Single;
+    FLockGen: Integer;
+    FRestoringScroll: Boolean;
+    FApplyingList: Integer;
     FPendingCursorIndex: Integer;
     FPendingRenamePath: string;
     FHistoryClearSel: Boolean;
@@ -309,6 +320,8 @@ type
     procedure GetTileLayout(AWidth: Single; out ACols, ATS: Integer;
       out ATileH, ASlotW, APadX: Single);
     procedure KeepFocusVisible;
+    procedure LockScrollPosition;
+    procedure RestoreScrollPosition;
     function GetCurrentPathImpl: string;
     function EntrySizeText(const AEntry: TFileEntry): string;
     function IsManualSizeRow(const AEntry: TFileEntry): Boolean;
@@ -1406,7 +1419,7 @@ begin
   begin
     UpdateStatusText;
     RebuildContent;
-    if Assigned(FSelectionManager) then
+    if Assigned(FSelectionManager) and (FSuppressKeepFocus = 0) then
       EnsureIndexVisible(FSelectionManager.CurrentIndex);
     InvalidateView;
   end;
@@ -4278,7 +4291,10 @@ procedure TFilePanel.ScrollBoxResize(Sender: TObject);
 begin
   FColLayoutW := -1;
   RebuildContent;
-  KeepFocusVisible;
+  { Ресайз от перестройки списка не должен тянуть курсор в кадр.
+    Окно пользователь меняет сам — тогда вид тоже оставляем где был. }
+  if FLockScroll then
+    RestoreScrollPosition;
   FThumbDirty := True;
   FThumbMoveTick := TThread.GetTickCount64;
   if Assigned(FThumbTimer) and not FDestroying then
@@ -4296,6 +4312,12 @@ end;
 procedure TFilePanel.ScrollBoxViewportPositionChange(Sender: TObject;
   const OldViewportPosition, NewViewportPosition: TPointF; const ContentSizeChanged: Boolean);
 begin
+  { Сдвиг от пользователя снимает удержание. Сброс при перестройке списка — нет. }
+  if not FRestoringScroll and (FApplyingList = 0) then
+  begin
+    FLockScroll := False;
+    Inc(FLockGen);
+  end;
   FScrollTick := GetTickCount;
   FThumbDirty := True;
   FThumbMoveTick := TThread.GetTickCount64;
@@ -5767,10 +5789,45 @@ end;
 
 procedure TFilePanel.KeepFocusVisible;
 begin
-  if FDestroying or not Assigned(FSelectionManager) then
+  if FLockScroll or (FSuppressKeepFocus > 0) or FDestroying or
+     not Assigned(FSelectionManager) then
     Exit;
   if FSelectionManager.CurrentIndex >= 0 then
     EnsureIndexVisible(FSelectionManager.CurrentIndex);
+end;
+
+procedure TFilePanel.LockScrollPosition;
+var
+  SB: TVertScrollBox;
+begin
+  SB := CurrentScrollBox;
+  if SB = nil then
+    Exit;
+  FLockScrollY := SB.ViewportPosition.Y;
+  FLockScroll := True;
+  Inc(FLockGen);
+end;
+
+procedure TFilePanel.RestoreScrollPosition;
+var
+  SB: TVertScrollBox;
+  MaxV, Y: Single;
+begin
+  if not FLockScroll then
+    Exit;
+  SB := CurrentScrollBox;
+  if SB = nil then
+    Exit;
+  MaxV := Max(0, SB.ContentBounds.Height - SB.Height);
+  Y := EnsureRange(FLockScrollY, 0, MaxV);
+  if Abs(SB.ViewportPosition.Y - Y) <= 0.5 then
+    Exit;
+  FRestoringScroll := True;
+  try
+    SB.ViewportPosition := TPointF.Create(SB.ViewportPosition.X, Y);
+  finally
+    FRestoringScroll := False;
+  end;
 end;
 
 procedure TFilePanel.DoAddTab(const APath: string; Activate: Boolean);
@@ -5808,6 +5865,10 @@ begin
   SB.Align := TAlignLayout.Client;
   SB.ShowScrollBars := False;
   SB.AniCalculations.AutoShowing := False;
+  { Иначе после колеса/ползунка анимация через пару секунд возвращает
+    вид к последней программной позиции — к файлу под курсором. }
+  SB.AniCalculations.Animation := False;
+  SB.AniCalculations.BoundsAnimation := False;
   SB.OnMouseWheel := PanelMouseWheel;
   SB.OnResize := ScrollBoxResize;
   SB.OnApplyStyleLookup := ScrollBoxApplyStyle;
@@ -6608,7 +6669,10 @@ end;
 procedure TFilePanel.Refresh(const ASelectPath: string; AKeepSelection: Boolean);
 var
   Path: string;
+  Hold: Boolean;
 begin
+  Hold := FHoldScrollNext;
+  FHoldScrollNext := False;
   if FDestroying then Exit;
   FLogonHold := False;
   if IsSearchView then
@@ -6662,6 +6726,17 @@ begin
   else
     FPendingCursorIndex := 0;
 
+  if not Hold and (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) then
+  begin
+    var TClear := FTabs[FActiveTabIndex];
+    if TClear.HoldScroll then
+    begin
+      TClear.HoldScroll := False;
+      FTabs[FActiveTabIndex] := TClear;
+    end;
+  end;
+
+  FHoldScrollNext := Hold;
   StartDirLoad(Path, ASelectPath, AKeepSelection);
 end;
 
@@ -6813,6 +6888,7 @@ begin
   Tab.Loading := False;
   Tab.LoadQueued := False;
   Tab.RefreshPending := False;
+  Tab.PendingHoldScroll := False;
   Tab.PendingSelect := '';
   Tab.PendingKeepSel := False;
   Tab.LoadPath := '';
@@ -6860,6 +6936,9 @@ begin
     Keep := Tab.PendingKeepSel;
     Tab.PendingSelect := '';
     Tab.PendingKeepSel := False;
+    if Tab.PendingHoldScroll then
+      FHoldScrollNext := True;
+    Tab.PendingHoldScroll := False;
     FTabs[ATabIndex] := Tab;
     if ATabIndex = FActiveTabIndex then
       FRefreshPending := False;
@@ -7733,6 +7812,10 @@ begin
     Exit;
   end;
   Tab := FTabs[ATabIndex];
+  if FHoldScrollNext then
+    Tab.HoldScroll := True;
+  FHoldScrollNext := False;
+  FTabs[ATabIndex] := Tab;
   if Remote and PathReadBusy(Path) then
   begin
     Tab.Loading := ATabIndex = FActiveTabIndex;
@@ -7768,6 +7851,7 @@ begin
         FKeepLiveNext := False;
       end;
       Tab.RefreshPending := True;
+      Tab.PendingHoldScroll := Tab.HoldScroll;
       if ASelectPath <> '' then
         Tab.PendingSelect := ASelectPath;
       Tab.PendingKeepSel := Tab.PendingKeepSel or AKeepSelection;
@@ -10706,6 +10790,12 @@ begin
   SB := CurrentScrollBox;
   if SB = nil then Exit;
 
+  if not (ssCtrl in Shift) then
+  begin
+    FLockScroll := False;
+    Inc(FLockGen);
+  end;
+
   if ssCtrl in Shift then
   begin
     var CurZoom := ZoomPercent;
@@ -11662,7 +11752,8 @@ end;
 
 procedure TFilePanel.PanelonResize(Sender: TObject);
 begin
-  KeepFocusVisible;
+  if FLockScroll then
+    RestoreScrollPosition;
 end;
 
 function TFilePanel.GetFocusedEntry(out AEntry: TFileEntry): Boolean;
@@ -13809,6 +13900,8 @@ begin
         if IsBrowsablePath(Cur) then
         begin
           FKeepLiveNext := True;
+          FHoldScrollNext := True;
+          LockScrollPosition;
           Refresh('', True);
         end
         else
@@ -13817,6 +13910,8 @@ begin
       end;
     end;
     FKeepLiveNext := True;
+    FHoldScrollNext := True;
+    LockScrollPosition;
     Refresh('', True);
     Exit;
   end;
@@ -13827,6 +13922,8 @@ begin
     if (FKeepSelFocus = '') then
       FKeepSelFocus := FTabs[InactiveLoadIdx].CursorPath;
     FKeepLiveNext := True;
+    FHoldScrollNext := True;
+    LockScrollPosition;
     StartDirLoadAt(InactiveLoadIdx, FTabs[InactiveLoadIdx].Path, '', True);
   end;
 end;
@@ -13925,6 +14022,8 @@ var
   Focus: string;
   Seen: TDictionary<string, Boolean>;
   Pin: TFileEntry;
+  HoldScroll: Boolean;
+  Locked: Boolean;
 begin
   if List = nil then
     Exit;
@@ -13957,6 +14056,16 @@ begin
     NoteOpenedUnc(APath);
 
   Tab := FTabs[TargetIdx];
+  HoldScroll := Tab.HoldScroll;
+  Tab.HoldScroll := False;
+  FTabs[TargetIdx] := Tab;
+  if HoldScroll or FLockScroll then
+    LockScrollPosition;
+  Locked := FLockScroll;
+  if HoldScroll then
+    Inc(FSuppressKeepFocus);
+  Inc(FApplyingList);
+  try
   if APartial then
     SortEntries(List, sfName, True)
   else
@@ -14010,11 +14119,13 @@ begin
         ApplyCursorAfterLoad(Tab.Entries, ASelectPath, False);
         if FNameFilter <> '' then
           CommitNameFilter(False)
-        else
+        else if not HoldScroll then
         begin
           KeepFocusVisible;
           InvalidateView;
-        end;
+        end
+        else
+          InvalidateView;
       end;
       NotifyCursorChange;
       RefreshThumbs;
@@ -14055,7 +14166,8 @@ begin
     begin
       UpdateStatusText;
       RebuildContent;
-      KeepFocusVisible;
+      if not HoldScroll then
+        KeepFocusVisible;
     end;
     NotifyCursorChange;
     if not APartial then
@@ -14090,6 +14202,25 @@ begin
       Tab.CursorPath := Focus;
     Tab.CursorIndex := IndexFromCursorPath(Tab);
     FTabs[TargetIdx] := Tab;
+  end;
+  finally
+    Dec(FApplyingList);
+    if HoldScroll then
+      Dec(FSuppressKeepFocus);
+    if Locked then
+    begin
+      RestoreScrollPosition;
+      var Gen := FLockGen;
+      TThread.ForceQueue(nil,
+        procedure
+        begin
+          if FDestroying or (FLockGen <> Gen) then
+            Exit;
+          RestoreScrollPosition;
+          if FLockGen = Gen then
+            FLockScroll := False;
+        end);
+    end;
   end;
 end;
 

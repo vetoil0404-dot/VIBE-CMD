@@ -24,6 +24,9 @@ function IsDriveRoot(const APath: string): Boolean;
 function DriveMemoryKey(const APath: string): string;
 function ComputerFolderPath: string;
 function DisplayNameForPath(const APath: string): string;
+{ Цепочка как в крошках: «Этот компьютер > D90 > DCIM», не parsing-имя. }
+function FriendlyFolderPath(const APath: string): string;
+function TryShellItemSize(const APath: string; out ASize: Int64): Boolean;
 function IsArchiveExt(const AExt: string): Boolean;
 function IsArchiveFileName(const AName: string): Boolean;
 function IsOfficeLockFile(const APath: string): Boolean;
@@ -906,6 +909,33 @@ begin
     AEntry.Modified := FileTimeToLocalDT(FT);
 end;
 
+function TryShellItemSize(const APath: string; out ASize: Int64): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Item: IShellItem;
+  Item2: IShellItem2;
+  Sz: ULONGLONG;
+{$ENDIF}
+begin
+  ASize := 0;
+  Result := False;
+  if APath = '' then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  if not IsVirtualShellPath(APath) then
+    Exit;
+  if not TryCreateShellItem(APath, Item) then
+    Exit;
+  if not Supports(Item, IShellItem2, Item2) then
+    Exit;
+  Sz := 0;
+  if Failed(Item2.GetUInt64(PKEY_ItemSize, Sz)) or (Sz = 0) then
+    Exit;
+  ASize := Int64(Sz);
+  Result := True;
+  {$ENDIF}
+end;
+
 procedure ApplyRecycleProps(const AItem: IShellItem; var AEntry: TFileEntry);
 const
   PKEY_DeletedFrom: TPropertyKey = (
@@ -981,6 +1011,72 @@ begin
     else
       Result := APath;
   end;
+end;
+
+var
+  GFriendlyRaw: string;
+  GFriendlyText: string;
+
+function FriendlyFolderPath(const APath: string): string;
+var
+  Acc, Name, Parent, Leaf: string;
+  Parts: TArray<string>;
+  N, Guard: Integer;
+  {$IFDEF MSWINDOWS}
+  Item: IShellItem;
+  {$ENDIF}
+begin
+  if SameText(APath, GFriendlyRaw) then
+    Exit(GFriendlyText);
+  Leaf := ExcludeTrailingPathDelimiter(Trim(APath));
+  if Leaf = '' then
+  begin
+    GFriendlyRaw := APath;
+    GFriendlyText := '';
+    Exit('');
+  end;
+  if not IsVirtualShellPath(APath) then
+  begin
+    if IsDriveRoot(APath) then
+      Result := IncludeTrailingPathDelimiter(APath)
+    else
+      Result := Leaf;
+    GFriendlyRaw := APath;
+    GFriendlyText := Result;
+    Exit;
+  end;
+  Result := Leaf;
+  {$IFDEF MSWINDOWS}
+  if not TryCreateShellItem(APath, Item) then
+    Exit;
+  Item := nil;
+  SetLength(Parts, 0);
+  Acc := Leaf;
+  Guard := 0;
+  while (Acc <> '') and (Guard < 24) do
+  begin
+    Inc(Guard);
+    Name := DisplayNameForPath(Acc);
+    if Name = '' then
+      Break;
+    SetLength(Parts, Length(Parts) + 1);
+    Parts[High(Parts)] := Name;
+    if IsThisPCPath(Acc) then
+      Break;
+    Parent := ParentOfBrowsablePath(Acc);
+    if (Parent = '') or SameText(ExcludeTrailingPathDelimiter(Parent), Acc) then
+      Break;
+    Acc := ExcludeTrailingPathDelimiter(Parent);
+  end;
+  if Length(Parts) > 0 then
+  begin
+    Result := Parts[High(Parts)];
+    for N := High(Parts) - 1 downto 0 do
+      Result := Result + ' > ' + Parts[N];
+  end;
+  {$ENDIF}
+  GFriendlyRaw := APath;
+  GFriendlyText := Result;
 end;
 
 function IsArchiveExt(const AExt: string): Boolean;

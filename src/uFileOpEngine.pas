@@ -32,6 +32,9 @@ type
     FileBytesTotal: Int64;
     TotalBytesDone: Int64;
     TotalBytesTotal: Int64;
+    { Реальная сумма размеров. 0 — ещё не посчитано или оболочка размер не дала.
+      TotalBytesTotal при нуле подменяется числом файлов для полосы прогресса. }
+    MeasuredBytes: Int64;
     SpeedBps: Double;
     RemainingSec: Double;
     Errors: Integer;
@@ -798,6 +801,13 @@ begin
   begin
     Inc(AFiles, Af);
     Inc(ABytes, Ab);
+  end
+  else if IsVirtualShellPath(APath) then
+  begin
+    var Sz: Int64;
+    Inc(AFiles);
+    if TryShellItemSize(APath, Sz) then
+      Inc(ABytes, Sz);
   end
   else if not IsRemotePath(APath) then
     Inc(AFiles);
@@ -1840,6 +1850,7 @@ begin
     FLock.Enter;
     try
       FSnap.FilesTotal := Files;
+      FSnap.MeasuredBytes := Bytes;
       FSnap.TotalBytesTotal := Bytes;
       if Bytes = 0 then
         FSnap.TotalBytesTotal := Files;

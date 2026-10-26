@@ -73,6 +73,7 @@ type
     FConfBody: TLayout;
     FConfIcon: TText;
     FConfAskTitle, FConfAskText: TText;
+    FConfAskBase: string;
     FConfFromCap, FConfFromPath: TText;
     FConfToCap, FConfToPath: TText;
     FConfMore: TText;
@@ -110,6 +111,7 @@ type
     procedure ConfPollTick(Sender: TObject);
     procedure ConfClick(Sender: TObject);
     procedure ShowConfirm(const P: TFileOpProgress);
+    procedure ApplyConfirmBytes(const P: TFileOpProgress);
     procedure HideDeleteConfirm;
     procedure LayoutConfirm;
     procedure ConfBodyResize(Sender: TObject);
@@ -613,19 +615,17 @@ begin
   if (J.State = jsBackground) and Assigned(J.Form) and
      Assigned(J.Form.FConfirm) and J.Form.FConfirm.Visible and not J.Form.FDeleteAsked then
     Exit(L('op.waitconfirm'));
-  if J.Progress.FileName <> '' then
+  if (J.Progress.SourcePath <> '') and IsVirtualShellPath(J.Progress.SourcePath) then
+    NamePart := DisplayNameForPath(J.Progress.SourcePath)
+  else if J.Progress.FileName <> '' then
     NamePart := J.Progress.FileName
   else if Length(J.Sources) = 1 then
-    NamePart := ExtractFileName(ExcludeTrailingPathDelimiter(J.Sources[0]))
+    NamePart := DisplayNameForPath(J.Sources[0])
   else
     NamePart := LCount(Length(J.Sources), 'op.files.one', 'op.files.few', 'op.files.many');
   DestPart := '';
   if J.Dest <> '' then
-  begin
-    DestPart := ExtractFileName(ExcludeTrailingPathDelimiter(J.Dest));
-    if DestPart = '' then
-      DestPart := ExcludeTrailingPathDelimiter(J.Dest);
-  end;
+    DestPart := DisplayNameForPath(J.Dest);
   if DestPart <> '' then
     Result := NamePart + ' · ' + DestPart
   else
@@ -1152,6 +1152,8 @@ begin
   FTimer.OnTimer := Tick;
   FTimer.Enabled := True;
   ShowConfirm(FEngine.GetProgress);
+  { Размер нужен ещё в вопросе, до кнопки «Копировать». }
+  FEngine.ScanAsync;
 end;
 
 destructor TFileOpProgressForm.Destroy;
@@ -1714,19 +1716,26 @@ begin
   end;
   Caption := FileOpKindCaption(P.Kind);
   if P.FileName <> '' then
-    FCurLbl.Text := Lf('op.currentfile', [P.FileName])
+  begin
+    if P.SourcePath <> '' then
+      FCurLbl.Text := Lf('op.currentfile', [DisplayNameForPath(P.SourcePath)])
+    else
+      FCurLbl.Text := Lf('op.currentfile', [P.FileName]);
+  end
   else
     FCurLbl.Text := L('op.current');
   if P.SourcePath <> '' then
-    FPaths.Text := Lf('op.frompath', [P.SourcePath])
+    FPaths.Text := Lf('op.frompath', [FriendlyFolderPath(P.SourcePath)])
   else
     FPaths.Text := L('op.from');
   if P.DestPath <> '' then
-    FToPath.Text := Lf('op.topath', [P.DestPath])
+    FToPath.Text := Lf('op.topath', [FriendlyFolderPath(P.DestPath)])
   else if FEngine.Dest <> '' then
-    FToPath.Text := Lf('op.topath', [FEngine.Dest])
+    FToPath.Text := Lf('op.topath', [FriendlyFolderPath(FEngine.Dest)])
   else
     FToPath.Text := L('op.to');
+  if Assigned(FConfirm) and FConfirm.Visible then
+    ApplyConfirmBytes(P);
   St := P.Status;
   if SameText(St, FileOpKindCaption(P.Kind)) or
      SameText(St, L('op.scan')) or StartsText(L('op.prepare'), St) then
@@ -2027,8 +2036,8 @@ begin
   SrcDir := TDirectory.Exists(AInfo.Source) and not TFile.Exists(AInfo.Source);
   DstDir := TDirectory.Exists(AInfo.Dest) and not TFile.Exists(AInfo.Dest);
 
-  FSrcName.Text := ExtractFileName(ExcludeTrailingPathDelimiter(AInfo.Source));
-  FDstName.Text := ExtractFileName(ExcludeTrailingPathDelimiter(AInfo.Dest));
+  FSrcName.Text := DisplayNameForPath(AInfo.Source);
+  FDstName.Text := DisplayNameForPath(AInfo.Dest);
   FSrcName.TagString := AInfo.Source;
   FDstName.TagString := AInfo.Dest;
 
@@ -2270,7 +2279,17 @@ begin
     FArchStem := ArchiveStem(FEngine.Dest);
   FEngine.SetDest(FArchStem + ArchiveExtOf(K));
   if Assigned(FConfToPath) then
-    FConfToPath.Text := FEngine.Dest;
+    FConfToPath.Text := FriendlyFolderPath(FEngine.Dest);
+end;
+
+procedure TFileOpProgressForm.ApplyConfirmBytes(const P: TFileOpProgress);
+begin
+  if not Assigned(FConfAskText) or (FConfAskBase = '') then
+    Exit;
+  if P.MeasuredBytes > 0 then
+    FConfAskText.Text := FConfAskBase + '  ·  ' + FormatOpBytes(P.MeasuredBytes)
+  else
+    FConfAskText.Text := FConfAskBase;
 end;
 
 procedure TFileOpProgressForm.ShowConfirm(const P: TFileOpProgress);
@@ -2340,14 +2359,14 @@ begin
     YesCap := L('op.yes.copy');
     YesW := 120;
   end;
-  if P.TotalBytesTotal > 0 then
-    FConfAskText.Text := FConfAskText.Text + '  ·  ' + FormatOpBytes(P.TotalBytesTotal);
+  FConfAskBase := FConfAskText.Text;
+  ApplyConfirmBytes(P);
   FConfAskTitle.Text := Verb;
   FromDir := CommonSourceDir(FEngine);
   if FromDir = '' then
     FromDir := P.SourcePath;
-  FConfFromPath.Text := FromDir;
-  FConfToPath.Text := FEngine.Dest;
+  FConfFromPath.Text := FriendlyFolderPath(FromDir);
+  FConfToPath.Text := FriendlyFolderPath(FEngine.Dest);
   Shown := 0;
   for I := 0 to 7 do
   begin
@@ -2355,7 +2374,7 @@ begin
     begin
       Path := FEngine.SourcePath(I);
       IsDir := TDirectory.Exists(Path);
-      FConfRowName[I].Text := ExtractFileName(ExcludeTrailingPathDelimiter(Path));
+      FConfRowName[I].Text := DisplayNameForPath(Path);
       SetConfFallbackIcon(Path, IsDir, FConfRowIco[I]);
       FConfRowHost[I].Visible := True;
       Inc(Shown);
@@ -2400,7 +2419,7 @@ begin
       if (FArchCombo.ItemIndex >= 0) and
          (FArchKinds[FArchCombo.ItemIndex] <> Ord(Cur)) then
         FEngine.SetDest(FArchStem + ArchiveExtOf(TArchiveKind(FArchKinds[FArchCombo.ItemIndex])));
-      FConfToPath.Text := FEngine.Dest;
+      FConfToPath.Text := FriendlyFolderPath(FEngine.Dest);
     finally
       FArchLock := False;
     end;
