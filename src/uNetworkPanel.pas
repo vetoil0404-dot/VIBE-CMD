@@ -101,20 +101,24 @@ end;
 
 function FlagText(const AHost: TNetworkHost): string;
 begin
+  Result := '';
   if AHost.HasSMB then
-  begin
     Result := 'SMB';
-    if AHost.HasFTP then
-      Result := Result + ' · FTP';
-    Exit;
-  end;
   if AHost.HasFTP then
-    Exit('FTP');
-  if AHost.IsRouter then
-    Exit(L('net.flag.host'));
+    if Result = '' then
+      Result := 'FTP'
+    else
+      Result := Result + ' · FTP';
   if AHost.HasWebAdmin then
-    Exit('Web');
-  Result := L('net.flag.host');
+    if Result = '' then
+      Result := 'Web'
+    else
+      Result := Result + ' · Web';
+  if AHost.IsRouter then
+    if Result = '' then
+      Result := L('net.flag.host')
+    else
+      Result := Result + ' · ' + L('net.flag.host');
 end;
 
 function HostIconKey(const AHost: TNetworkHost): string;

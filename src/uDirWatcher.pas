@@ -21,8 +21,10 @@ type
     FThread: TThread;
     FStopEvent: TEvent;
     FRemote: Boolean;
+    FNeedsRetry: Boolean;
     procedure StopThread;
     procedure FireChange;
+    function GetNeedsRetry: Boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -30,6 +32,8 @@ type
     procedure Stop;
     property OnChange: TDirChangeNotify read FOnChange write FOnChange;
     property Path: string read FPath;
+    { Тип тома ещё не известен, либо поток слежения уже завершился. }
+    property NeedsRetry: Boolean read GetNeedsRetry;
   end;
 
 implementation
@@ -166,6 +170,7 @@ end;
 
 procedure TDirWatcher.Stop;
 begin
+  FNeedsRetry := False;
   StopThread;
   FPath := '';
 end;
@@ -173,9 +178,12 @@ end;
 procedure TDirWatcher.Watch(const APath: string);
 var
   Norm: string;
+  Remote, Live: Boolean;
 begin
+  FNeedsRetry := False;
   Norm := ExcludeTrailingPathDelimiter(APath);
-  if SameText(Norm, FPath) and Assigned(FThread) then
+  Live := Assigned(FThread) and not FThread.Finished;
+  if SameText(Norm, FPath) and Live then
     Exit;
 
   StopThread;
@@ -183,7 +191,15 @@ begin
   FRemote := False;
   if FPath = '' then
     Exit;
-  if UiSkipNetworkTouch(FPath) then
+  { Неизвестный тип — не remote. UiSkipNetworkTouch на UI в этом случае
+    True, и прежний выход гасил слежение насовсем: повторного Watch не было. }
+  if not DriveTouchKnown(FPath, Remote) then
+  begin
+    FNeedsRetry := True;
+    FPath := '';
+    Exit;
+  end;
+  if Remote then
   begin
     FRemote := True;
     FPath := '';
@@ -205,6 +221,12 @@ procedure TDirWatcher.FireChange;
 begin
   if Assigned(FOnChange) and (FPath <> '') then
     FOnChange(FPath);
+end;
+
+function TDirWatcher.GetNeedsRetry: Boolean;
+begin
+  Result := FNeedsRetry or
+    (Assigned(FThread) and FThread.Finished and (FPath <> ''));
 end;
 
 end.

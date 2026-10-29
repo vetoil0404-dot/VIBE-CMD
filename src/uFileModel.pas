@@ -126,6 +126,9 @@ type
     procedure SendError(const AMsg: string);
     procedure EmitSlice(AList: TFileEntryList; AFrom: Integer; ADone: Boolean);
     procedure NoteProgress(ACount: Integer);
+    { Мережа: спочатку каталоги, їх видно одразу. Файли — другим проходом. }
+    function CollectRemote(AEntries: TFileEntryList; var ALastChunk: Integer;
+      var ALastEmit: Cardinal): DWORD;
   protected
     procedure Execute; override;
   public
@@ -157,6 +160,9 @@ function TryClaimPathRead(const APath: string; AOwner: TThread): Boolean;
 procedure ReleasePathRead(const APath: string; AOwner: TThread);
 function PathReadBusy(const APath: string): Boolean;
 function UiSkipNetworkTouch(const APath: string): Boolean;
+{ True, когда тип тома уже известен. Неизвестный локальный диск — False:
+  UiSkipNetworkTouch в этом случае тоже True, и им нельзя гасить слежение. }
+function DriveTouchKnown(const APath: string; out ARemote: Boolean): Boolean;
 function FormatDrivePair(ALeft, ARight: Int64): string;
 function FormatDriveFreeUsed(AFree, ATotal: Int64): string;
 function CollectAllPlaces(AIncludeNetwork: Boolean): TArray<TDriveInfo>;
@@ -178,6 +184,10 @@ const
   FILEOP_NOUI = $0004 or $0010 or $0400 or $0200;
   PKEY_ItemSize: TPropertyKey = (fmtid: '{B725F130-47EF-101A-A5F1-02608C9EEBAC}'; pid: 12);
   PKEY_ItemDateModified: TPropertyKey = (fmtid: '{B725F130-47EF-101A-A5F1-02608C9EEBAC}'; pid: 14);
+
+function VibeFindFirstEx(lpFileName: PWideChar; fInfoLevelId: DWORD;
+  lpFindFileData: Pointer; fSearchOp: DWORD; lpSearchFilter: Pointer;
+  dwAdditionalFlags: DWORD): THandle; stdcall; external kernel32 name 'FindFirstFileExW';
 
 type
   IPortableDeviceManager = interface(IUnknown)
@@ -1457,6 +1467,44 @@ begin
     EnsureDriveTypeAsync(Root);
     Result := True;
   end;
+{$ENDIF}
+end;
+
+function DriveTouchKnown(const APath: string; out ARemote: Boolean): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Root: string;
+  DT: Cardinal;
+{$ENDIF}
+begin
+  ARemote := False;
+  if APath = '' then
+    Exit(True);
+  if IsUncPath(APath) then
+  begin
+    ARemote := True;
+    Exit(True);
+  end;
+{$IFDEF MSWINDOWS}
+  Root := DriveRootOf(APath);
+  if Root = '' then
+    Exit(True);
+  if DriveTypeCached(Root, DT) then
+  begin
+    ARemote := DT = DRIVE_REMOTE;
+    Exit(True);
+  end;
+  if TThread.CurrentThread.ThreadID = MainThreadID then
+  begin
+    EnsureDriveTypeAsync(Root);
+    Exit(False);
+  end;
+  DT := GetDriveType(PChar(Root));
+  StoreDriveType(Root, DT);
+  ARemote := DT = DRIVE_REMOTE;
+  Result := True;
+{$ELSE}
+  Result := True;
 {$ENDIF}
 end;
 
@@ -3574,6 +3622,186 @@ begin
     end);
 end;
 
+function TDirLoadThread.CollectRemote(AEntries: TFileEntryList;
+  var ALastChunk: Integer; var ALastEmit: Cardinal): DWORD;
+const
+  FIND_INFO_STANDARD = 0;
+  FIND_INFO_BASIC = 1;
+  FIND_SEARCH_NAME = 0;
+  FIND_SEARCH_DIRS = 1;
+  FIND_LARGE_FETCH = 2;
+var
+  Held: TFileEntryList;
+  Mask: string;
+
+  function OpenFind(ADirsOnly, ABasic: Boolean; var AData: TWin32FindData): THandle;
+  var
+    Level, Op: Integer;
+  begin
+    if ABasic then
+      Level := FIND_INFO_BASIC
+    else
+      Level := FIND_INFO_STANDARD;
+    if ADirsOnly then
+      Op := FIND_SEARCH_DIRS
+    else
+      Op := FIND_SEARCH_NAME;
+    Result := VibeFindFirstEx(PWideChar(Mask), Level, @AData, Op, nil, FIND_LARGE_FETCH);
+    if (Result = INVALID_HANDLE_VALUE) and ABasic and
+       (GetLastError = ERROR_INVALID_PARAMETER) then
+      Result := VibeFindFirstEx(PWideChar(Mask), FIND_INFO_STANDARD, @AData, Op, nil,
+        FIND_LARGE_FETCH);
+  end;
+
+  function ToEntry(const AData: TWin32FindData): TFileEntry;
+  var
+    SR: TSearchRec;
+    LocalFt: TFileTime;
+    DosDate, DosTime: Word;
+  begin
+    SR := Default(TSearchRec);
+    SR.Name := AData.cFileName;
+    SR.Attr := Integer(AData.dwFileAttributes);
+    SR.Size := (Int64(AData.nFileSizeHigh) shl 32) or AData.nFileSizeLow;
+    if FileTimeToLocalFileTime(AData.ftLastWriteTime, LocalFt) and
+       FileTimeToDosDateTime(LocalFt, DosDate, DosTime) then
+      SR.Time := (Integer(DosDate) shl 16) or DosTime;
+    Result := TFileEntry.FromSearchRec(TPath.Combine(FPath, SR.Name), SR);
+  end;
+
+  procedure Flush(ABatch, AGapMs: Integer);
+  begin
+    if not Assigned(FOnChunk) or (AEntries = nil) then
+      Exit;
+    if AEntries.Count <= ALastChunk then
+      Exit;
+    if (AEntries.Count - ALastChunk < ABatch) and
+       (TThread.GetTickCount - ALastEmit < Cardinal(AGapMs)) then
+      Exit;
+    EmitSlice(AEntries, ALastChunk, False);
+    NoteProgress(AEntries.Count);
+    ALastChunk := AEntries.Count;
+    ALastEmit := TThread.GetTickCount;
+  end;
+
+  procedure FlushNow;
+  begin
+    if not Assigned(FOnChunk) or (AEntries = nil) then
+      Exit;
+    if AEntries.Count <= ALastChunk then
+      Exit;
+    EmitSlice(AEntries, ALastChunk, False);
+    NoteProgress(AEntries.Count);
+    ALastChunk := AEntries.Count;
+    ALastEmit := TThread.GetTickCount;
+  end;
+
+  function Walk(ADirsOnly: Boolean; AKeepFiles: Boolean; out ASawFile: Boolean): DWORD;
+  var
+    H: THandle;
+    Data: TWin32FindData;
+    IsDir: Boolean;
+  begin
+    Result := 0;
+    ASawFile := False;
+    H := OpenFind(ADirsOnly, True, Data);
+    if H = INVALID_HANDLE_VALUE then
+    begin
+      Result := GetLastError;
+      if Result = 0 then
+        Result := ERROR_FILE_NOT_FOUND;
+      Exit;
+    end;
+    try
+      repeat
+        if Terminated then
+          Exit;
+        if (StrComp(Data.cFileName, '.') = 0) or (StrComp(Data.cFileName, '..') = 0) then
+          Continue;
+        if ShouldSkipListedEntry(Integer(Data.dwFileAttributes), FShowHidden) then
+          Continue;
+        IsDir := (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0;
+        if IsDir then
+        begin
+          if ADirsOnly then
+          begin
+            AEntries.Add(ToEntry(Data));
+            Flush(8, 150);
+          end;
+        end
+        else
+        begin
+          ASawFile := True;
+          if AKeepFiles and (Held <> nil) then
+            Held.Add(ToEntry(Data));
+        end;
+      until not Winapi.Windows.FindNextFile(H, Data);
+    finally
+      Winapi.Windows.FindClose(H);
+    end;
+  end;
+
+var
+  Code: DWORD;
+  SawFile: Boolean;
+  I: Integer;
+  FileFrom: Integer;
+begin
+  Result := 0;
+  Mask := TPath.Combine(FPath, '*');
+  Held := TFileEntryList.Create;
+  try
+    Code := Walk(True, True, SawFile);
+    if Terminated then
+      Exit;
+    if (Code <> 0) and (Code <> ERROR_FILE_NOT_FOUND) and (Code <> ERROR_NO_MORE_FILES) then
+    begin
+      if AEntries.Count = 0 then
+        Result := Code;
+      Exit;
+    end;
+    FlushNow;
+    if Terminated then
+      Exit;
+    if SawFile then
+    begin
+      { Фільтр каталогів сервер проігнорував: файли вже прочитані, папки віддані. }
+      FileFrom := AEntries.Count;
+      for I := 0 to Held.Count - 1 do
+      begin
+        if Terminated then
+          Exit;
+        AEntries.Add(Held[I]);
+        if (AEntries.Count - FileFrom >= 300) or
+           (TThread.GetTickCount - ALastEmit >= 1000) then
+          Flush(300, 1000);
+      end;
+      Exit;
+    end;
+    Code := Walk(False, True, SawFile);
+    if Terminated then
+      Exit;
+    if (Code <> 0) and (Code <> ERROR_FILE_NOT_FOUND) and (Code <> ERROR_NO_MORE_FILES) then
+    begin
+      if AEntries.Count = 0 then
+        Result := Code;
+      Exit;
+    end;
+    FileFrom := AEntries.Count;
+    for I := 0 to Held.Count - 1 do
+    begin
+      if Terminated then
+        Exit;
+      AEntries.Add(Held[I]);
+      if (AEntries.Count - FileFrom >= 300) or
+         (TThread.GetTickCount - ALastEmit >= 1000) then
+        Flush(300, 1000);
+    end;
+  finally
+    Held.Free;
+  end;
+end;
+
 procedure TDirLoadThread.EmitSlice(AList: TFileEntryList; AFrom: Integer; ADone: Boolean);
 var
   Slice: TFileEntryList;
@@ -3707,6 +3935,31 @@ begin
             Exit;
           end;
         end;
+        if Remote then
+        begin
+          RC := Integer(CollectRemote(Entries, LastChunk, LastEmit));
+          ErrCode := DWORD(RC);
+          if Assigned(FProbeGate) then
+            FProbeGate.SetEvent;
+          if Terminated then
+            Abort;
+          if RC <> 0 then
+          begin
+{$IFDEF MSWINDOWS}
+            if (ErrCode = ERROR_PATH_NOT_FOUND) and not IsUncPath(FPath) then
+            begin
+              if not TryListShellFolder(FPath, Entries, FShowHidden) then
+                raise Exception.Create(NetErrorText(ErrCode));
+            end
+            else
+              raise Exception.Create(NetErrorText(ErrCode));
+{$ELSE}
+            raise Exception.Create(Lf('model.open.path', [FPath]));
+{$ENDIF}
+          end;
+        end
+        else
+        begin
         RC := System.SysUtils.FindFirst(TPath.Combine(FPath, '*.*'), faAnyFile, SearchRec);
 {$IFDEF MSWINDOWS}
         ErrCode := GetLastError;
@@ -3723,21 +3976,7 @@ begin
         end;
         if RC <> 0 then
         begin
-          if Remote then
-          begin
-{$IFDEF MSWINDOWS}
-            if (ErrCode = ERROR_PATH_NOT_FOUND) and not IsUncPath(FPath) then
-            begin
-              if not TryListShellFolder(FPath, Entries, FShowHidden) then
-                raise Exception.Create(NetErrorText(ErrCode));
-            end
-            else
-              raise Exception.Create(NetErrorText(ErrCode));
-{$ELSE}
-            raise Exception.Create(Lf('model.open.path', [FPath]));
-{$ENDIF}
-          end
-          else if Entries.Count = 0 then
+          if Entries.Count = 0 then
             TryListShellFolder(FPath, Entries, FShowHidden);
         end
         else
@@ -3755,20 +3994,11 @@ begin
             begin
               FullPath := TPath.Combine(FPath, SearchRec.Name);
               Entries.Add(TFileEntry.FromSearchRec(FullPath, SearchRec));
-              if Remote then
-                if (Entries.Count - LastChunk >= 300) or
-                   ((Entries.Count > LastChunk) and
-                    (TThread.GetTickCount - LastEmit >= 1000)) then
-                begin
-                  EmitSlice(Entries, LastChunk, False);
-                  NoteProgress(Entries.Count);
-                  LastChunk := Entries.Count;
-                  LastEmit := TThread.GetTickCount;
-                end;
             end;
           until System.SysUtils.FindNext(SearchRec) <> 0;
         finally
           System.SysUtils.FindClose(SearchRec);
+        end;
         end;
         if (not Remote) and (Entries.Count = 0) then
           TryListShellFolder(FPath, Entries, FShowHidden);

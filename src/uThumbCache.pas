@@ -117,7 +117,8 @@ var
 implementation
 
 uses
-  System.Zip, uVecPreview, uHtmlThumb, uArchiveEngine, uImageSniff;
+  System.Zip, uVecPreview, uDxfPreview, uHtmlThumb, uArchiveEngine, uImageSniff,
+  uMeshPreview, uHdrPreview;
 
 function IsSvgThumbExt(const APath: string): Boolean;
 var
@@ -284,10 +285,12 @@ begin
     if AIsDir then
       Exit;
     Ext := ThumbExtOf(APath, ANameHint);
-    Result := IsRasterThumbExt(Ext) or IsMetaThumbExt(Ext) or IsCdrThumbExt(Ext) or
-      (Ext = '.cur') or
+    Result := IsRasterThumbExt(Ext) or IsHdrExt(Ext) or IsMetaThumbExt(Ext) or
+      IsCdrThumbExt(Ext) or
+      (Ext = '.cur') or (Ext = '.dxf') or
       (Ext = '.pdf') or (Ext = '.svg') or (Ext = '.svgz') or (Ext = '.ai') or
       (Ext = '.psd') or (Ext = '.psb') or
+      IsMeshExt(Ext) or
       (Ext = '.xlsx') or (Ext = '.xls') or (Ext = '.xlsm') or
       (Ext = '.csv') or (Ext = '.tsv') or
       (Ext = '.docx') or (Ext = '.doc') or (Ext = '.pptx') or (Ext = '.ppt') or
@@ -315,11 +318,13 @@ begin
     (Ext = '.png') or (Ext = '.gif') or (Ext = '.bmp') or (Ext = '.dib') or
     (Ext = '.webp') or (Ext = '.tif') or (Ext = '.tiff') or (Ext = '.tga') or
     (Ext = '.heic') or (Ext = '.heif') or (Ext = '.avif') or
-    (Ext = '.jxl') or (Ext = '.dds') or (Ext = '.wmf') or (Ext = '.emf') or
-    (Ext = '.cur') or
+    (Ext = '.jxl') or (Ext = '.dds') or IsHdrExt(Ext) or
+    (Ext = '.wmf') or (Ext = '.emf') or
+    (Ext = '.cur') or (Ext = '.dxf') or
     (Ext = '.cdr') or (Ext = '.cdt') or
     (Ext = '.pdf') or (Ext = '.svg') or (Ext = '.svgz') or (Ext = '.ai') or
     (Ext = '.psd') or (Ext = '.psb') or
+    IsMeshExt(Ext) or
     (Ext = '.xlsx') or (Ext = '.xls') or (Ext = '.xlsm') or
     (Ext = '.csv') or (Ext = '.tsv') or
     (Ext = '.tgs') or (Ext = '.lottie') or (Ext = '.json') or
@@ -2467,7 +2472,7 @@ begin
       Unk: IUnknown;
       Local, Ext, ReadPath, OwnTemp, ArcName, InnerName: string;
       SkipFallback, ArcEnc: Boolean;
-      ArcBytes: Int64;
+      ArcBytes, MeshCap: Int64;
       ArcWhen: TDateTime;
     begin
       Bmp := nil;
@@ -2502,8 +2507,13 @@ begin
               ReadPath := '';
               ArcBytes := 0;
               ArcEnc := False;
+              MeshCap := 48 * 1024 * 1024;
+              if IsMeshExt(Ext) or (Ext = '.dxf') then
+                MeshCap := 64 * 1024 * 1024
+              else if IsHdrExt(Ext) then
+                MeshCap := 128 * 1024 * 1024;
               if ArchiveEntryInfo(Path, ArcBytes, ArcWhen, ArcEnc) and
-                 (not ArcEnc) and (ArcBytes <= 48 * 1024 * 1024) then
+                 (not ArcEnc) and (ArcBytes <= MeshCap) then
               begin
                 Local := '';
                 if MaterializeFile(Path, Local) and (Local <> '') and
@@ -2514,7 +2524,19 @@ begin
                 end;
               end;
             end;
-            if IsRasterThumbExt(Ext) then
+            if IsHdrExt(Ext) and (Bmp = nil) and (ReadPath <> '') then
+            begin
+              try
+                Bmp := RenderHdrThumb(ReadPath, RenderSize);
+                Success := Assigned(Bmp) and (Bmp.Width > 0);
+                if not Success then
+                  FreeAndNil(Bmp);
+              except
+                Success := False;
+                FreeAndNil(Bmp);
+              end;
+            end;
+            if not Success and IsRasterThumbExt(Ext) then
               Success := RenderRasterThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
             if not Success and (Bmp = nil) and (Ext = '.cur') then
             begin
@@ -2537,6 +2559,20 @@ begin
               Success := RenderSvgThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
             if not Success and IsPsdThumbExt(Path) then
               Success := RenderPsdThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            if not Success and (Bmp = nil) and IsMeshExt(Ext) then
+            begin
+              SkipFallback := True;
+              if ReadPath <> '' then
+              try
+                Bmp := RenderMeshThumb(ReadPath, RenderSize);
+                Success := Assigned(Bmp) and (Bmp.Width > 0);
+                if not Success then
+                  FreeAndNil(Bmp);
+              except
+                Success := False;
+                FreeAndNil(Bmp);
+              end;
+            end;
 
             if not Success and (Length(Raw) = 0) then
             begin
@@ -2557,6 +2593,22 @@ begin
                   Success := False;
                   FreeAndNil(Bmp);
                 end;
+              end;
+            end;
+
+            if not Success and (Bmp = nil) and (Ext = '.dxf') then
+            begin
+              Bmp := TBitmap.Create;
+              try
+                Success := RenderDxfTile(ReadPath, RenderSize, Bmp);
+                if not Success or (Bmp.Width <= 0) then
+                begin
+                  Success := False;
+                  FreeAndNil(Bmp);
+                end;
+              except
+                Success := False;
+                FreeAndNil(Bmp);
               end;
             end;
 

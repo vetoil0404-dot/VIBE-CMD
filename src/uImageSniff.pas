@@ -238,6 +238,224 @@ begin
 end;
 {$ENDIF}
 
+{ CUR хранит сам DIB, не ресурс RT_CURSOR. У классического кадра biHeight
+  удвоен: сначала XOR, потом AND (бит 1 — дырка). DrawIconEx в 32-битный
+  DIB часто пишет цвет с альфой 0, и плитка такой кадр выбрасывает. }
+function CursorDibBitmap(const ABytes: TBytes; AOff, ASize: Cardinal;
+  ADirH: Integer): TBitmap;
+
+  function U32(O: Integer): Cardinal;
+  begin
+    Result := Cardinal(ABytes[O]) or (Cardinal(ABytes[O + 1]) shl 8) or
+      (Cardinal(ABytes[O + 2]) shl 16) or (Cardinal(ABytes[O + 3]) shl 24);
+  end;
+
+  function MaskBit(ARow, AX: Integer): Boolean;
+  begin
+    Result := (ABytes[ARow + (AX shr 3)] and (1 shl (7 - (AX and 7)))) <> 0;
+  end;
+
+var
+  Base, Hdr, Bpp, Colors, ImgW, ImgH, AbsH, XorH: Integer;
+  XorStride, AndStride, PixAt, X, Y, SrcY, Idx, Opaque: Integer;
+  Need: Int64;
+  TopDown, HasMask, UseAlpha: Boolean;
+  Pal: array of array[0..2] of Byte;
+  Surf: TBitmapSurface;
+  RowXor, RowAnd: Integer;
+  Dst: PByte;
+  BB, GG, RR, AA, MaxA: Byte;
+begin
+  Result := nil;
+  if (ASize < 40) or (Int64(AOff) + ASize > Length(ABytes)) then
+    Exit;
+  Base := Integer(AOff);
+  Hdr := Integer(U32(Base));
+  if (Hdr < 40) or (Hdr > Integer(ASize)) then
+    Exit;
+  ImgW := Integer(U32(Base + 4));
+  ImgH := Integer(U32(Base + 8));
+  Bpp := ABytes[Base + 14] or (ABytes[Base + 15] shl 8);
+  if (U32(Base + 16) <> 0) or (ImgW < 1) or (ImgH = 0) then
+    Exit;
+  if not (Bpp in [1, 4, 8, 24, 32]) then
+    Exit;
+  if ImgH = Low(Integer) then
+    Exit;
+  TopDown := ImgH < 0;
+  AbsH := Abs(ImgH);
+  if (ADirH > 0) and (AbsH = ADirH * 2) then
+  begin
+    XorH := ADirH;
+    HasMask := True;
+  end
+  else if (ADirH > 0) and (AbsH = ADirH) then
+  begin
+    XorH := ADirH;
+    HasMask := False;
+  end
+  else if (AbsH mod 2) = 0 then
+  begin
+    XorH := AbsH div 2;
+    HasMask := True;
+  end
+  else
+  begin
+    XorH := AbsH;
+    HasMask := False;
+  end;
+  if (ImgW > 2048) or (XorH < 1) or (XorH > 2048) then
+    Exit;
+  Colors := 0;
+  if Bpp <= 8 then
+  begin
+    Colors := Integer(U32(Base + 32));
+    if Colors = 0 then
+      Colors := 1 shl Bpp
+    else if (Colors < 1) or (Colors > (1 shl Bpp)) then
+      Exit;
+  end;
+  if Int64(Hdr) + Int64(Colors) * 4 > ASize then
+    Exit;
+  PixAt := Base + Hdr + Colors * 4;
+  XorStride := ((ImgW * Bpp + 31) div 32) * 4;
+  AndStride := ((ImgW + 31) div 32) * 4;
+  Need := Int64(XorStride) * XorH;
+  if HasMask then
+    Inc(Need, Int64(AndStride) * XorH);
+  if Int64(PixAt) + Need > Int64(Base) + ASize then
+    Exit;
+  SetLength(Pal, Colors);
+  for Idx := 0 to Colors - 1 do
+  begin
+    Pal[Idx][0] := ABytes[Base + Hdr + Idx * 4];
+    Pal[Idx][1] := ABytes[Base + Hdr + Idx * 4 + 1];
+    Pal[Idx][2] := ABytes[Base + Hdr + Idx * 4 + 2];
+  end;
+  UseAlpha := False;
+  if Bpp = 32 then
+  begin
+    MaxA := 0;
+    for Y := 0 to XorH - 1 do
+    begin
+      RowXor := PixAt + Y * XorStride;
+      for X := 0 to ImgW - 1 do
+        if ABytes[RowXor + X * 4 + 3] > MaxA then
+          MaxA := ABytes[RowXor + X * 4 + 3];
+    end;
+    UseAlpha := MaxA > 0;
+  end;
+  Surf := TBitmapSurface.Create;
+  try
+    Surf.SetSize(ImgW, XorH, TPixelFormat.BGRA);
+    Opaque := 0;
+    for Y := 0 to XorH - 1 do
+    begin
+      if TopDown then
+        SrcY := Y
+      else
+        SrcY := XorH - 1 - Y;
+      RowXor := PixAt + SrcY * XorStride;
+      RowAnd := PixAt + XorH * XorStride + SrcY * AndStride;
+      Dst := Surf.Scanline[Y];
+      for X := 0 to ImgW - 1 do
+      begin
+        BB := 0;
+        GG := 0;
+        RR := 0;
+        AA := 255;
+        Idx := 0;
+        case Bpp of
+          1:
+            begin
+              Idx := (ABytes[RowXor + (X shr 3)] shr (7 - (X and 7))) and 1;
+              if Idx < Colors then
+              begin
+                BB := Pal[Idx][0];
+                GG := Pal[Idx][1];
+                RR := Pal[Idx][2];
+              end;
+            end;
+          4:
+            begin
+              if (X and 1) = 0 then
+                Idx := ABytes[RowXor + (X shr 1)] shr 4
+              else
+                Idx := ABytes[RowXor + (X shr 1)] and $0F;
+              if Idx < Colors then
+              begin
+                BB := Pal[Idx][0];
+                GG := Pal[Idx][1];
+                RR := Pal[Idx][2];
+              end;
+            end;
+          8:
+            begin
+              Idx := ABytes[RowXor + X];
+              if Idx < Colors then
+              begin
+                BB := Pal[Idx][0];
+                GG := Pal[Idx][1];
+                RR := Pal[Idx][2];
+              end;
+            end;
+          24:
+            begin
+              BB := ABytes[RowXor + X * 3];
+              GG := ABytes[RowXor + X * 3 + 1];
+              RR := ABytes[RowXor + X * 3 + 2];
+            end;
+          32:
+            begin
+              BB := ABytes[RowXor + X * 4];
+              GG := ABytes[RowXor + X * 4 + 1];
+              RR := ABytes[RowXor + X * 4 + 2];
+              if UseAlpha then
+                AA := ABytes[RowXor + X * 4 + 3]
+              else
+                AA := 255;
+            end;
+        end;
+        if HasMask and not UseAlpha and MaskBit(RowAnd, X) then
+        begin
+          { AND=1 и белый XOR — это инверсия экрана. На плитке рисуем чёрным. }
+          if (Bpp = 1) and (Idx = 1) then
+          begin
+            BB := 0;
+            GG := 0;
+            RR := 0;
+            AA := 255;
+          end
+          else
+          begin
+            BB := 0;
+            GG := 0;
+            RR := 0;
+            AA := 0;
+          end;
+        end;
+        Dst[0] := BB;
+        Dst[1] := GG;
+        Dst[2] := RR;
+        Dst[3] := AA;
+        Inc(Dst, 4);
+        if AA > 12 then
+          Inc(Opaque);
+      end;
+    end;
+    if Opaque = 0 then
+      Exit;
+    Result := TBitmap.Create;
+    try
+      Result.Assign(Surf);
+    except
+      FreeAndNil(Result);
+    end;
+  finally
+    Surf.Free;
+  end;
+end;
+
 function LoadIcoFrames(const APath: string; out AFrames: TArray<TBitmap>;
   out ALabels: TArray<string>): Boolean;
 {$IFDEF MSWINDOWS}
@@ -248,6 +466,7 @@ var
   Icon: HICON;
   Bmp: TBitmap;
   Png: TBytesStream;
+  IsCur: Boolean;
 {$ENDIF}
 begin
   Result := False;
@@ -261,6 +480,7 @@ begin
   end;
   if Length(Bytes) < 6 then
     Exit;
+  IsCur := (Bytes[2] = 2) and (Bytes[3] = 0);
   Count := Bytes[4] or (Bytes[5] shl 8);
   if (Count < 1) or (Count > 64) or (Length(Bytes) < 6 + Count * 16) then
     Exit;
@@ -295,12 +515,21 @@ begin
     end
     else
     begin
-      Icon := CreateIconFromResourceEx(@Bytes[Off], Size, True, $00030000, W, H, 0);
-      if Icon <> 0 then
+      if IsCur then
       try
-        Bmp := IconToBitmap(Icon, W, H);
-      finally
-        DestroyIcon(Icon);
+        Bmp := CursorDibBitmap(Bytes, Off, Size, H);
+      except
+        FreeAndNil(Bmp);
+      end;
+      if Bmp = nil then
+      begin
+        Icon := CreateIconFromResourceEx(@Bytes[Off], Size, True, $00030000, W, H, 0);
+        if Icon <> 0 then
+        try
+          Bmp := IconToBitmap(Icon, W, H);
+        finally
+          DestroyIcon(Icon);
+        end;
       end;
     end;
     if (Bmp <> nil) and (Bmp.Width > 0) then

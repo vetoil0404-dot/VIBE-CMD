@@ -188,6 +188,9 @@ type
     FSizeSortTick: UInt64;
     FDirChangeTimer: TTimer;
     FDirChangePath: string;
+    FWatchRetryTimer: TTimer;
+    FWatchRetryLeft: Integer;
+    FWatchArmTick: Cardinal;
     FTabs: TList<TFileTab>;
     FActiveTabIndex: Integer;
     FColors: TThemeColors;
@@ -555,6 +558,9 @@ type
     procedure OrderVisibleThumbs;
     function ThumbOrderRange(out AStart, AEnd: Integer): Boolean;
     procedure DirChangeTimerTick(Sender: TObject);
+    procedure WatchRetryTick(Sender: TObject);
+    procedure ArmWatchRetry;
+    procedure RetryPendingWatches;
     function FileListsEquivalent(A, B: uFileModel.TFileEntryList): Boolean;
 
     procedure BindDragEvents(AControl: TControl);
@@ -579,7 +585,7 @@ type
     procedure RestoreTabCursor(AIndex: Integer);
     function PathFromVisualIndex(const Tab: TFileTab; AVisual: Integer): string;
     function IndexFromCursorPath(const Tab: TFileTab): Integer;
-    procedure WatchTab(AIndex: Integer);
+    procedure WatchTab(AIndex: Integer; AFromRetry: Boolean = False);
     function TabMatchesWatch(const ATabPath, AWatchPath: string): Boolean;
     procedure WatchCurrentPath;
     procedure HandleDirChange(const APath: string);
@@ -981,6 +987,12 @@ begin
   FDirChangeTimer.Interval := 800;
   FDirChangeTimer.Enabled := False;
   FDirChangeTimer.OnTimer := DirChangeTimerTick;
+  FWatchRetryTimer := TTimer.Create(Self);
+  FWatchRetryTimer.Interval := 200;
+  FWatchRetryTimer.Enabled := False;
+  FWatchRetryTimer.OnTimer := WatchRetryTick;
+  FWatchRetryLeft := 0;
+  FWatchArmTick := 0;
   FLoadWatchTimer := TTimer.Create(Self);
   FLoadWatchTimer.Interval := 400;
   FLoadWatchTimer.Enabled := False;
@@ -1061,6 +1073,8 @@ begin
     FThumbTimer.Enabled := False;
   if Assigned(FDirChangeTimer) then
     FDirChangeTimer.Enabled := False;
+  if Assigned(FWatchRetryTimer) then
+    FWatchRetryTimer.Enabled := False;
   if Assigned(FLoadWatchTimer) then
     FLoadWatchTimer.Enabled := False;
   if Assigned(FNetPulseTimer) then
@@ -13598,18 +13612,28 @@ function TFilePanel.LoadNextStaleTab: Boolean;
 var
   I: Integer;
   Tab: TFileTab;
+  Remote, Waiting: Boolean;
 begin
   Result := False;
   if FDestroying then
     Exit;
   if ActiveLoadCount >= 3 then
     Exit(True);
+  Waiting := False;
   for I := 0 to FTabs.Count - 1 do
   begin
     if I = FActiveTabIndex then
       Continue;
     Tab := FTabs[I];
-    if IsRemotePath(Tab.Path) or UiSkipNetworkTouch(Tab.Path) then
+    if not DriveTouchKnown(Tab.Path, Remote) then
+    begin
+      { Тип ещё не пришёл. Не считать вкладку сетью и не останавливать
+        таймер, иначе локальная папка так и не получит слежение. }
+      if (not FWatchEnabled) or (GetTickCount - FWatchArmTick < 8000) then
+        Waiting := True;
+      Continue;
+    end;
+    if Remote then
       Continue;
     if Tab.Stale or not Tab.Loaded then
     begin
@@ -13619,14 +13643,20 @@ begin
       Exit(True);
     end;
   end;
+  if Waiting then
+    Result := True;
 end;
 
 procedure TFilePanel.EnableDirWatch;
+var
+  I: Integer;
 begin
   FWatchEnabled := True;
-  if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) and
-     FTabs[FActiveTabIndex].Loaded and not FTabs[FActiveTabIndex].Loading then
-    WatchTab(FActiveTabIndex);
+  FWatchArmTick := GetTickCount;
+  FWatchRetryLeft := 40;
+  for I := 0 to FTabs.Count - 1 do
+    if FTabs[I].Loaded and not FTabs[I].Loading then
+      WatchTab(I);
 end;
 
 procedure TFilePanel.StartDeferredDrives;
@@ -13777,10 +13807,49 @@ begin
     Result := Total - 1;
 end;
 
-procedure TFilePanel.WatchTab(AIndex: Integer);
+procedure TFilePanel.ArmWatchRetry;
+begin
+  if FDestroying or not FWatchEnabled or not Assigned(FWatchRetryTimer) then
+    Exit;
+  if FWatchRetryTimer.Enabled or (FWatchRetryLeft <= 0) then
+    Exit;
+  Dec(FWatchRetryLeft);
+  FWatchRetryTimer.Enabled := True;
+end;
+
+procedure TFilePanel.WatchRetryTick(Sender: TObject);
+begin
+  if Assigned(FWatchRetryTimer) then
+    FWatchRetryTimer.Enabled := False;
+  if FDestroying or not FWatchEnabled then
+    Exit;
+  RetryPendingWatches;
+end;
+
+procedure TFilePanel.RetryPendingWatches;
+var
+  I: Integer;
+  Again: Boolean;
+begin
+  if FDestroying or not FWatchEnabled then
+    Exit;
+  Again := False;
+  for I := 0 to FTabs.Count - 1 do
+    if Assigned(FTabs[I].Watcher) and FTabs[I].Watcher.NeedsRetry then
+    begin
+      WatchTab(I, True);
+      if Assigned(FTabs[I].Watcher) and FTabs[I].Watcher.NeedsRetry then
+        Again := True;
+    end;
+  if Again then
+    ArmWatchRetry;
+end;
+
+procedure TFilePanel.WatchTab(AIndex: Integer; AFromRetry: Boolean);
 var
   Tab: TFileTab;
   Watch, Arc, Inner: string;
+  Known, Remote: Boolean;
 begin
   if not FDestroying then
     SyncFolderSizeRoot;
@@ -13788,8 +13857,11 @@ begin
     Exit;
   if (AIndex < 0) or (AIndex >= FTabs.Count) then
     Exit;
+  if not AFromRetry then
+    FWatchRetryLeft := 40;
   Tab := FTabs[AIndex];
-  if IsVibeNetworkPath(Tab.Path) or IsRemotePath(Tab.Path) then
+  Known := DriveTouchKnown(Tab.Path, Remote);
+  if IsVibeNetworkPath(Tab.Path) or (Known and Remote) then
   begin
     if Assigned(Tab.Watcher) then
       Tab.Watcher.Stop;
@@ -13804,9 +13876,14 @@ begin
     FTabs[AIndex] := Tab;
   end;
   Watch := Tab.Path;
-  if SplitArchivePath(Tab.Path, Arc, Inner) then
+  { Пока тип тома не известен, не вызывать Exists по пути: это может быть сеть. }
+  if Known and SplitArchivePath(Tab.Path, Arc, Inner) then
     Watch := ExcludeTrailingPathDelimiter(ExtractFilePath(Arc));
   Tab.Watcher.Watch(Watch);
+  { Повтор: тип тома ещё не известен, либо поток сразу умер (FindFirst).
+    Обычный запуск тоже проверяется один раз — мёртвый поток иначе никто не поднимет. }
+  if Tab.Watcher.NeedsRetry or not AFromRetry then
+    ArmWatchRetry;
 end;
 
 function TFilePanel.TabMatchesWatch(const ATabPath, AWatchPath: string): Boolean;
@@ -13825,106 +13902,115 @@ begin
 end;
 
 procedure TFilePanel.WatchCurrentPath;
+var
+  I: Integer;
 begin
-  WatchTab(FActiveTabIndex);
+  for I := 0 to FTabs.Count - 1 do
+    WatchTab(I);
 end;
 
 procedure TFilePanel.HandleDirChange(const APath: string);
 begin
   if FDestroying then
     Exit;
-  if IsArchiveBusy then
+  FDirChangePath := APath;
+  if not Assigned(FDirChangeTimer) then
   begin
-    FRefreshPending := True;
+    if not IsArchiveBusy then
+      DirChangeTimerTick(nil);
     Exit;
   end;
-  FDirChangePath := APath;
-  if Assigned(FDirChangeTimer) then
-  begin
-    FDirChangeTimer.Enabled := False;
-    FDirChangeTimer.Enabled := True;
-  end
+  FDirChangeTimer.Enabled := False;
+  if IsArchiveBusy then
+    FDirChangeTimer.Interval := 250
   else
-    DirChangeTimerTick(nil);
+    FDirChangeTimer.Interval := 800;
+  FDirChangeTimer.Enabled := True;
 end;
 
 procedure TFilePanel.DirChangeTimerTick(Sender: TObject);
 var
-  I, InactiveLoadIdx: Integer;
-  Tab: TFileTab;
-  RefreshActive: Boolean;
+  I: Integer;
+  RefreshActive, Known, Remote, DoRefresh, GoParent: Boolean;
   APath, Cur, Arc, Inner: string;
 begin
   if Assigned(FDirChangeTimer) then
+  begin
     FDirChangeTimer.Enabled := False;
+    FDirChangeTimer.Interval := 800;
+  end;
   if FDestroying then
     Exit;
   APath := FDirChangePath;
+  if APath = '' then
+    Exit;
   if IsArchiveBusy then
   begin
     FRefreshPending := True;
+    if Assigned(FDirChangeTimer) then
+    begin
+      FDirChangeTimer.Interval := 250;
+      FDirChangeTimer.Enabled := True;
+    end;
     Exit;
   end;
 
   RefreshActive := False;
-  InactiveLoadIdx := -1;
-  for I := 0 to FTabs.Count - 1 do
+  if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) and
+     TabMatchesWatch(FTabs[FActiveTabIndex].Path, APath) and
+     not FTabs[FActiveTabIndex].SearchView then
   begin
-    if not TabMatchesWatch(FTabs[I].Path, APath) then
-      Continue;
-    if FTabs[I].SearchView then
-      Continue;
-    if IsRemotePath(FTabs[I].Path) or UiSkipNetworkTouch(FTabs[I].Path) then
-      Continue;
-    if I = FActiveTabIndex then
-      RefreshActive := True
-    else
-    begin
-      Tab := FTabs[I];
-      Tab.Stale := True;
-      FTabs[I] := Tab;
-      if InactiveLoadIdx < 0 then
-        InactiveLoadIdx := I;
-    end;
+    Known := DriveTouchKnown(FTabs[FActiveTabIndex].Path, Remote);
+    if not (Known and Remote) then
+      RefreshActive := True;
   end;
 
   if RefreshActive then
   begin
     Cur := GetCurrentPathImpl;
+    DoRefresh := True;
+    GoParent := False;
     if not SplitArchivePath(Cur, Arc, Inner) then
     begin
-      if IsRemotePath(Cur) or UiSkipNetworkTouch(Cur) then
-        Exit;
-      if (Cur <> '') and not TDirectory.Exists(Cur) and not IsVirtualShellPath(Cur) then
+      Known := DriveTouchKnown(Cur, Remote);
+      if Known and Remote then
+        DoRefresh := False
+      else if Known and (Cur <> '') and not TDirectory.Exists(Cur) and
+              not IsVirtualShellPath(Cur) and not IsBrowsablePath(Cur) then
       begin
-        if IsBrowsablePath(Cur) then
-        begin
-          FKeepLiveNext := True;
-          FHoldScrollNext := True;
-          LockScrollPosition;
-          Refresh('', True);
-        end
-        else
-          NavigateToParent;
-        Exit;
+        DoRefresh := False;
+        GoParent := True;
       end;
     end;
-    FKeepLiveNext := True;
-    FHoldScrollNext := True;
-    LockScrollPosition;
-    Refresh('', True);
-    Exit;
+    if GoParent then
+      NavigateToParent
+    else if DoRefresh then
+    begin
+      FKeepLiveNext := True;
+      FHoldScrollNext := True;
+      LockScrollPosition;
+      Refresh('', True);
+    end;
   end;
 
-  if (InactiveLoadIdx >= 0) and (ActiveLoadCount < 3) then
+  for I := 0 to FTabs.Count - 1 do
   begin
-    CaptureTabSelection(InactiveLoadIdx, FKeepSelPaths, FKeepSelFocus);
-    if (FKeepSelFocus = '') then
-      FKeepSelFocus := FTabs[InactiveLoadIdx].CursorPath;
+    if I = FActiveTabIndex then
+      Continue;
+    if not TabMatchesWatch(FTabs[I].Path, APath) then
+      Continue;
+    if FTabs[I].SearchView then
+      Continue;
+    Known := DriveTouchKnown(FTabs[I].Path, Remote);
+    if Known and Remote then
+      Continue;
+    CaptureTabSelection(I, FKeepSelPaths, FKeepSelFocus);
+    if FKeepSelFocus = '' then
+      FKeepSelFocus := FTabs[I].CursorPath;
     FKeepLiveNext := True;
     FHoldScrollNext := True;
     LockScrollPosition;
-    StartDirLoadAt(InactiveLoadIdx, FTabs[InactiveLoadIdx].Path, '', True);
+    StartDirLoadAt(I, FTabs[I].Path, '', True);
   end;
 end;
 

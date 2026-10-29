@@ -23,6 +23,7 @@ uses
   uSpreadsheetData, uSpreadsheetGrid, uCustomScrollbar,
   uDocumentData, uDocumentView, uPdfium, uPsdPreview, uMetaCache,
   uFluentComboBox, uFluentEdit, uTextCode, uCodeView, uImageSniff, uPeInfo,
+  uMeshPreview,
   uFontConvert, uLang, uLangBind
   {$IFDEF MSWINDOWS}, uMpvPlayer{$ENDIF};
 
@@ -344,11 +345,68 @@ type
     FMpv: TMpvSession;
     FUsingMpv: Boolean;
     {$ENDIF}
+    FMeshOn: Boolean;
+    FMeshPicture: Boolean;
+    FMeshDrag: Boolean;
+    FMeshHintGone: Boolean;
+    FMeshPending: Boolean;
+    FMeshBusy: Boolean;
+    FMeshSimple: Boolean;
+    FMeshDragX: Single;
+    FMeshDragY: Single;
+    FMeshAz: Single;
+    FMeshEl: Single;
+    FMeshScale: Single;
+    FMeshGen: Integer;
+    FMeshRendW: Integer;
+    FMeshRendH: Integer;
+    FMeshVerts: Int64;
+    FMeshTris: Int64;
+    FMeshPoints: Int64;
+    FMeshBytes: Int64;
+    FMeshPicW: Integer;
+    FMeshPicH: Integer;
+    FMeshKind: Integer;
+    FMeshPath: string;
+    FMeshExt: string;
+    FMeshHint: TText;
+    FHdrOn: Boolean;
+    FHdrLock: Boolean;
+    FHdrW: Integer;
+    FHdrH: Integer;
+    FHdrRgb: TArray<Single>;
+    FHdrFailKey: string;
+    FHdrKind: string;
+    FHdrTrack: TPaintBox;
+    FHdrEv: TText;
+    FHdrEvVal: Single;
+    FHdrShown: Single;
+    FHdrDrag: Boolean;
     procedure BuildUI;
     procedure CloseClick(Sender: TObject);
     procedure DebounceTick(Sender: TObject);
     procedure SyncTick(Sender: TObject);
     procedure DoLoad(const APath: string);
+    procedure StartMeshLoad(const ALocal: string);
+    procedure ScheduleMeshFrame;
+    procedure ApplyMeshFrame(ABmp: TBitmap; AErr: Integer; APicture, ASimple: Boolean;
+      AKind: Integer; AVerts, ATris, APoints, ABytes: Int64; APicW, APicH: Integer;
+      AGen, ALoadGen: Integer);
+    procedure ApplyMeshChrome;
+    procedure FinishOrdinary(const ALocal, AExt: string);
+    procedure ShowMeshFail(AErr: Integer);
+    procedure MeshRenderSize(out AW, AH: Integer);
+    procedure ClearHdr;
+    procedure LoadHdrView(const ALocal: string);
+    procedure ShowHdrFail(const AExt: string; ANoRgb: Boolean);
+    procedure ApplyHdrExposure;
+    procedure PaintHdrSeek(Sender: TObject; Canvas: TCanvas);
+    procedure HdrSeekDown(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    procedure HdrSeekMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+    procedure HdrSeekUp(Sender: TObject; Button: TMouseButton;
+      Shift: TShiftState; X, Y: Single);
+    function HdrXToEv(X: Single): Single;
     procedure HideViewers;
     procedure ShowInfo(const AText: string);
     procedure ShowMeta(const APath: string);
@@ -681,7 +739,9 @@ type
 implementation
 
 uses
-  System.Zip, uThumbCache, uIconCache, System.Variants, uVecPreview, FMX.Platform,
+  System.Zip, uThumbCache, uIconCache, System.Variants, uVecPreview, uDxfPreview,
+  uHdrPreview,
+  FMX.Platform,
   FMX.Skia.Canvas, uQuickViewForm
   {$IFDEF MSWINDOWS}, Winapi.ShLwApi, SHDocVw, Winapi.EdgeUtils{$ENDIF};
 
@@ -791,6 +851,7 @@ const
   PK_DOC     = 6;
   PK_TABLE   = 7;
   PK_PDF     = 8;
+  PK_MESH    = 9;
   IMG_SHELF_H = 39;
 
   MAX_TEXT_BYTES = 512 * 1024;
@@ -897,6 +958,8 @@ begin
   BuildUI;
   FDestroying := False;
   FLoadGen := 0;
+  FMeshGen := 0;
+  FMeshScale := 1;
   FPdfPage := 0;
   FDebounce := TTimer.Create(Self);
   FDebounce.Interval := 140;
@@ -913,6 +976,7 @@ destructor TFilePreview.Destroy;
 begin
   FDestroying := True;
   Inc(FLoadGen);
+  Inc(FMeshGen);
   FreeAndNil(FIcoFrames);
   if FTextJob <> nil then
   begin
@@ -1073,6 +1137,18 @@ begin
   FImage.WrapMode := TImageWrapMode.Stretch;
   FImage.Visible := False;
   FImage.HitTest := False;
+
+  FMeshHint := TText.Create(Self);
+  FMeshHint.Parent := FImgHost;
+  FMeshHint.Align := TAlignLayout.Bottom;
+  FMeshHint.Height := 18;
+  FMeshHint.HitTest := False;
+  FMeshHint.Visible := False;
+  ApplyFluentText(FMeshHint, 11, False);
+  FMeshHint.TextSettings.HorzAlign := TTextAlign.Center;
+  FMeshHint.TextSettings.VertAlign := TTextAlign.Center;
+  FMeshHint.TextSettings.Trimming := TTextTrimming.Character;
+  FMeshHint.WordWrap := False;
 
   FMemo := TMemo.Create(Self);
   FMemo.Parent := FBody;
@@ -1414,6 +1490,15 @@ begin
   {$ENDIF}
   if FFontOn then
     LayoutFont;
+  if FMeshOn and Assigned(FImgHost) and FImgHost.Visible and Assigned(FImage) and
+     FImage.Visible and (FImage.Bitmap.Width > 0) then
+  begin
+    if not FMeshPicture then
+      FImgHost.Cursor := crHandPoint;
+    if (Abs(Round(FImgHost.Width) - FMeshRendW) > 48) or
+       (Abs(Round(FImgHost.Height) - FMeshRendH) > 48) then
+      ScheduleMeshFrame;
+  end;
 end;
 
 function TFilePreview.ImgViewActive: Boolean;
@@ -1585,6 +1670,22 @@ var
   Scale, Dw, Dh, L, T, OldScale, NewScale, NewDw, NewDh, FracX, FracY: Single;
   Mouse: TPointF;
 begin
+  if FMeshOn and not FMeshPicture then
+  begin
+    if WheelDelta = 0 then
+      Exit;
+    Handled := True;
+    if WheelDelta > 0 then
+      FMeshScale := FMeshScale * 1.12
+    else
+      FMeshScale := FMeshScale / 1.12;
+    if FMeshScale < 0.4 then
+      FMeshScale := 0.4
+    else if FMeshScale > 6 then
+      FMeshScale := 6;
+    ScheduleMeshFrame;
+    Exit;
+  end;
   if WheelDelta = 0 then
     Exit;
   if not ImgViewActive then
@@ -1621,6 +1722,22 @@ var
   Scale, Dw, Dh, L, T: Single;
   PanBtn: Boolean;
 begin
+  if FMeshOn and not FMeshPicture then
+  begin
+    FocusViewer;
+    if Button <> TMouseButton.mbLeft then
+      Exit;
+    FMeshDrag := True;
+    FMeshDragX := X;
+    FMeshDragY := Y;
+    FMeshHintGone := True;
+    if Assigned(FMeshHint) then
+      FMeshHint.Visible := False;
+    if Assigned(FImgHost.Root) then
+      FImgHost.Root.Captured := FImgHost;
+    FImgHost.Cursor := crHandPoint;
+    Exit;
+  end;
   FocusViewer;
   if FCropping or not ImgViewActive then
     Exit;
@@ -1640,6 +1757,21 @@ end;
 
 procedure TFilePreview.ImgMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
 begin
+  if FMeshOn and not FMeshPicture then
+  begin
+    if not FMeshDrag then
+      Exit;
+    FMeshAz := FMeshAz - (X - FMeshDragX) * 0.4;
+    FMeshEl := FMeshEl + (Y - FMeshDragY) * 0.4;
+    if FMeshEl > 89 then
+      FMeshEl := 89
+    else if FMeshEl < -89 then
+      FMeshEl := -89;
+    FMeshDragX := X;
+    FMeshDragY := Y;
+    ScheduleMeshFrame;
+    Exit;
+  end;
   if not FImgPanning then
     Exit;
   FImgPan.X := FImgPan.X + (X - FImgPanLast.X);
@@ -1651,6 +1783,14 @@ end;
 procedure TFilePreview.ImgMouseUp(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Single);
 begin
+  if FMeshDrag then
+  begin
+    FMeshDrag := False;
+    if Assigned(FImgHost) and Assigned(FImgHost.Root) and
+       Assigned(FImgHost.Root.Captured) and (FImgHost.Root.Captured.GetObject = FImgHost) then
+      FImgHost.Root.Captured := nil;
+    Exit;
+  end;
   if not FImgPanning then
     Exit;
   FImgPanning := False;
@@ -1865,6 +2005,17 @@ procedure TFilePreview.HideViewers;
 begin
   FKindKey := '';
   FInfoKey := '';
+  ClearHdr;
+  if FMeshDrag and Assigned(FImgHost) and Assigned(FImgHost.Root) and
+     Assigned(FImgHost.Root.Captured) and (FImgHost.Root.Captured.GetObject = FImgHost) then
+    FImgHost.Root.Captured := nil;
+  FMeshOn := False;
+  FMeshDrag := False;
+  FMeshPending := False;
+  FMeshPicture := False;
+  Inc(FMeshGen);
+  if Assigned(FMeshHint) then
+    FMeshHint.Visible := False;
   FPdfPrintW := 0;
   FPdfPrintH := 0;
   FPdfPointW := 0;
@@ -1986,7 +2137,7 @@ function TFilePreview.ClassifyExt(const AExt: string): Integer;
 begin
   if ExtIn(AExt, ['.jpg', '.jpeg', '.jpe', '.png', '.bmp', '.dib', '.gif', '.tif', '.tiff',
     '.webp', '.ico', '.cur', '.jfif', '.heic', '.heif', '.jxl', '.dds', '.svg', '.svgz',
-    '.emf', '.wmf', '.eps', '.cdr', '.cdt', '.psd', '.psb', '.tga', '.avif', '.lottie', '.tgs']) then
+    '.emf', '.wmf', '.eps', '.cdr', '.cdt', '.dxf', '.psd', '.psb', '.tga', '.avif', '.lottie', '.tgs']) then
     Exit(PK_IMAGE);
   if ExtIn(AExt, ['.txt', '.log', '.ini', '.inf', '.md', '.markdown',
  '.json', '.htm', '.html', '.xhtml', '.shtml',   '.m3u8', '.m3u',
@@ -2017,6 +2168,8 @@ begin
   if ExtIn(AExt, ['.docx', '.docm', '.dotx', '.dotm', '.odt', '.rtf', '.doc',
     '.ppt', '.vsd', '.vsdx']) then
     Exit(PK_DOC);
+  if ExtIn(LowerCase(AExt), ['.stl', '.obj', '.ply', '.gltf', '.glb', '.blend']) then
+    Exit(PK_MESH);
 
   Result := PK_OTHER;
 end;
@@ -7672,6 +7825,26 @@ begin
   Result := False;
   Ext := LowerCase(ExtractFileExt(APath));
   try
+    if Ext = '.dxf' then
+    begin
+      if LoadDxfPreview(APath, FImage.Bitmap, 2400) then
+      begin
+        FImgKind := ivRaster;
+        FViewW := FImage.Bitmap.Width;
+        FViewH := FImage.Bitmap.Height;
+        FMetaPrintW := 0;
+        FMetaPrintH := 0;
+        FMetaScreenW := 0;
+        FMetaScreenH := 0;
+        FFrameW := FViewW;
+        FFrameH := FViewH;
+        if Assigned(FKindText) then
+          SetKindRaw('DXF');
+        ShowRasterImage;
+        Exit(True);
+      end;
+      Exit(False);
+    end;
     if ExtIn(Ext, ['.emf', '.wmf', '.eps', '.cdr', '.cdt']) then
     begin
       if LoadVectorPreview(APath, FImage.Bitmap, VecLabel,
@@ -9892,7 +10065,7 @@ end;
 
 procedure TFilePreview.LayoutImageFooter(Sender: TObject);
 var
-  Y, W, X, Total, SaveW: Single;
+  Y, W, X, Total, SaveW, RightW: Single;
   I: Integer;
   Btns: array[0..5] of TFluentButton;
 begin
@@ -9967,15 +10140,35 @@ begin
     if Assigned(FEditRule) then
       FEditRule.SetBounds(0, 0, W, 1);
     Total := 108 + 8 + 36 + 8 + 36;
-    X := (W - Total) / 2;
+    RightW := 0;
+    if FHdrOn and Assigned(FHdrTrack) then
+      RightW := 168 + 4 + 48 + 8;
+    X := (W - RightW - Total) / 2;
     if X < 8 then
       X := 8;
+    if RightW > 0 then
+    begin
+      if X + Total > W - RightW - 8 then
+        X := Max(8, W - RightW - 8 - Total);
+    end;
     if Assigned(FZoomCombo) then
       FZoomCombo.SetBounds(X, 4, 108, 32);
     if Assigned(FBtnFit) then
       FBtnFit.SetBounds(X + 116, 4, 36, 32);
     if Assigned(FBtnEdit) then
       FBtnEdit.SetBounds(X + 160, 4, 36, 32);
+    if Assigned(FHdrTrack) then
+    begin
+      FHdrTrack.Visible := FHdrOn and Assigned(FViewBar) and FViewBar.Visible;
+      if FHdrTrack.Visible then
+        FHdrTrack.SetBounds(W - 12 - 48 - 168, 4, 168, 32);
+    end;
+    if Assigned(FHdrEv) then
+    begin
+      FHdrEv.Visible := FHdrOn and Assigned(FViewBar) and FViewBar.Visible;
+      if FHdrEv.Visible then
+        FHdrEv.SetBounds(W - 12 - 44, 4, 44, 32);
+    end;
     SaveW := 128;
     if Assigned(FBtnSave) then
       FBtnSave.SetBounds(W - 12 - SaveW, 4, SaveW, 32);
@@ -10467,7 +10660,18 @@ begin
 end;
 
 procedure TFilePreview.ImgDblClick(Sender: TObject);
+var
+  Cam: TMeshCamera;
 begin
+  if FMeshOn and not FMeshPicture then
+  begin
+    Cam := MeshHomeCamera;
+    FMeshAz := Cam.Azimuth;
+    FMeshEl := Cam.Elevation;
+    FMeshScale := Cam.Scale;
+    ScheduleMeshFrame;
+    Exit;
+  end;
   if FCropping then
   begin
     ApplyCrop;
@@ -12030,6 +12234,10 @@ begin
     FEditRule.Fill.Color := FColors.DividerColor;
   if Assigned(FEditWarn) then
     FEditWarn.TextSettings.FontColor := FColors.SubTextColor;
+  if Assigned(FHdrEv) then
+    FHdrEv.TextSettings.FontColor := FColors.TextColor;
+  if Assigned(FHdrTrack) and FHdrTrack.Visible then
+    FHdrTrack.Repaint;
   if Assigned(FSizeWLbl) then
     FSizeWLbl.TextSettings.FontColor := FColors.TextColor;
   if Assigned(FSizeHLbl) then
@@ -12339,6 +12547,26 @@ begin
   TrHint(FBtnFit, 'qv.fit');
   FBtnEdit := MakeIconButton(Self, FViewBar, #$E70F, '', fbkSubtle, 36, ImgEditClick);
   TrHint(FBtnEdit, 'qv.edit');
+  FHdrTrack := TPaintBox.Create(Self);
+  FHdrTrack.Parent := FViewBar;
+  FHdrTrack.Align := TAlignLayout.None;
+  FHdrTrack.Visible := False;
+  FHdrTrack.HitTest := True;
+  FHdrTrack.AutoCapture := True;
+  FHdrTrack.OnPaint := PaintHdrSeek;
+  FHdrTrack.OnMouseDown := HdrSeekDown;
+  FHdrTrack.OnMouseMove := HdrSeekMove;
+  FHdrTrack.OnMouseUp := HdrSeekUp;
+  TrHint(FHdrTrack, 'qv.hdr.exposure');
+  FHdrEv := TText.Create(Self);
+  FHdrEv.Parent := FViewBar;
+  FHdrEv.Align := TAlignLayout.None;
+  FHdrEv.HitTest := False;
+  FHdrEv.Visible := False;
+  ApplyFluentText(FHdrEv, 12, False);
+  FHdrEv.TextSettings.HorzAlign := TTextAlign.Leading;
+  FHdrEv.TextSettings.VertAlign := TTextAlign.Center;
+  FHdrEv.Text := '0.0';
 
   FEditBar := TLayout.Create(Self);
   FEditBar.Parent := FFooterHost;
@@ -12799,6 +13027,528 @@ begin
   Result := (ASize = BSize) and (Abs(AAge - BAge) < (0.2 / 86400.0));
 end;
 
+procedure TFilePreview.MeshRenderSize(out AW, AH: Integer);
+begin
+  AW := 640;
+  AH := 480;
+  if Assigned(FImgHost) and (FImgHost.Width >= 32) and (FImgHost.Height >= 32) then
+  begin
+    AW := Round(FImgHost.Width);
+    AH := Round(FImgHost.Height);
+  end;
+  if AW < 32 then
+    AW := 32;
+  if AH < 32 then
+    AH := 32;
+  if AW > 2560 then
+    AW := 2560;
+  if AH > 2560 then
+    AH := 2560;
+end;
+
+procedure TFilePreview.ShowMeshFail(AErr: Integer);
+var
+  Key: string;
+begin
+  if Assigned(FImage) and FImage.Visible and (FImage.Bitmap.Width > 0) then
+    Exit;
+  if AErr = Ord(meBad) then
+    Key := 'qv.mesh.bad'
+  else if AErr = Ord(meBlend) then
+    Key := 'qv.mesh.blend'
+  else
+    Key := 'qv.mesh.empty';
+  if Assigned(FImgHost) then
+    FImgHost.Visible := False;
+  ShowInfoKey(Key);
+  SetKindRaw(MeshKindName(TMeshKind(FMeshKind)));
+end;
+
+procedure TFilePreview.ApplyMeshChrome;
+var
+  Count, Line, Name: string;
+begin
+  Name := MeshKindName(TMeshKind(FMeshKind));
+  if Name = '' then
+    Name := UpperCase(Copy(FMeshExt, 2, 8));
+  FKindKey := '';
+  SetKindRaw(Name);
+  if FMeshPicture then
+    Line := Name + ' · ' + IntToStr(FMeshPicW) + '×' + IntToStr(FMeshPicH) +
+      ' · ' + FormatFileSize(FMeshBytes)
+  else
+  begin
+    if FMeshPoints > 0 then
+      Count := Lf('qv.mesh.pts', [IntToStr(FMeshPoints)])
+    else
+      Count := Lf('qv.mesh.tris', [IntToStr(FMeshTris)]);
+    if FMeshSimple then
+      Count := Count + ' ~';
+    Line := Lf('qv.mesh.stats', [Name, IntToStr(FMeshVerts), Count, FormatFileSize(FMeshBytes)]);
+  end;
+  if Assigned(FMeta) then
+  begin
+    FMeta.Visible := True;
+    FMeta.Text := Line;
+  end;
+  if Assigned(FMeshHint) then
+  begin
+    FMeshHint.Text := L('qv.mesh.turn');
+    FMeshHint.Visible := FMeshOn and not FMeshPicture and not FMeshHintGone;
+    if FMeshHint.Visible then
+      FMeshHint.BringToFront;
+  end;
+end;
+
+procedure TFilePreview.FinishOrdinary(const ALocal, AExt: string);
+begin
+  if Assigned(FInfo) then
+    FInfo.Visible := False;
+  FInfoKey := '';
+  {$IFDEF MSWINDOWS}
+  if not IsExcelExt(AExt) then
+    if LoadNativePreview(ALocal) then
+    begin
+      SetKindRaw(UpperCase(Copy(AExt, 2, 8)));
+      Exit;
+    end;
+  {$ENDIF}
+  if IsListedTextExt(AExt) or LooksLikeText(ALocal) then
+  begin
+    FTextEnc := temAuto;
+    StartTextLoad(ALocal);
+    Exit;
+  end;
+  ShowFileCard(ALocal);
+end;
+
+procedure TFilePreview.ApplyMeshFrame(ABmp: TBitmap; AErr: Integer;
+  APicture, ASimple: Boolean; AKind: Integer; AVerts, ATris, APoints, ABytes: Int64;
+  APicW, APicH: Integer; AGen, ALoadGen: Integer);
+begin
+  FMeshBusy := False;
+  try
+    if FDestroying or (AGen <> FMeshGen) or (ALoadGen <> FLoadGen) or not FMeshOn then
+      Exit;
+    if AErr = Ord(meNotMesh) then
+    begin
+      FMeshOn := False;
+      if Assigned(FMeshHint) then
+        FMeshHint.Visible := False;
+      FinishOrdinary(FMeshPath, FMeshExt);
+      Exit;
+    end;
+    FMeshKind := AKind;
+    FMeshPicture := APicture;
+    FMeshSimple := ASimple;
+    FMeshVerts := AVerts;
+    FMeshTris := ATris;
+    FMeshPoints := APoints;
+    FMeshBytes := ABytes;
+    FMeshPicW := APicW;
+    FMeshPicH := APicH;
+    if (ABmp = nil) or (AErr <> Ord(meNone)) then
+    begin
+      if AErr <> Ord(meNone) then
+        ShowMeshFail(AErr);
+      Exit;
+    end;
+    FImage.Bitmap.Assign(ABmp);
+    if Assigned(FInfo) then
+      FInfo.Visible := False;
+    FInfoKey := '';
+    ShowRasterImage(True);
+    ShowImageTools(False);
+    ApplyMeshChrome;
+    if not FMeshPicture and Assigned(FImgHost) then
+      FImgHost.Cursor := crHandPoint;
+  finally
+    FreeAndNil(ABmp);
+    if FMeshPending and FMeshOn and not FDestroying and not FMeshBusy then
+      ScheduleMeshFrame;
+  end;
+end;
+
+procedure TFilePreview.ScheduleMeshFrame;
+var
+  Path: string;
+  W, H, Gen, LoadGen: Integer;
+  Cam: TMeshCamera;
+begin
+  if not FMeshOn or FDestroying then
+    Exit;
+  if FMeshBusy then
+  begin
+    FMeshPending := True;
+    Exit;
+  end;
+  FMeshBusy := True;
+  FMeshPending := False;
+  Inc(FMeshGen);
+  Gen := FMeshGen;
+  LoadGen := FLoadGen;
+  Path := FMeshPath;
+  Cam.Azimuth := FMeshAz;
+  Cam.Elevation := FMeshEl;
+  Cam.Scale := FMeshScale;
+  MeshRenderSize(W, H);
+  FMeshRendW := W;
+  FMeshRendH := H;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Info: TMeshInfo;
+      Bmp: TBitmap;
+      Err, Kind, PicW, PicH: Integer;
+      Picture, Simple: Boolean;
+      Verts, Tris, Points, Bytes: Int64;
+    begin
+      Bmp := nil;
+      Err := Ord(meBad);
+      Kind := 0;
+      Picture := False;
+      Simple := False;
+      Verts := 0;
+      Tris := 0;
+      Points := 0;
+      Bytes := 0;
+      PicW := 0;
+      PicH := 0;
+      try
+        Bmp := RenderMeshView(Path, W, H, Cam, Info,
+          function: Boolean
+          begin
+            Result := FDestroying or (Gen <> FMeshGen) or (LoadGen <> FLoadGen);
+          end);
+        Err := Ord(Info.Error);
+        Kind := Ord(Info.Kind);
+        Picture := Info.Picture;
+        Simple := Info.Simplified;
+        Verts := Info.Vertices;
+        Tris := Info.Triangles;
+        Points := Info.Points;
+        Bytes := Info.Bytes;
+        PicW := Info.PicW;
+        PicH := Info.PicH;
+      except
+        FreeAndNil(Bmp);
+        Err := Ord(meBad);
+      end;
+      TThread.Queue(nil,
+        procedure
+        begin
+          if FDestroying then
+          begin
+            Bmp.Free;
+            FMeshBusy := False;
+            Exit;
+          end;
+          ApplyMeshFrame(Bmp, Err, Picture, Simple, Kind, Verts, Tris, Points, Bytes,
+            PicW, PicH, Gen, LoadGen);
+        end);
+    end).Start;
+end;
+
+procedure TFilePreview.StartMeshLoad(const ALocal: string);
+var
+  Cam: TMeshCamera;
+begin
+  Cam := MeshHomeCamera;
+  FMeshOn := True;
+  FMeshPicture := False;
+  FMeshDrag := False;
+  FMeshHintGone := False;
+  FMeshPending := False;
+  FMeshSimple := False;
+  FMeshPath := ALocal;
+  FMeshExt := LowerCase(ExtractFileExt(ALocal));
+  FMeshKind := 0;
+  FMeshAz := Cam.Azimuth;
+  FMeshEl := Cam.Elevation;
+  FMeshScale := Cam.Scale;
+  FMeshVerts := 0;
+  FMeshTris := 0;
+  FMeshPoints := 0;
+  FMeshBytes := 0;
+  FMeshPicW := 0;
+  FMeshPicH := 0;
+  FMeshRendW := 0;
+  FMeshRendH := 0;
+  if FMeshExt = '.gltf' then
+    SetKindRaw('glTF')
+  else
+    SetKindRaw(UpperCase(Copy(FMeshExt, 2, 8)));
+  if Assigned(FMeshHint) then
+    FMeshHint.Visible := False;
+  ShowInfoKey('qv.loading');
+  ScheduleMeshFrame;
+end;
+
+function HdrEvText(V: Single): string;
+begin
+  Result := FormatFloat('0.0', V);
+  if V > 0.049 then
+    Result := '+' + Result;
+end;
+
+procedure TFilePreview.ClearHdr;
+begin
+  FHdrOn := False;
+  FHdrW := 0;
+  FHdrH := 0;
+  FHdrKind := '';
+  FHdrFailKey := '';
+  FHdrEvVal := 0;
+  FHdrShown := 0;
+  FHdrDrag := False;
+  SetLength(FHdrRgb, 0);
+  FHdrLock := True;
+  try
+    if Assigned(FHdrTrack) then
+      FHdrTrack.Visible := False;
+  finally
+    FHdrLock := False;
+  end;
+  if Assigned(FHdrEv) then
+  begin
+    FHdrEv.Text := '0.0';
+    FHdrEv.Visible := False;
+  end;
+end;
+
+function TFilePreview.HdrXToEv(X: Single): Single;
+var
+  W, T, V: Single;
+  N: Integer;
+begin
+  Result := 0;
+  if not Assigned(FHdrTrack) then
+    Exit;
+  W := FHdrTrack.Width;
+  if W < 17 then
+    W := 17;
+  T := EnsureRange((X - 8) / (W - 16), 0, 1);
+  V := -3 + T * 6;
+  if V >= 0 then
+    N := Trunc(V * 10 + 0.5)
+  else
+    N := -Trunc(-V * 10 + 0.5);
+  Result := EnsureRange(N / 10, -3, 3);
+end;
+
+procedure TFilePreview.PaintHdrSeek(Sender: TObject; Canvas: TCanvas);
+var
+  R, Track, FillR: TRectF;
+  Cy, X, T: Single;
+begin
+  if not (Sender is TPaintBox) then
+    Exit;
+  R := TPaintBox(Sender).LocalRect;
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := TAlphaColors.Null;
+  Canvas.FillRect(R, 0, 0, [], 1);
+  Cy := R.Top + R.Height * 0.5;
+  Track := TRectF.Create(R.Left + 8, Cy - 3, R.Right - 8, Cy + 3);
+  if Track.Width < 1 then
+    Exit;
+  Canvas.Fill.Color := FColors.ControlFill;
+  Canvas.FillRect(Track, 3, 3, AllCorners, 1);
+  T := (EnsureRange(FHdrEvVal, -3, 3) + 3) / 6;
+  X := Track.Left + T * Track.Width;
+  FillR := TRectF.Create(Track.Left, Track.Top, X, Track.Bottom);
+  Canvas.Fill.Color := FColors.SelectionColor;
+  Canvas.FillRect(FillR, 3, 3, AllCorners, 1);
+  Canvas.FillEllipse(TRectF.Create(X - 6, Cy - 6, X + 6, Cy + 6), 1);
+end;
+
+procedure TFilePreview.HdrSeekDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if (Button <> TMouseButton.mbLeft) or FDestroying or not FHdrOn then
+    Exit;
+  FHdrDrag := True;
+  FHdrEvVal := HdrXToEv(X);
+  if Assigned(FHdrEv) then
+    FHdrEv.Text := HdrEvText(FHdrEvVal);
+  if Assigned(FHdrTrack) then
+    FHdrTrack.Repaint;
+end;
+
+procedure TFilePreview.HdrSeekMove(Sender: TObject; Shift: TShiftState;
+  X, Y: Single);
+begin
+  if FHdrDrag and not (ssLeft in Shift) then
+  begin
+    HdrSeekUp(Sender, TMouseButton.mbLeft, Shift, X, Y);
+    Exit;
+  end;
+  if not FHdrDrag or FDestroying or not FHdrOn then
+    Exit;
+  FHdrEvVal := HdrXToEv(X);
+  if Assigned(FHdrEv) then
+    FHdrEv.Text := HdrEvText(FHdrEvVal);
+  if Assigned(FHdrTrack) then
+    FHdrTrack.Repaint;
+end;
+
+procedure TFilePreview.HdrSeekUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  if not FHdrDrag then
+    Exit;
+  FHdrDrag := False;
+  if FDestroying or not FHdrOn then
+    Exit;
+  FHdrEvVal := HdrXToEv(X);
+  if Assigned(FHdrEv) then
+    FHdrEv.Text := HdrEvText(FHdrEvVal);
+  if Assigned(FHdrTrack) then
+    FHdrTrack.Repaint;
+  ApplyHdrExposure;
+end;
+
+procedure TFilePreview.ApplyHdrExposure;
+var
+  Bmp: TBitmap;
+  Ev: Single;
+begin
+  if FHdrLock or FDestroying or not FHdrOn or (FHdrW < 1) or (FHdrH < 1) then
+    Exit;
+  if Length(FHdrRgb) < FHdrW * FHdrH * 3 then
+    Exit;
+  Ev := EnsureRange(FHdrEvVal, -3, 3);
+  if Abs(Ev - FHdrShown) < 0.001 then
+    Exit;
+  if Assigned(FHdrEv) then
+    FHdrEv.Text := HdrEvText(Ev);
+  Bmp := TBitmap.Create;
+  try
+    if not ToneMapHdr(FHdrRgb, FHdrW, FHdrH, Ev, Bmp) then
+      Exit;
+    FHdrShown := Ev;
+    if FImgOriginal = nil then
+      FImgOriginal := TBitmap.Create;
+    FImgOriginal.Assign(Bmp);
+    if Length(FImgOps) = 0 then
+    begin
+      if Assigned(FImage) then
+      begin
+        FImage.Bitmap.Assign(Bmp);
+        FImage.Visible := True;
+      end;
+      FViewW := Bmp.Width;
+      FViewH := Bmp.Height;
+      ShowRasterImage(False);
+    end
+    else
+      KickRebuild;
+  finally
+    Bmp.Free;
+  end;
+end;
+
+procedure TFilePreview.ShowHdrFail(const AExt: string; ANoRgb: Boolean);
+var
+  Kind, Key: string;
+begin
+  Kind := HdrKindName(AExt);
+  FHdrKind := Kind;
+  try
+    ShowFileCard(FPath);
+  except
+  end;
+  SetKindRaw(Kind);
+  if ANoRgb then
+  begin
+    FHdrFailKey := '';
+    FFileType := Kind;
+  end
+  else
+  begin
+    if Kind = 'EXR' then
+      Key := 'qv.exr.fail'
+    else
+      Key := 'qv.hdr.fail';
+    FHdrFailKey := Key;
+    FInfoKey := Key;
+    FFileType := L(Key);
+    if Assigned(FMeta) then
+    begin
+      FMeta.Visible := True;
+      FMeta.Text := L(Key);
+    end;
+  end;
+  if Assigned(FFileBox) then
+    FFileBox.Repaint;
+end;
+
+procedure TFilePreview.LoadHdrView(const ALocal: string);
+var
+  Img: THdrImage;
+  Err: THdrError;
+  Bmp: TBitmap;
+  Ext, Name: string;
+begin
+  Ext := LowerCase(ExtractFileExt(ALocal));
+  FHdrKind := HdrKindName(Ext);
+  Img.Clear;
+  try
+    Err := LoadHdrImage(ALocal, Img);
+  except
+    Err := heBad;
+    Img.Clear;
+  end;
+  if Err <> heNone then
+  begin
+    Img.Clear;
+    ShowHdrFail(Ext, Err = heNoRgb);
+    Exit;
+  end;
+  FHdrW := Img.Width;
+  FHdrH := Img.Height;
+  FHdrRgb := Img.Rgb;
+  SetLength(Img.Rgb, 0);
+  Bmp := TBitmap.Create;
+  try
+    if not ToneMapHdr(FHdrRgb, FHdrW, FHdrH, 0, Bmp) then
+    begin
+      ClearHdr;
+      ShowHdrFail(Ext, False);
+      Exit;
+    end;
+    FHdrOn := True;
+    FHdrFailKey := '';
+    if FImgOriginal = nil then
+      FImgOriginal := TBitmap.Create;
+    FImgOriginal.Assign(Bmp);
+    if Assigned(FImage) then
+      FImage.Bitmap.Assign(Bmp);
+  finally
+    Bmp.Free;
+  end;
+  FImgKind := ivRaster;
+  FViewW := FHdrW;
+  FViewH := FHdrH;
+  FFrameW := FHdrW;
+  FFrameH := FHdrH;
+  FHdrEvVal := 0;
+  FHdrShown := 0;
+  FHdrDrag := False;
+  if Assigned(FHdrEv) then
+    FHdrEv.Text := '0.0';
+  ShowRasterImage(True);
+  ShowImageTools(True);
+  Name := ExtractFileName(ExcludeTrailingPathDelimiter(FPath));
+  if Name = '' then
+    Name := ExtractFileName(ALocal);
+  FTitle.Text := Name + ' · ' + FHdrKind;
+  SetHeaderPixels(FHdrW, FHdrH);
+  if Assigned(FInfo) then
+    FInfo.Visible := False;
+  FInfoKey := '';
+  LayoutImageFooter(nil);
+end;
+
 procedure TFilePreview.DoLoad(const APath: string);
 var
   Local, Ext: string;
@@ -12870,6 +13620,11 @@ begin
   end;
 
   Ext := LowerCase(ExtractFileExt(Local));
+  if IsHdrExt(Ext) then
+  begin
+    LoadHdrView(Local);
+    Exit;
+  end;
   if OpenLottieView(Local) then
     Exit;
   if OpenSvgView(Local) then
@@ -12919,6 +13674,12 @@ begin
   begin
     if LoadAsImage(Local) then
       Exit;
+    if Ext = '.dxf' then
+    begin
+      ShowFileCard(Local);
+      SetKindRaw('DXF');
+      Exit;
+    end;
     if (Ext = '.svg') or (Ext = '.svgz') then
       if LoadAsText(Local) then
         Exit;
@@ -13062,24 +13823,14 @@ begin
       AdoptRasterView;
       Exit;
     end;
-  end;
-
-  {$IFDEF MSWINDOWS}
-  if not IsExcelExt(Ext) then
-    if LoadNativePreview(Local) then
-    begin
-      SetKindRaw(UpperCase(Copy(Ext, 2, 8)));
-      Exit;
-    end;
-  {$ENDIF}
-
-  if IsListedTextExt(Ext) or LooksLikeText(Local) then
+  end
+  else if Kind = PK_MESH then
   begin
-    FTextEnc := temAuto;
-    StartTextLoad(Local);
+    StartMeshLoad(Local);
     Exit;
   end;
-  ShowFileCard(Local);
+
+  FinishOrdinary(Local, Ext);
   finally
     if FCaptureKeys then
       FocusViewer;
@@ -13222,8 +13973,18 @@ begin
     ShowSigBanner(FSig);
   if FFontOn then
     RefreshFontKind
+  else if FMeshOn then
+    ApplyMeshChrome
   else if FKindKey <> '' then
     SetKindKey(FKindKey);
+  if (FHdrFailKey <> '') and not FHdrOn then
+  begin
+    if Assigned(FMeta) then
+      FMeta.Text := L(FHdrFailKey);
+    FFileType := L(FHdrFailKey);
+    if Assigned(FFileBox) and FFileBox.Visible then
+      FFileBox.Repaint;
+  end;
   if (FKindKey = 'qv.kind.sheet') and (FBook <> nil) and Assigned(FMeta) then
   begin
     ShowMeta(FPath);
@@ -13430,6 +14191,8 @@ begin
     FKindText.TextSettings.FontColor := AColors.SubTextColor;
   if Assigned(FMeta) then
     FMeta.TextSettings.FontColor := AColors.SubTextColor;
+  if Assigned(FMeshHint) then
+    FMeshHint.TextSettings.FontColor := AColors.SubTextColor;
   if Assigned(FInfo) then
     FInfo.TextSettings.FontColor := AColors.SubTextColor;
   if Assigned(FPanoBox) and FPanoBox.Visible then

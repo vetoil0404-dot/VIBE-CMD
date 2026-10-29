@@ -409,6 +409,11 @@ begin
   FOpacitySlider.OnDblClick := OpacitySliderDblClick;
   FCbOpacity := AddCheck(FTintCard, 'set.opacity',
     Assigned(FSettings) and (FSettings.Transparency > 0), OpacityEnabledClick);
+  FOpacitySlider.Visible := False;
+  FOpacitySlider.Height := 0;
+  FOpacitySlider.Margins.Rect := TRectF.Create(0, 0, 0, 0);
+  FCbOpacity.Visible := False;
+  FCbOpacity.Height := 0;
   FTintSlider := TPaintBox.Create(Self);
   FTintSlider.Parent := FTintCard;
   FTintSlider.Align := TAlignLayout.Top;
@@ -714,9 +719,9 @@ begin
     end;
   end;
   if ShowHint then
-    FTintCard.Height := 198
+    FTintCard.Height := 124
   else
-    FTintCard.Height := 160;
+    FTintCard.Height := 86;
   if Assigned(FTintSlider) then
     FTintSlider.Repaint;
   if Assigned(FOpacitySlider) then
@@ -967,11 +972,13 @@ begin
 
   { Список в карточке идёт снизу вверх: последний пункт оказывается сверху. }
   Card := AddCard(FPages[0], 'set.card.ui');
-  Card.Height := 22 + 8 * 36 + 16;
+  Card.Height := 22 + 7 * 36 + 16;
   FCbCmd := AddCheck(Card, 'set.ui.cmdline', FSettings.ShowCommandLine, OptionChanged);
   FCbFn := AddCheck(Card, 'set.ui.fn', FSettings.ShowFnBar, OptionChanged);
   FCbQuick := AddCheck(Card, 'set.ui.viewbtns', FSettings.ShowQuickAccess, OptionChanged);
   FCbDriveHome := AddCheck(Card, 'set.ui.drivehome', FSettings.ShowDriveHome, OptionChanged);
+  FCbDriveHome.Visible := False;
+  FCbDriveHome.Height := 0;
   FCbNetwork := AddCheck(Card, 'set.ui.network', FSettings.ShowNetworkButton, OptionChanged);
   FCbDrives := AddCheck(Card, 'set.ui.drives', FSettings.ShowDriveBar, OptionChanged);
   FCbMid := AddCheck(Card, 'set.ui.mid', FSettings.ShowMidBar, OptionChanged);
@@ -1226,7 +1233,12 @@ begin
   if not (Sender is TRectangle) then
     Exit;
   FSettings.WindowMaterial := TWindowMaterial(TRectangle(Sender).Tag);
+  if FSettings.WindowMaterial = wmNormal then
+    FSettings.Transparency := 0
+  else
+    FSettings.Transparency := 100;
   ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  ConfigureWindowOpacity(FSettings.Transparency);
   ScheduleSave;
   UpdateMaterialCards;
   SyncTintHint;

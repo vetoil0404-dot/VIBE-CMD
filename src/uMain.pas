@@ -129,11 +129,6 @@ type
     FSessionDirty: Boolean;
     FSessionSnap: Boolean;
     FSessionSaved: Boolean;
-    FSessionSig: string;
-    FLeftCursorSig: string;
-    FRightCursorSig: string;
-    FGeomL, FGeomT, FGeomW, FGeomH: Integer;
-    FGeomReady: Boolean;
     FFadeTimer: TTimer;
     FStartupTimer: TTimer;
     FIdlePlusTimer: TTimer;
@@ -888,6 +883,19 @@ begin
   FSettings.Load;
   SetLanguage(FSettings.Language);
   ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  if FSettings.WindowMaterial = wmNormal then
+  begin
+    if FSettings.Transparency <> 0 then
+    begin
+      FSettings.Transparency := 0;
+      FSettings.SaveAsync;
+    end;
+  end
+  else if FSettings.Transparency <> 100 then
+  begin
+    FSettings.Transparency := 100;
+    FSettings.SaveAsync;
+  end;
   ConfigureWindowOpacity(FSettings.Transparency);
   SeedDockIfNeeded(FSettings);
   SetActiveAppTheme(FSettings.Theme);
@@ -3192,56 +3200,13 @@ begin
 end;
 
 procedure TMainForm.SessionTimerTick(Sender: TObject);
-  function SideSig(const S: TSideState): string;
-  var
-    I: Integer;
-  begin
-    Result := IntToStr(S.ActiveTab);
-    for I := 0 to High(S.Tabs) do
-      Result := Result + '|' + S.Tabs[I].Path + #1 + S.Tabs[I].CursorPath +
-        #1 + IntToStr(Ord(S.Tabs[I].ViewMode)) +
-        #1 + IntToStr(S.Tabs[I].ZoomDetails) +
-        #1 + IntToStr(S.Tabs[I].ZoomTiles) +
-        #1 + IntToStr(S.Tabs[I].SortField) +
-        #1 + BoolToStr(S.Tabs[I].SortAsc, True);
-    for I := 0 to High(S.DriveLast) do
-      Result := Result + '|' + S.DriveLast[I].Root + '=' + S.DriveLast[I].Path;
-  end;
-  function DockSig: string;
-  var
-    I: Integer;
-  begin
-    Result := IntToStr(Ord(FSettings.DockAlign)) + BoolToStr(FSettings.DockShowSeparators, True);
-    for I := 0 to High(FSettings.DockItems) do
-    begin
-      Result := Result + '|' + FSettings.DockItems[I] + #1;
-      if I <= High(FSettings.DockCaptions) then
-        Result := Result + FSettings.DockCaptions[I];
-      Result := Result + #1;
-      if I <= High(FSettings.DockKinds) then
-        Result := Result + IntToStr(FSettings.DockKinds[I]);
-    end;
-  end;
-var
-  Sig: string;
 begin
   if Assigned(FSessionTimer) then
     FSessionTimer.Enabled := False;
   if (csDestroying in ComponentState) or not FSessionDirty then
     Exit;
   SnapshotSession;
-  if not Assigned(FSettings) then
-    Exit;
-  Sig := IntToStr(FSettings.ActivePanel) + '|' +
-    IntToStr(FSettings.WindowLeft) + '|' + IntToStr(FSettings.WindowTop) + '|' +
-    IntToStr(FSettings.WindowWidth) + '|' + IntToStr(FSettings.WindowHeight) + '|' +
-    BoolToStr(FSettings.WindowMaximized, True) + '|' +
-    FloatToStr(FSettings.SplitterPos) + '|' +
-    string.Join(#9, FSettings.SearchHistory) + '|' +
-    SideSig(FSettings.Left) + '|' + SideSig(FSettings.Right) + '|' + DockSig;
-  if Sig = FSessionSig then
-    Exit;
-  FSessionSig := Sig;
+  if Assigned(FSettings) then
   try
     FSettings.SaveSessionAsync;
   except
@@ -4825,23 +4790,8 @@ begin
 end;
 
 procedure TMainForm.FormResizeHandler(Sender: TObject);
-var
-  L, T, W, H: Integer;
 begin
-  L := Round(Left);
-  T := Round(Top);
-  W := Round(Width);
-  H := Round(Height);
-  if (not FGeomReady) or (L <> FGeomL) or (T <> FGeomT) or
-     (W <> FGeomW) or (H <> FGeomH) then
-  begin
-    FGeomReady := True;
-    FGeomL := L;
-    FGeomT := T;
-    FGeomW := W;
-    FGeomH := H;
-    MarkSessionDirty;
-  end;
+  MarkSessionDirty;
   UpdateWindowButtons;
   LayoutQuickSearch;
   LayoutWorkArea;
@@ -4994,31 +4944,10 @@ procedure TMainForm.PanelCursorChanged(Sender: TObject);
 var
   Other: TFilePanel;
   Entry: TFileEntry;
-  ColumnPath, WindowPath, Sig: string;
+  ColumnPath, WindowPath: string;
   ColumnOn, HasEntry, Remote: Boolean;
 begin
-  if Sender = FLeftPanel then
-  begin
-    Sig := FLeftPanel.CurrentPath;
-    if FLeftPanel.GetFocusedEntry(Entry) then
-      Sig := Sig + #1 + Entry.FullPath;
-    if Sig <> FLeftCursorSig then
-    begin
-      FLeftCursorSig := Sig;
-      MarkSessionDirty;
-    end;
-  end
-  else if Sender = FRightPanel then
-  begin
-    Sig := FRightPanel.CurrentPath;
-    if FRightPanel.GetFocusedEntry(Entry) then
-      Sig := Sig + #1 + Entry.FullPath;
-    if Sig <> FRightCursorSig then
-    begin
-      FRightCursorSig := Sig;
-      MarkSessionDirty;
-    end;
-  end;
+  MarkSessionDirty;
   if Sender <> FActivePanel then
     Exit;
   SyncCmdPath;
@@ -5588,6 +5517,10 @@ procedure TMainForm.OnThemeChangedFromSettings(NewTheme: TAppTheme);
 begin
   FSettings.Theme := NewTheme;
   ConfigureThemeTint(FSettings.ColorTint, FSettings.WindowMaterial);
+  if FSettings.WindowMaterial = wmNormal then
+    FSettings.Transparency := 0
+  else
+    FSettings.Transparency := 100;
   ConfigureWindowOpacity(FSettings.Transparency);
   FColors := GetThemeColors(NewTheme);
   ApplyThemeToAll(FColors);
