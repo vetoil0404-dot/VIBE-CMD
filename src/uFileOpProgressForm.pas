@@ -12,9 +12,10 @@ uses
   System.SysUtils, System.Classes, System.Types, System.UITypes, System.IOUtils,
   System.Generics.Collections,
   FMX.Types, FMX.Forms, FMX.Controls, FMX.Layouts, FMX.Objects, FMX.Graphics, FMX.StdCtrls,
+  FMX.TextLayout,
   {$IFDEF MSWINDOWS}Winapi.Windows, Winapi.DwmApi, FMX.Platform.Win,{$ENDIF}
   uThemeManager, uFluentChrome, uFluentComboBox, uFileOps, uFileOpEngine, uAppSettings,
-  uThumbCache, UCoreEngine;
+  uThumbCache, UCoreEngine, uConflictDialog, uFileModel;
 
 procedure RunVibeOperation(AKind: TFileOpKind; const ASources: TArray<string>;
   const ADest: string; AOnDone: TFileOpDoneProc; APermanent: Boolean = False;
@@ -34,6 +35,7 @@ type
     FBackground: Boolean;
     FArmedWait: Boolean;
     FFinished: Boolean;
+    FQuiet: Boolean;
 
     FRoot: TRectangle;
     FTitle: TText;
@@ -149,7 +151,7 @@ type
 implementation
 
 uses
-  System.Math, System.StrUtils, System.DateUtils, FMX.Dialogs, uFileModel,
+  System.Math, System.StrUtils, System.DateUtils, FMX.Dialogs,
   uArchiveEngine, uLang, uLangBind;
 
 type
@@ -171,6 +173,7 @@ type
     ErrorMsg: string;
     Progress: TFileOpProgress;
     DoneAt: TDateTime;
+    destructor Destroy; override;
   end;
 
 var
@@ -315,6 +318,11 @@ begin
 end;
 
 procedure HubPresent(J: TFileOpJob); forward;
+procedure HubPresentQuiet(J: TFileOpJob); forward;
+procedure HubFinishJob(AId: Integer; ASuccess: Boolean; const AErr: string;
+  AWasBg, ACloseForm: Boolean); forward;
+procedure HubQuietDone(AId: Integer; AOk: Boolean; const AErr: string); forward;
+procedure HubArm(AId: Integer; AToBackground: Boolean); forward;
 procedure HubBeginIO(J: TFileOpJob); forward;
 procedure HubResumeYielded(J: TFileOpJob); forward;
 procedure HubPromote; forward;
@@ -362,6 +370,31 @@ begin
   end;
 end;
 
+procedure ReleaseQuietEngine(Eng: TFileOpEngine);
+begin
+  if Eng = nil then
+    Exit;
+  Eng.OnDone := nil;
+  Eng.OnBatchConflict := nil;
+  Eng.OnConflict := nil;
+  Eng.OnItemDone := nil;
+  { Освободить после текущего сообщения: Run ещё может выходить. }
+  TThread.ForceQueue(nil,
+    procedure
+    begin
+      Eng.Free;
+    end);
+end;
+
+destructor TFileOpJob.Destroy;
+begin
+  if (Form = nil) and (Engine <> nil) then
+    ReleaseQuietEngine(Engine);
+  Engine := nil;
+  Form := nil;
+  inherited;
+end;
+
 procedure FireJobDone(J: TFileOpJob; AOk: Boolean; const AErr: string);
 var
   Cb: TFileOpDoneProc;
@@ -374,6 +407,72 @@ begin
     Cb(AOk, AErr);
 end;
 
+procedure HubQuietDone(AId: Integer; AOk: Boolean; const AErr: string);
+var
+  J: TFileOpJob;
+begin
+  J := HubFind(AId);
+  if J = nil then
+    Exit;
+  if J.Engine <> nil then
+  begin
+    J.Engine.OnDone := nil;
+    J.Engine.OnBatchConflict := nil;
+    J.Engine.OnConflict := nil;
+    J.Engine.OnItemDone := nil;
+  end;
+  FireJobDone(J, AOk, AErr);
+  HubFinishJob(AId, AOk, AErr, True, False);
+end;
+
+procedure HubPresentQuiet(J: TFileOpJob);
+var
+  Eng: TFileOpEngine;
+  JobId: Integer;
+  Kind: TFileOpKind;
+  Perm: Boolean;
+begin
+  Kind := J.Kind;
+  Perm := J.Permanent;
+  JobId := J.Id;
+  Eng := TFileOpEngine.Create(Kind, J.Sources, J.Dest, Perm);
+  Eng.OnItemDone := J.OnItemDone;
+  Eng.SpecialCopy :=
+    procedure(ASrc, ADst: string)
+    begin
+      if Kind = okDelete then
+        DeletePathSync(ASrc, Perm)
+      else if Kind <> okArchive then
+        CopyPathSync(ASrc, ADst);
+    end;
+  if Kind in [okCopy, okMove] then
+  begin
+    Eng.DeferConflicts := True;
+    Eng.OnBatchConflict :=
+      function(const AItems: TArray<TConflictItem>;
+        out AActions: TArray<TConflictAction>): Boolean
+      var
+        Own: TCommonCustomForm;
+      begin
+        Result := False;
+        SetLength(AActions, 0);
+        Own := Application.MainForm;
+        if Application.Terminated or (Own = nil) or
+           (csDestroying in Own.ComponentState) then
+          Exit;
+        Result := ShowConflictDialog(Own, AItems, AActions);
+      end;
+  end;
+  Eng.OnDone :=
+    procedure(AOk: Boolean; const AErr: string)
+    begin
+      HubQuietDone(JobId, AOk, AErr);
+    end;
+  J.Engine := Eng;
+  J.Background := True;
+  HubArm(J.Id, True);
+end;
+
 procedure HubPresent(J: TFileOpJob);
 var
   Eng: TFileOpEngine;
@@ -382,8 +481,14 @@ var
   Kind: TFileOpKind;
   Perm: Boolean;
 begin
-  if (J = nil) or (J.State <> jsQueued) or (J.Form <> nil) then
+  if (J = nil) or (J.State <> jsQueued) or (J.Form <> nil) or (J.Engine <> nil) then
     Exit;
+  { Тихий режим — тот же движок и очередь, без окна прогресса. }
+  if GetFileOpMode = fomQuiet then
+  begin
+    HubPresentQuiet(J);
+    Exit;
+  end;
   Kind := J.Kind;
   Perm := J.Permanent;
   Colors := GetThemeColors(ActiveAppTheme);
@@ -575,10 +680,34 @@ begin
     HubBeginIO(J);
 end;
 
+function DeviceOp(const P: TFileOpProgress): Boolean;
+begin
+  Result := IsVirtualShellPath(P.SourcePath) or IsPortableDevicePath(P.SourcePath) or
+    IsDeviceNamespacePath(P.SourcePath) or
+    IsVirtualShellPath(P.DestPath) or IsPortableDevicePath(P.DestPath) or
+    IsDeviceNamespacePath(P.DestPath);
+end;
+
+function TotalByFiles(const P: TFileOpProgress): Boolean;
+begin
+  { Байты идут — полоса по байтам. На устройстве счётчик байтов часто молчит,
+    хотя файлы уже прошли: тогда количество, не дожидаясь конца.
+    Байтов нет совсем — количество, как ветка ниже. }
+  if P.FilesTotal <= 0 then
+    Exit(False);
+  if P.TotalBytesDone > 0 then
+    Exit(False);
+  if P.MeasuredBytes <= 0 then
+    Exit(True);
+  Result := DeviceOp(P) and (P.FilesDone > 0);
+end;
+
 function JobPercent(const P: TFileOpProgress; out AIndet: Boolean): Integer;
 begin
   AIndet := False;
-  if P.TotalBytesTotal > 0 then
+  if TotalByFiles(P) then
+    Result := EnsureRange(Round(100.0 * P.FilesDone / P.FilesTotal), 0, 100)
+  else if P.TotalBytesTotal > 0 then
     Result := EnsureRange(Round(100.0 * P.TotalBytesDone / P.TotalBytesTotal), 0, 100)
   else if P.FilesTotal > 0 then
     Result := EnsureRange(Round(100.0 * P.FilesDone / P.FilesTotal), 0, 100)
@@ -587,6 +716,149 @@ begin
     Result := 0;
     AIndet := P.Phase in [opIdle, opScan, opReady];
   end;
+end;
+
+function MeasureOpLine(const AText: string): Single;
+var
+  L: TTextLayout;
+begin
+  L := TTextLayoutManager.DefaultTextLayout.Create;
+  try
+    L.BeginUpdate;
+    try
+      L.Font.Family := FluentFontFamily;
+      L.Font.Size := 12;
+      L.WordWrap := False;
+      L.Text := AText;
+    finally
+      L.EndUpdate;
+    end;
+    Result := L.TextWidth;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure SplitHumanSegs(const APath: string; out ASep: string;
+  out AParts: TArray<string>);
+var
+  Rest, Part: string;
+  P: Integer;
+begin
+  if Pos(' > ', APath) > 0 then
+    ASep := ' > '
+  else
+    ASep := '\';
+  SetLength(AParts, 0);
+  Rest := APath;
+  while Rest <> '' do
+  begin
+    P := Pos(ASep, Rest);
+    if P > 0 then
+    begin
+      Part := Copy(Rest, 1, P - 1);
+      Delete(Rest, 1, P + Length(ASep) - 1);
+    end
+    else
+    begin
+      Part := Rest;
+      Rest := '';
+    end;
+    if Part = '' then
+      Continue;
+    SetLength(AParts, Length(AParts) + 1);
+    AParts[High(AParts)] := Part;
+  end;
+end;
+
+function EllipsizeHuman(const APath: string; AWidth: Single): string;
+var
+  Sep: string;
+  Parts: TArray<string>;
+  N, I: Integer;
+  Tail, Last: string;
+begin
+  if APath = '' then
+    Exit('');
+  if (AWidth < 12) or (MeasureOpLine(APath) <= AWidth) then
+    Exit(APath);
+  SplitHumanSegs(APath, Sep, Parts);
+  if Length(Parts) = 0 then
+    Exit(APath);
+  for N := 0 to High(Parts) - 1 do
+  begin
+    Tail := '…';
+    for I := N + 1 to High(Parts) do
+      Tail := Tail + Sep + Parts[I];
+    if MeasureOpLine(Tail) <= AWidth then
+      Exit(Tail);
+  end;
+  Last := Parts[High(Parts)];
+  while (Length(Last) > 1) and (MeasureOpLine('…' + Last) > AWidth) do
+    Delete(Last, 1, 1);
+  Result := '…' + Last;
+end;
+
+function FitLabeledPath(const AKey, AHuman: string; AWidth: Single): string;
+var
+  Prefix, Full: string;
+  Room: Single;
+begin
+  Prefix := Lf(AKey, ['']);
+  Full := Prefix + AHuman;
+  if (AWidth < 24) or (MeasureOpLine(Full) <= AWidth) then
+    Exit(Full);
+  Room := AWidth - MeasureOpLine(Prefix);
+  if Room < 24 then
+    Room := AWidth;
+  Result := Prefix + EllipsizeHuman(AHuman, Room);
+end;
+
+function JoinHumanPath(const AFolder, AName: string; AShell: Boolean): string;
+begin
+  if AName = '' then
+    Exit(AFolder);
+  if AFolder = '' then
+    Exit(AName);
+  if AShell or (Pos(' > ', AFolder) > 0) then
+  begin
+    if EndsText(' > ' + AName, AFolder) or EndsText(AName, AFolder) then
+      Exit(AFolder);
+    Exit(AFolder + ' > ' + AName);
+  end;
+  if SameText(ExtractFileName(ExcludeTrailingPathDelimiter(AFolder)), AName) then
+    Exit(AFolder);
+  if EndsText('\', AFolder) then
+    Result := AFolder + AName
+  else
+    Result := AFolder + '\' + AName;
+end;
+
+function HumanDestPath(const P: TFileOpProgress; const AEngineDest: string): string;
+var
+  Raw, Tail, Real: string;
+  Shell: Boolean;
+begin
+  Raw := P.DestPath;
+  if Raw = '' then
+    Raw := AEngineDest;
+  Result := FriendlyFolderPath(Raw);
+  if P.Kind = okDelete then
+    Exit;
+  Tail := ExtractFileName(ExcludeTrailingPathDelimiter(Raw));
+  if not IsRawShellName(Tail) then
+    Exit;
+  Real := '';
+  if P.SourcePath <> '' then
+    Real := DisplayNameForPath(P.SourcePath);
+  if (Real = '') or IsRawShellName(Real) or (Real = '?') or
+     SameText(Real, L('drive.device')) then
+    Real := P.FileName;
+  if IsRawShellName(Real) or (Real = '?') or SameText(Real, L('drive.device')) then
+    Real := '';
+  Shell := IsVirtualShellPath(Raw) or IsPortableDevicePath(Raw) or
+    IsDeviceNamespacePath(Raw) or (Pos(' > ', Result) > 0);
+  Result := JoinHumanPath(Result, Real, Shell);
 end;
 
 function JobDetailText(J: TFileOpJob): string;
@@ -900,9 +1172,11 @@ begin
   begin
     Frm := J.Form;
     J.Form := nil;
-    J.Engine := nil;
     if Assigned(Frm) then
+    begin
+      J.Engine := nil;
       Frm.FJobId := 0;
+    end;
     GJobs.Remove(J);
     if Assigned(Frm) and not (csDestroying in Frm.ComponentState) then
       Frm.Close;
@@ -911,6 +1185,8 @@ begin
   end;
   if Assigned(J.Form) then
     J.Form.CancelClick(nil)
+  else if Assigned(J.Engine) then
+    J.Engine.Cancel
   else
   begin
     FireJobDone(J, False, L('op.cancelled'));
@@ -953,18 +1229,22 @@ begin
   if Drop then
   begin
     J.Form := nil;
-    J.Engine := nil;
     if Assigned(Frm) then
+    begin
+      J.Engine := nil;
       Frm.FJobId := 0;
+    end;
     GJobs.Remove(J);
     J := nil;
   end
   else if ACloseForm and (J <> nil) then
   begin
     J.Form := nil;
-    J.Engine := nil;
     if Assigned(Frm) then
+    begin
+      J.Engine := nil;
       Frm.FJobId := 0;
+    end;
   end;
   if ACloseForm and Assigned(Frm) and not (csDestroying in Frm.ComponentState) then
   begin
@@ -1139,11 +1419,34 @@ begin
   Position := TFormPosition.Designed;
   FormStyle := TFormStyle.StayOnTop;
   FEngine.OnDone := EngineDone;
+  FQuiet := GetFileOpMode = fomQuiet;
   FEngine.OnConflict :=
     procedure(const AInfo: TFileOpConflictInfo; AAnswer: TProc<TConflictChoice>)
     begin
       ShowConflict(AInfo, AAnswer);
     end;
+  if FQuiet and (AEngine.Kind in [okCopy, okMove]) then
+  begin
+    AEngine.DeferConflicts := True;
+    AEngine.OnBatchConflict :=
+      function(const AItems: TArray<TConflictItem>;
+        out AActions: TArray<TConflictAction>): Boolean
+      var
+        Own: TCommonCustomForm;
+      begin
+        Result := False;
+        SetLength(AActions, 0);
+        if Application.Terminated or (csDestroying in ComponentState) then
+          Exit;
+        if Visible then
+          Own := Self
+        else
+          Own := Application.MainForm;
+        if (Own <> nil) and (csDestroying in Own.ComponentState) then
+          Exit;
+        Result := ShowConflictDialog(Own, AItems, AActions);
+      end;
+  end;
   BuildUI;
   ApplyTheme(FColors);
   PlaceNearOwner;
@@ -1151,7 +1454,11 @@ begin
   FTimer.Interval := 80;
   FTimer.OnTimer := Tick;
   FTimer.Enabled := True;
-  ShowConfirm(FEngine.GetProgress);
+  if FQuiet then
+    { Тихий режим — тот же прогресс, без вопроса «копировать?». Старт после Show. }
+    FDeleteAsked := True
+  else
+    ShowConfirm(FEngine.GetProgress);
   { Размер нужен ещё в вопросе, до кнопки «Копировать». }
   FEngine.ScanAsync;
 end;
@@ -1169,6 +1476,7 @@ begin
   begin
     FEngine.OnDone := nil;
     FEngine.OnConflict := nil;
+    FEngine.OnBatchConflict := nil;
     if Application.Terminated and FEngine.DetachWorker then
       FEngine := nil
     else
@@ -1350,8 +1658,14 @@ begin
   FStats.Text := '';
   FPaths := MkText(FBody, 12, False, FColors.SubTextColor);
   FPaths.Text := L('op.from');
+  FPaths.HitTest := True;
+  FPaths.ShowHint := True;
+  FPaths.TextSettings.Trimming := TTextTrimming.None;
   FToPath := MkText(FBody, 12, False, FColors.SubTextColor);
   FToPath.Text := L('op.to');
+  FToPath.HitTest := True;
+  FToPath.ShowHint := True;
+  FToPath.TextSettings.Trimming := TTextTrimming.None;
   FCurLbl := MkText(FBody, 11, False, FColors.SubTextColor);
   FCurLbl.Text := L('op.current');
   FFileTrack := MkTrack(FBody, FFileFill, FFilePct);
@@ -1640,15 +1954,20 @@ end;
 procedure TFileOpProgressForm.PaintBars(const P: TFileOpProgress);
 var
   W, FileR, TotR: Single;
+  FileUnknown: Boolean;
 begin
   W := FFileTrack.Width;
   if W < 8 then
     Exit;
+  FileUnknown := (P.FileBytesTotal <= 0) and DeviceOp(P) and
+    (P.Phase in [opRun, opPaused]) and (P.FileName <> '');
   if P.FileBytesTotal > 0 then
     FileR := P.FileBytesDone / P.FileBytesTotal
   else
     FileR := 0;
-  if P.TotalBytesTotal > 0 then
+  if TotalByFiles(P) then
+    TotR := P.FilesDone / P.FilesTotal
+  else if P.TotalBytesTotal > 0 then
     TotR := P.TotalBytesDone / P.TotalBytesTotal
   else if P.FilesTotal > 0 then
     TotR := P.FilesDone / P.FilesTotal
@@ -1658,9 +1977,15 @@ begin
   if FileR > 1 then FileR := 1;
   if TotR < 0 then TotR := 0;
   if TotR > 1 then TotR := 1;
-  FFileFill.Width := Max(0, FileR * W);
-  FTotalFill.Width := Max(0, TotR * W);
-  FFilePct.Text := Format('%d%%', [Round(FileR * 100)]);
+  if FileUnknown then
+    FFileFill.Width := 0
+  else
+    FFileFill.Width := Max(0, FileR * W);
+  FTotalFill.Width := Max(0, TotR * (FTotalTrack.Width));
+  if FileUnknown then
+    FFilePct.Text := '…'
+  else
+    FFilePct.Text := Format('%d%%', [Round(FileR * 100)]);
   FTotalPct.Text := Format('%d%%', [Round(TotR * 100)]);
 end;
 
@@ -1697,7 +2022,7 @@ end;
 procedure TFileOpProgressForm.Tick(Sender: TObject);
 var
   P: TFileOpProgress;
-  St: string;
+  St, Human: string;
 begin
   if FEngine = nil then
     Exit;
@@ -1725,15 +2050,27 @@ begin
   else
     FCurLbl.Text := L('op.current');
   if P.SourcePath <> '' then
-    FPaths.Text := Lf('op.frompath', [FriendlyFolderPath(P.SourcePath)])
+  begin
+    Human := FriendlyFolderPath(P.SourcePath);
+    FPaths.Hint := Lf('op.frompath', [Human]);
+    FPaths.Text := FitLabeledPath('op.frompath', Human, FPaths.Width);
+  end
   else
+  begin
+    FPaths.Hint := '';
     FPaths.Text := L('op.from');
-  if P.DestPath <> '' then
-    FToPath.Text := Lf('op.topath', [FriendlyFolderPath(P.DestPath)])
-  else if FEngine.Dest <> '' then
-    FToPath.Text := Lf('op.topath', [FriendlyFolderPath(FEngine.Dest)])
+  end;
+  if (P.DestPath <> '') or (FEngine.Dest <> '') then
+  begin
+    Human := HumanDestPath(P, FEngine.Dest);
+    FToPath.Hint := Lf('op.topath', [Human]);
+    FToPath.Text := FitLabeledPath('op.topath', Human, FToPath.Width);
+  end
   else
+  begin
+    FToPath.Hint := '';
     FToPath.Text := L('op.to');
+  end;
   if Assigned(FConfirm) and FConfirm.Visible then
     ApplyConfirmBytes(P);
   St := P.Status;

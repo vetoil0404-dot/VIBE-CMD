@@ -24,8 +24,11 @@ function IsDriveRoot(const APath: string): Boolean;
 function DriveMemoryKey(const APath: string): string;
 function ComputerFolderPath: string;
 function DisplayNameForPath(const APath: string): string;
-{ Цепочка как в крошках: «Этот компьютер > D90 > DCIM», не parsing-имя. }
+{ Цепочка как в крошках: «Этот компьютер > D90 > DCIM», не parsing-имя.
+  Если имя устройства не прочиталось, не подставлять «Устройство > ?». }
 function FriendlyFolderPath(const APath: string): string;
+{ Object id MTP, \\?\usb# и прочий внутренний сегмент оболочки, не имя папки. }
+function IsRawShellName(const AName: string): Boolean;
 function TryShellItemSize(const APath: string; out ASize: Int64): Boolean;
 function IsArchiveExt(const AExt: string): Boolean;
 function IsArchiveFileName(const AName: string): Boolean;
@@ -207,6 +210,7 @@ var
   GZipBusy: Integer;
   GPidlLock: TCriticalSection;
   GPidlMap: TDictionary<string, TBytes>;
+  GShellCaps: TDictionary<string, string>;
   GDriveTypeLock: TCriticalSection;
   GDriveTypeCache: TDictionary<string, Cardinal>;
   GDriveTypePending: TDictionary<string, Boolean>;
@@ -568,6 +572,10 @@ begin
     Result := Copy(L, A, MaxInt);
 end;
 
+function UsableShellCaption(const AName: string): Boolean; forward;
+procedure NoteShellCaption(const APath, AName: string); forward;
+function LookupShellCaption(const APath: string): string; forward;
+
 {$IFDEF MSWINDOWS}
 function ShellItemName(const AItem: IShellItem; ASig: DWORD): string; forward;
 
@@ -632,7 +640,7 @@ end;
 procedure RememberShellItem(const AItem: IShellItem);
 var
   Pidl: PItemIDList;
-  Parse, Wpd: string;
+  Parse, Wpd, Cap: string;
 begin
   if AItem = nil then
     Exit;
@@ -641,6 +649,9 @@ begin
     Exit;
   try
     Parse := ShellItemName(AItem, SIGDN_DESKTOPABSOLUTEPARSING);
+    Cap := ShellItemName(AItem, SIGDN_NORMALDISPLAY);
+    if UsableShellCaption(Cap) then
+      NoteShellCaption(Parse, Cap);
     PidlCachePut(Parse, Pidl);
     Wpd := ExtractWpdId(Parse);
     if Wpd <> '' then
@@ -1007,6 +1018,11 @@ begin
   if IsVirtualShellPath(APath) and TryCreateShellItem(APath, Item) then
   begin
     Result := ShellItemName(Item, SIGDN_NORMALDISPLAY);
+    if UsableShellCaption(Result) then
+    begin
+      NoteShellCaption(APath, Result);
+      Exit;
+    end;
     if Result <> '' then
       Exit;
   end;
@@ -1023,54 +1039,316 @@ begin
   end;
 end;
 
+function IsGuidToken(const S: string): Boolean;
 var
-  GFriendlyRaw: string;
-  GFriendlyText: string;
+  I: Integer;
+begin
+  Result := Length(S) = 38;
+  if not Result then
+    Exit;
+  if (S[1] <> '{') or (S[38] <> '}') then
+    Exit(False);
+  if (S[10] <> '-') or (S[15] <> '-') or (S[20] <> '-') or (S[25] <> '-') then
+    Exit(False);
+  for I := 2 to 37 do
+    if not (I in [10, 15, 20, 25]) and
+       not CharInSet(S[I], ['0'..'9', 'A'..'F', 'a'..'f']) then
+      Exit(False);
+end;
+
+function IsRawShellName(const AName: string): Boolean;
+var
+  U: string;
+begin
+  if AName = '' then
+    Exit(False);
+  if IsGuidToken(AName) then
+    Exit(True);
+  U := LowerCase(AName);
+  Result := StartsText('\\?\', AName) or StartsText('::', AName) or
+    StartsText('shell:', AName) or StartsText('SID-', AName) or
+    (Pos('::{', AName) > 0) or (Pos('usb#vid_', U) > 0) or
+    (Pos('wpdbusenum', U) > 0) or (Pos('umb#', U) > 0) or
+    (Pos(WpdInterfaceGuid, U) > 0);
+end;
+
+function UsableShellCaption(const AName: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(AName);
+  { «?» и сырой object id — имя не прочиталось. «Устройство» — уже замена. }
+  Result := (S <> '') and (S <> '?') and not IsRawShellName(S) and
+    not SameText(S, L('drive.device'));
+end;
+
+function PathIsDeviceRoot(const APath: string): Boolean;
+var
+  P, Low: string;
+  G, I: Integer;
+begin
+  P := ExcludeTrailingPathDelimiter(Trim(APath));
+  Low := LowerCase(P);
+  G := Pos(WpdInterfaceGuid, Low);
+  if G = 0 then
+    Exit(False);
+  I := G + Length(WpdInterfaceGuid) - 1;
+  Result := I >= Length(P);
+end;
+
+procedure NoteShellCaption(const APath, AName: string);
+var
+  K, Id: string;
+begin
+  if (GShellCaps = nil) or not UsableShellCaption(AName) then
+    Exit;
+  K := NormShellKey(APath);
+  Id := ExtractWpdId(APath);
+  GPidlLock.Enter;
+  try
+    if (K <> '') and ((GShellCaps.Count < 20000) or GShellCaps.ContainsKey(K)) then
+      GShellCaps.AddOrSetValue(K, Trim(AName));
+    { Один ключ на устройство. Папка внутри несёт тот же id и не должна его затирать. }
+    if PathIsDeviceRoot(APath) and (Id <> '') then
+    begin
+      Id := 'wpd:' + Id;
+      if not GShellCaps.ContainsKey(Id) then
+        GShellCaps.AddOrSetValue(Id, Trim(AName));
+    end;
+  finally
+    GPidlLock.Leave;
+  end;
+end;
+
+function LookupShellCaption(const APath: string): string;
+var
+  K, Id: string;
+begin
+  Result := '';
+  if GShellCaps = nil then
+    Exit;
+  K := NormShellKey(APath);
+  Id := ExtractWpdId(APath);
+  GPidlLock.Enter;
+  try
+    if (K <> '') and GShellCaps.TryGetValue(K, Result) and
+       UsableShellCaption(Result) then
+      Exit;
+    Result := '';
+    { Имя устройства — только у самого корня. У папки внутри тот же WPD id. }
+    if PathIsDeviceRoot(APath) and (Id <> '') and
+       GShellCaps.TryGetValue('wpd:' + Id, Result) and
+       UsableShellCaption(Result) then
+      Exit;
+    Result := '';
+  finally
+    GPidlLock.Leave;
+  end;
+end;
+
+function DeviceQuestionMark(const S: string): Boolean;
+var
+  D: string;
+begin
+  D := L('drive.device');
+  Result := SameText(S, D + ' > ?') or EndsText(' > ' + D + ' > ?', S) or
+    SameText(S, '? > ' + D) or SameText(S, D + ' > ? > ' + D);
+end;
+
+type
+  TFriendlySlot = record
+    Raw: string;
+    Text: string;
+  end;
+
+var
+  GFriendly: array[0..3] of TFriendlySlot;
+  GFriendlyAt: Integer;
+
+function FriendlyCached(const APath: string; out AText: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  AText := '';
+  for I := 0 to High(GFriendly) do
+    if (GFriendly[I].Raw <> '') and SameText(GFriendly[I].Raw, APath) then
+    begin
+      AText := GFriendly[I].Text;
+      Exit(True);
+    end;
+end;
+
+procedure FriendlyStore(const APath, AText: string);
+begin
+  GFriendly[GFriendlyAt].Raw := APath;
+  GFriendly[GFriendlyAt].Text := AText;
+  GFriendlyAt := (GFriendlyAt + 1) mod Length(GFriendly);
+end;
 
 function FriendlyFolderPath(const APath: string): string;
 var
-  Acc, Name, Parent, Leaf: string;
-  Parts: TArray<string>;
+  Acc, Name, Alt, Parent, Leaf, LeafName, Peeled: string;
+  Parts, HumanTail: TArray<string>;
   N, Guard: Integer;
+  Shell, RawTail: Boolean;
   {$IFDEF MSWINDOWS}
   Item: IShellItem;
   {$ENDIF}
+
+  function DeviceAwareParent(const AFull: string): string;
+  var
+    P, Low: string;
+    G, Slash: Integer;
+  begin
+    P := ExcludeTrailingPathDelimiter(Trim(AFull));
+    Low := LowerCase(P);
+    G := Pos(WpdInterfaceGuid, Low);
+    if G = 0 then
+      G := Pos('usb#vid_', Low);
+    if G = 0 then
+      G := Pos('wpdbusenum#', Low);
+    if G > 0 then
+    begin
+      Slash := LastDelimiter('\', P);
+      if Slash > G then
+        Exit(ExcludeTrailingPathDelimiter(Copy(P, 1, Slash - 1)));
+      if Pos(CLSID_ThisPC, UpperCase(P)) > 0 then
+        Exit(ComputerFolderPath);
+    end;
+    Result := ExcludeTrailingPathDelimiter(ExtractFileDir(P));
+  end;
+
+  function InventedQuestion(const AFull, AName: string): Boolean;
+  var
+    P, Low: string;
+  begin
+    { Кусок «?» из префикса \\?\, а не папка, которую так назвала оболочка. }
+    Result := AName = '?';
+    if not Result then
+      Exit;
+    P := ExcludeTrailingPathDelimiter(AFull);
+    Low := LowerCase(P);
+    Result := (Pos(WpdInterfaceGuid, Low) = 0) and (Pos('usb#vid_', Low) = 0) and
+      (EndsText('\?', P) or (P = '?'));
+  end;
+
+  procedure AddTail(const AName: string);
+  begin
+    if (AName = '') or (AName = '?') or IsRawShellName(AName) then
+      Exit;
+    SetLength(HumanTail, Length(HumanTail) + 1);
+    HumanTail[High(HumanTail)] := AName;
+  end;
+
+  function WithTail(const ABase: string; AShell: Boolean): string;
+  var
+    I: Integer;
+  begin
+    Result := ABase;
+    for I := High(HumanTail) downto 0 do
+    begin
+      if HumanTail[I] = '' then
+        Continue;
+      if Result = '' then
+        Result := HumanTail[I]
+      else if AShell then
+        Result := Result + ' > ' + HumanTail[I]
+      else if EndsText('\', Result) then
+        Result := Result + HumanTail[I]
+      else
+        Result := Result + '\' + HumanTail[I];
+    end;
+  end;
+
+  procedure Remember(const AText: string);
+  begin
+    Result := AText;
+    FriendlyStore(APath, Result);
+  end;
+
 begin
-  if SameText(APath, GFriendlyRaw) then
-    Exit(GFriendlyText);
+  if FriendlyCached(APath, Name) and not DeviceQuestionMark(Name) then
+    Exit(Name);
   Leaf := ExcludeTrailingPathDelimiter(Trim(APath));
   if Leaf = '' then
   begin
-    GFriendlyRaw := APath;
-    GFriendlyText := '';
-    Exit('');
-  end;
-  if not IsVirtualShellPath(APath) then
-  begin
-    if IsDriveRoot(APath) then
-      Result := IncludeTrailingPathDelimiter(APath)
-    else
-      Result := Leaf;
-    GFriendlyRaw := APath;
-    GFriendlyText := Result;
+    Remember('');
     Exit;
   end;
-  Result := Leaf;
-  {$IFDEF MSWINDOWS}
-  if not TryCreateShellItem(APath, Item) then
-    Exit;
-  Item := nil;
-  SetLength(Parts, 0);
+  SetLength(HumanTail, 0);
   Acc := Leaf;
+  {$IFDEF MSWINDOWS}
+  { Снять только имя файла, которого ещё нет в оболочке.
+    object id и префикс \\?\ не режем ExtractFileDir: из него получается «?». }
+  if IsVirtualShellPath(Leaf) or IsDeviceNamespacePath(Leaf) or
+     IsPortableDevicePath(Leaf) or IsRawShellName(ExtractFileName(Leaf)) then
+  begin
+    Guard := 0;
+    while (Acc <> '') and (Guard < 12) do
+    begin
+      Inc(Guard);
+      LeafName := ExtractFileName(Acc);
+      RawTail := IsRawShellName(LeafName) or (LeafName = '?') or (LeafName = '');
+      Item := nil;
+      if (not RawTail) and TryCreateShellItem(Acc, Item) then
+        Break;
+      if RawTail then
+        Break;
+      Parent := DeviceAwareParent(Acc);
+      if (Parent = '') or SameText(Parent, Acc) then
+        Break;
+      Alt := LookupShellCaption(Acc);
+      if UsableShellCaption(Alt) then
+        AddTail(Alt)
+      else
+        AddTail(LeafName);
+      Acc := Parent;
+      if not IsVirtualShellPath(Acc) and not IsDeviceNamespacePath(Acc) and
+         not IsPortableDevicePath(Acc) and not IsRawShellName(ExtractFileName(Acc)) then
+        Break;
+    end;
+  end;
+  {$ENDIF}
+  Shell := IsVirtualShellPath(Acc) or IsDeviceNamespacePath(Acc) or
+    IsPortableDevicePath(Acc);
+  if not Shell then
+  begin
+    if IsDriveRoot(Acc) then
+      Peeled := IncludeTrailingPathDelimiter(Acc)
+    else
+      Peeled := Acc;
+    Remember(WithTail(Peeled, False));
+    Exit;
+  end;
+  Result := Acc;
+  {$IFDEF MSWINDOWS}
+  SetLength(Parts, 0);
   Guard := 0;
   while (Acc <> '') and (Guard < 24) do
   begin
     Inc(Guard);
     Name := DisplayNameForPath(Acc);
-    if Name = '' then
-      Break;
-    SetLength(Parts, Length(Parts) + 1);
-    Parts[High(Parts)] := Name;
+    if IsRecycleBinPath(Acc) then
+      Name := L('bin.title');
+    if InventedQuestion(Acc, Name) then
+      Name := ''
+    else if not UsableShellCaption(Name) then
+    begin
+      Alt := LookupShellCaption(Acc);
+      if UsableShellCaption(Alt) then
+        Name := Alt
+      else if (Name = '') or IsRawShellName(Name) then
+        Name := L('drive.device');
+    end;
+    if UsableShellCaption(Name) then
+      NoteShellCaption(Acc, Name);
+    if (Name <> '') and
+       ((Length(Parts) = 0) or not SameText(Parts[High(Parts)], Name)) then
+    begin
+      SetLength(Parts, Length(Parts) + 1);
+      Parts[High(Parts)] := Name;
+    end;
     if IsThisPCPath(Acc) then
       Break;
     Parent := ParentOfBrowsablePath(Acc);
@@ -1083,10 +1361,14 @@ begin
     Result := Parts[High(Parts)];
     for N := High(Parts) - 1 downto 0 do
       Result := Result + ' > ' + Parts[N];
-  end;
+  end
+  else
+    Result := L('drive.device');
+  Result := WithTail(Result, True);
+  {$ELSE}
+  Result := WithTail(Acc, False);
   {$ENDIF}
-  GFriendlyRaw := APath;
-  GFriendlyText := Result;
+  Remember(Result);
 end;
 
 function IsArchiveExt(const AExt: string): Boolean;
@@ -2108,6 +2390,7 @@ var
   I: Integer;
   Info: TDriveInfo;
 begin
+  NoteShellCaption(ARoot, AName);
   if Trim(ARoot) = '' then
     Exit;
   for I := 0 to High(AList) do
@@ -4107,6 +4390,7 @@ initialization
   GZipMapLock := TCriticalSection.Create;
   GPidlLock := TCriticalSection.Create;
   GPidlMap := TDictionary<string, TBytes>.Create;
+  GShellCaps := TDictionary<string, string>.Create;
   GDriveTypeLock := TCriticalSection.Create;
   GDriveTypeCache := TDictionary<string, Cardinal>.Create;
   GDriveTypePending := TDictionary<string, Boolean>.Create;
@@ -4137,6 +4421,7 @@ finalization
   FreeAndNil(GDriveTypePending);
   FreeAndNil(GDriveTypeCache);
   FreeAndNil(GDriveTypeLock);
+  FreeAndNil(GShellCaps);
   FreeAndNil(GPidlMap);
   FreeAndNil(GPidlLock);
   FreeAndNil(GZipMapLock);

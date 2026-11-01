@@ -18,7 +18,7 @@ type
   TFileOpPhase = (opIdle, opScan, opReady, opRun, opPaused, opDone, opCancel, opFail);
 
   TConflictChoice = (ccOverwrite, ccSkip, ccAutoRename, ccOverwriteAll,
-    ccSkipAll, ccOverwriteOlder, ccCancel);
+    ccSkipAll, ccOverwriteOlder, ccCancel, ccDefer);
 
   TFileOpProgress = record
     Phase: TFileOpPhase;
@@ -32,8 +32,8 @@ type
     FileBytesTotal: Int64;
     TotalBytesDone: Int64;
     TotalBytesTotal: Int64;
-    { Реальная сумма размеров. 0 — ещё не посчитано или оболочка размер не дала.
-      TotalBytesTotal при нуле подменяется числом файлов для полосы прогресса. }
+    { Реальная сумма размеров. 0 — оболочка размер не дала.
+      Полоса тогда считается по файлам, подпись оставляет 0 байт. }
     MeasuredBytes: Int64;
     SpeedBps: Double;
     RemainingSec: Double;
@@ -55,6 +55,12 @@ type
 
   TFileOpConflictProc = reference to procedure(const AInfo: TFileOpConflictInfo;
     AAnswer: TProc<TConflictChoice>);
+
+  { Тихий режим: пачка спорных имён одним окном, без решения вслепую.
+    False или пустой ответ — пропуск, не перезапись. }
+  TFileOpBatchConflictFunc = reference to function(
+    const AItems: TArray<TConflictItem>;
+    out AActions: TArray<TConflictAction>): Boolean;
 
   TFileOpEngine = class
   private
@@ -88,6 +94,11 @@ type
     FBytesAtTick: Int64;
     FSpecialCopy: TProc<string, string>;
     FBatchWork: TProc;
+    FDeferConflicts: Boolean;
+    FForceChoice: Boolean;
+    FForcedChoice: TConflictChoice;
+    FDeferred: TList<TConflictItem>;
+    FDeferredRoots: TStringList;
     procedure NotifyItem(const APath: string; AStatus: TOpItemStatus);
     procedure SetPhase(APhase: TFileOpPhase; const AStatus: string);
     procedure Publish(const AFile: string; AFileDone, AFileTotal: Int64);
@@ -114,9 +125,14 @@ type
     function UniqueName(const APath: string): string;
     function IsIntoSelf(const ASrc, ADstDir: string): Boolean;
     function SameVolume(const A, B: string): Boolean;
+    procedure RememberConflict(const ASrc, ADst: string);
+    function CoversDeferred(const APath: string): Boolean;
+    procedure ApplyOneDeferred(const AIt: TConflictItem; AAct: TConflictAction);
+    procedure ResolveDeferred;
     procedure Run;
   public
     OnConflict: TFileOpConflictProc;
+    OnBatchConflict: TFileOpBatchConflictFunc;
     OnDone: TFileOpDoneProc;
     OnItemDone: TFileOpItemDoneProc;
     constructor Create(AKind: TFileOpKind; const ASources: TArray<string>;
@@ -139,6 +155,7 @@ type
     property Dest: string read FDest;
     property SpecialCopy: TProc<string, string> read FSpecialCopy write FSpecialCopy;
     property BatchWork: TProc read FBatchWork write FBatchWork;
+    property DeferConflicts: Boolean read FDeferConflicts write FDeferConflicts;
     property WaitingConflict: Boolean read FWaitingConflict;
     property Conflict: TFileOpConflictInfo read FConflict;
     property Permanent: Boolean read FPermanent;
@@ -570,6 +587,9 @@ begin
   FSnap.Phase := opIdle;
   FSnap.DestPath := ADest;
   FTickStart := Now;
+  FDeferred := TList<TConflictItem>.Create;
+  FDeferredRoots := TStringList.Create;
+  FDeferredRoots.CaseSensitive := False;
 end;
 
 destructor TFileOpEngine.Destroy;
@@ -585,6 +605,8 @@ begin
   FreeAndNil(FElevateFiles);
   FreeAndNil(FElevate);
   FreeAndNil(FErrorList);
+  FreeAndNil(FDeferredRoots);
+  FreeAndNil(FDeferred);
   FreeAndNil(FLock);
   inherited;
 end;
@@ -1094,6 +1116,8 @@ function TFileOpEngine.DecideConflictKnown(const ASrc, ADst: string;
   ASrcSize, ADstSize: Int64; ASrcTime, ADstTime: TDateTime): TConflictChoice;
 begin
   Result := ccOverwrite;
+  if FForceChoice then
+    Exit(FForcedChoice);
   if FSkipAll then
     Exit(ccSkip);
   if FAutoRename then
@@ -1107,7 +1131,13 @@ begin
     else
       Exit(ccSkip);
   end;
-  { Всегда спрашиваем при конфликте имени — даже если размер/время совпадают. }
+  { Всегда спрашиваем при конфликте имени — даже если размер/время совпадают.
+    Тихий режим не останавливает пачку: имя в список, ответ — одним окном. }
+  if FDeferConflicts then
+  begin
+    RememberConflict(ASrc, ADst);
+    Exit(ccDefer);
+  end;
   if not Assigned(OnConflict) then
     Exit(ccOverwrite);
 
@@ -1189,6 +1219,8 @@ var
   SrcDir, DstDir, SrcFile, DstFile: Boolean;
 begin
   Result := ccOverwrite;
+  if FForceChoice then
+    Exit(FForcedChoice);
   SrcDir := TDirectory.Exists(ASrc);
   DstDir := TDirectory.Exists(ADst);
   SrcFile := TFile.Exists(ASrc) and not SrcDir;
@@ -1206,6 +1238,11 @@ begin
     FConflict.DstSize := SafeFileSize(ADst);
     FConflict.SrcTime := SafeFileTime(ASrc);
     FConflict.DstTime := SafeFileTime(ADst);
+    if FDeferConflicts then
+    begin
+      NoteError(ASrc, Lf('ops.typemismatch', [TPath.GetFileName(ASrc)]));
+      Exit(ccSkip);
+    end;
     if FSkipAll then
       Exit(ccSkip);
     if FAutoRename then
@@ -1326,6 +1363,11 @@ begin
         end;
       ccAutoRename:
         Dest := UniqueName(Dest);
+      ccDefer:
+        begin
+          NotifyItem(ASrc, oisConflictPending);
+          Exit(False);
+        end;
     end;
   end;
 
@@ -1507,6 +1549,11 @@ begin
         end;
       ccAutoRename:
         Dest := UniqueName(Dest);
+      ccDefer:
+        begin
+          NotifyItem(ASrc, oisConflictPending);
+          Exit;
+        end;
     else
       Exit;
     end;
@@ -1690,12 +1737,16 @@ begin
       try
         if Assigned(FSpecialCopy) and (FKind in [okCopy, okMove, okArchive]) then
         begin
+          Publish(ASrc, 0, 0);
           FSpecialCopy(ASrc, ADestDir);
           if (FKind = okMove) and not FCancel then
             DeletePathSync(ASrc, True);
         end
         else if Assigned(FSpecialCopy) and (FKind = okDelete) then
+        begin
+          Publish(ASrc, 0, 0);
           FSpecialCopy(ASrc, '');
+        end;
         IncDone;
       except
         on E: EAbort do
@@ -1798,6 +1849,189 @@ begin
   end;
 end;
 
+procedure TFileOpEngine.RememberConflict(const ASrc, ADst: string);
+var
+  It: TConflictItem;
+  I: Integer;
+begin
+  if FDeferred = nil then
+    Exit;
+  for I := 0 to FDeferred.Count - 1 do
+    if SameText(FDeferred[I].SourcePath, ASrc) and
+       SameText(FDeferred[I].DestPath, ADst) then
+      Exit;
+  It := Default(TConflictItem);
+  It.SourcePath := ASrc;
+  It.DestPath := ADst;
+  It.SourceSize := SafeFileSize(ASrc);
+  It.DestSize := SafeFileSize(ADst);
+  It.SourceTime := SafeFileTime(ASrc);
+  It.DestTime := SafeFileTime(ADst);
+  It.SourceIsDir := TDirectory.Exists(ASrc) and not TFile.Exists(ASrc);
+  It.DestIsDir := TDirectory.Exists(ADst) and not TFile.Exists(ADst);
+  FDeferred.Add(It);
+end;
+
+function TFileOpEngine.CoversDeferred(const APath: string): Boolean;
+var
+  I: Integer;
+  P, S: string;
+begin
+  Result := False;
+  if (FDeferred = nil) or (APath = '') then
+    Exit;
+  P := ExcludeTrailingPathDelimiter(APath);
+  for I := 0 to FDeferred.Count - 1 do
+  begin
+    S := ExcludeTrailingPathDelimiter(FDeferred[I].SourcePath);
+    if SameText(S, P) or StartsText(IncludeTrailingPathDelimiter(P), S) then
+      Exit(True);
+  end;
+end;
+
+procedure TFileOpEngine.ApplyOneDeferred(const AIt: TConflictItem;
+  AAct: TConflictAction);
+var
+  Dest, P, Root, S: string;
+begin
+  CheckWait;
+  if AAct = caSkip then
+  begin
+    IncSkipped;
+    NotifyItem(AIt.SourcePath, oisSkipped);
+    Exit;
+  end;
+  Dest := AIt.DestPath;
+  if AAct = caAutoName then
+  begin
+    Dest := UniqueName(AIt.DestPath);
+    if Dest = '' then
+    begin
+      NoteError(AIt.SourcePath, Lf('ops.noname', [TPath.GetFileName(AIt.SourcePath)]));
+      NotifyItem(AIt.SourcePath, oisError);
+      Exit;
+    end;
+  end;
+  FForceChoice := True;
+  FForcedChoice := ccOverwrite;
+  try
+    if TDirectory.Exists(AIt.SourcePath) and not TFile.Exists(AIt.SourcePath) then
+      CopyOneDir(AIt.SourcePath, Dest, FKind = okMove)
+    else if CopyOneFile(AIt.SourcePath, Dest) then
+    begin
+      IncDone;
+      if (FKind = okMove) and not FCancel then
+      try
+        ClearReadonly(AIt.SourcePath);
+        TFile.Delete(AIt.SourcePath);
+        Root := '';
+        for S in FSources do
+        begin
+          P := ExcludeTrailingPathDelimiter(S);
+          if SameText(P, ExcludeTrailingPathDelimiter(AIt.SourcePath)) then
+            Continue;
+          if StartsText(IncludeTrailingPathDelimiter(P), AIt.SourcePath) then
+            Root := P;
+        end;
+        if Root <> '' then
+        begin
+          P := ExcludeTrailingPathDelimiter(ExtractFileDir(AIt.SourcePath));
+          while (P <> '') and
+                (SameText(P, Root) or
+                 StartsText(IncludeTrailingPathDelimiter(Root), P)) do
+          begin
+            if not TryRemoveEmptyDir(P) then
+              Break;
+            if SameText(P, Root) then
+              Break;
+            P := ExcludeTrailingPathDelimiter(ExtractFileDir(P));
+          end;
+        end;
+      except
+        on E: Exception do
+          NoteError(AIt.SourcePath, E.Message);
+      end;
+    end;
+  finally
+    FForceChoice := False;
+  end;
+end;
+
+procedure TFileOpEngine.ResolveDeferred;
+var
+  Ev: TEvent;
+  Ok: Boolean;
+  Acts: TArray<TConflictAction>;
+  Items: TArray<TConflictItem>;
+  Fn: TFileOpBatchConflictFunc;
+  I: Integer;
+begin
+  if (FDeferred = nil) or (FDeferred.Count = 0) or FCancel then
+    Exit;
+  Items := FDeferred.ToArray;
+  Fn := OnBatchConflict;
+  Ok := False;
+  SetLength(Acts, 0);
+  if not Assigned(Fn) then
+  begin
+    for I := 0 to High(Items) do
+    begin
+      IncSkipped;
+      NotifyItem(Items[I].SourcePath, oisSkipped);
+    end;
+  end
+  else
+  begin
+    Ev := TEvent.Create(nil, True, False, '');
+    try
+      TThread.Queue(nil,
+        procedure
+        begin
+          try
+            Ok := Fn(Items, Acts);
+          finally
+            Ev.SetEvent;
+          end;
+        end);
+      Ev.WaitFor(INFINITE);
+    finally
+      Ev.Free;
+    end;
+    if FCancel or not Ok then
+    begin
+      for I := 0 to High(Items) do
+      begin
+        IncSkipped;
+        NotifyItem(Items[I].SourcePath, oisSkipped);
+      end;
+    end
+    else
+      for I := 0 to High(Items) do
+      begin
+        CheckWait;
+        if FCancel then
+        begin
+          IncSkipped;
+          NotifyItem(Items[I].SourcePath, oisSkipped);
+        end
+        else if I <= High(Acts) then
+          ApplyOneDeferred(Items[I], Acts[I])
+        else
+        begin
+          IncSkipped;
+          NotifyItem(Items[I].SourcePath, oisSkipped);
+        end;
+      end;
+  end;
+  if FDeferredRoots <> nil then
+  begin
+    for I := 0 to FDeferredRoots.Count - 1 do
+      NotifyItem(FDeferredRoots[I], oisOk);
+    FDeferredRoots.Clear;
+  end;
+  FDeferred.Clear;
+end;
+
 procedure TFileOpEngine.Run;
 var
   I, Files: Integer;
@@ -1852,8 +2086,6 @@ begin
       FSnap.FilesTotal := Files;
       FSnap.MeasuredBytes := Bytes;
       FSnap.TotalBytesTotal := Bytes;
-      if Bytes = 0 then
-        FSnap.TotalBytesTotal := Files;
     finally
       FLock.Leave;
     end;
@@ -1891,9 +2123,17 @@ begin
           Break;
         try
           ProcessPath(FSources[I], DestDir);
-          { Корень обработан (скопирован / пропущен после конфликта) — снять выделение. }
+          { Корень обработан — снять выделение. Спорное имя ждёт окна в конце. }
           if FKind in [okCopy, okMove] then
-            NotifyItem(FSources[I], oisOk);
+          begin
+            if CoversDeferred(FSources[I]) then
+            begin
+              if FDeferredRoots.IndexOf(FSources[I]) < 0 then
+                FDeferredRoots.Add(FSources[I]);
+            end
+            else
+              NotifyItem(FSources[I], oisOk);
+          end;
         except
           on E: EAbort do
           begin
@@ -1911,6 +2151,8 @@ begin
           end;
         end;
       end;
+      if FDeferConflicts and not FCancel then
+        ResolveDeferred;
     end;
     if (FKind = okDelete) and (FElevate <> nil) and (FElevate.Count > 0) then
     begin
