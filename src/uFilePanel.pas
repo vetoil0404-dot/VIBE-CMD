@@ -4,7 +4,7 @@ interface
 
 uses
   {$IFDEF MSWINDOWS}
-  Winapi.Windows, Winapi.ShellAPI, Winapi.ActiveX, Vcl.Graphics,
+  Winapi.Windows, Winapi.Messages, Winapi.ShellAPI, Winapi.ActiveX, Vcl.Graphics,
   {$ENDIF}
   System.IOUtils, System.SysUtils, System.Classes, System.Types, System.UITypes,
   System.Generics.Collections, System.Math, System.Masks, System.StrUtils,
@@ -245,8 +245,7 @@ type
     FHomeList: TLayout;
     FHomeShadow: TShadowEffect;
     FHomeClosedAt: UInt64;
-    FHomeHold: Boolean;
-    FHomeTries: Integer;
+    FHomeMenuGuard: Boolean;
     FNameFilter: string;
     FFilterReady: Boolean;
     FFilterMap: TList<Integer>;
@@ -498,6 +497,7 @@ type
     function NetColKind: Integer;
     procedure OpenHomeFolder(const APath: string);
     procedure DriveBarContext(Sender: TObject; const ARoot: string);
+    procedure ShowRootMenu(const ARoot: string; AX, AY: Integer);
     function DriveClickKey(const ARoot: string): string;
     procedure RememberDrivePath(const APath: string);
     function ResolveDriveTarget(const ARoot: string): string;
@@ -518,8 +518,6 @@ type
     procedure OpenDriveHome;
     procedure HomeClick(Sender: TObject);
     procedure HomePopClosed(Sender: TObject);
-    procedure HomePopupKeep(Sender: TObject; var Action: TCloseAction);
-    procedure HoldHomePopup;
     procedure HomeRowMouseUp(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
     procedure HomeRowEnter(Sender: TObject);
@@ -794,6 +792,8 @@ var
   GFileDragDropHook: TFileDragDropHook;
   GFilePanels: TList<TFilePanel>;
   GHomeShellIcons: TDictionary<string, FMX.Graphics.TBitmap>;
+  GHomeStayWnd: HWND;
+  GHomeStayOld: Pointer;
 
 function HomeShellIcon(const APath: string): FMX.Graphics.TBitmap;
 var
@@ -2651,25 +2651,80 @@ begin
     ShowNotice(L('panel.folder.missing'));
 end;
 
-procedure TFilePanel.DriveBarContext(Sender: TObject; const ARoot: string);
+function HomeStayWndProc(Wnd: HWND; Msg: UINT; WParam: WPARAM; LParam: LPARAM): LRESULT; stdcall;
+begin
+  if Msg = WM_CLOSE then
+    Exit(0);
+  if (Msg = WM_NCACTIVATE) and (WParam = 0) then
+    Exit(1);
+  if GHomeStayOld <> nil then
+    Result := CallWindowProc(GHomeStayOld, Wnd, Msg, WParam, LParam)
+  else
+    Result := DefWindowProc(Wnd, Msg, WParam, LParam);
+end;
+
+procedure TFilePanel.ShowRootMenu(const ARoot: string; AX, AY: Integer);
 {$IFDEF MSWINDOWS}
 var
-  Pt: TPoint;
   Wnd: HWND;
   Verb: string;
   Files: TArray<string>;
+  Stay: HWND;
+  OldProc: Pointer;
+  I: Integer;
+  Pop: TCommonCustomForm;
 begin
-  if Assigned(FOnActivate) then
+  if not FHomeMenuGuard and Assigned(FOnActivate) then
     FOnActivate(Self);
   if ARoot = '' then
     Exit;
-  GetCursorPos(Pt);
   Wnd := 0;
   if Root is TCommonCustomForm then
     Wnd := FormToHWND(TCommonCustomForm(Root));
   SetLength(Files, 1);
   Files[0] := ARoot;
-  ShowExplorerContextMenu(Wnd, Files, Pt.X, Pt.Y, FColors.IsDark, Verb);
+  Stay := 0;
+  OldProc := nil;
+  if FHomeMenuGuard and Assigned(FHomePop) and (GHomeStayWnd = 0) then
+    for I := 0 to Screen.PopupFormCount - 1 do
+    begin
+      Pop := Screen.PopupForms[I];
+      if (Pop <> nil) and (Pop.Owner = FHomePop) then
+      begin
+        Stay := FormToHWND(Pop);
+        Break;
+      end;
+    end;
+  if Stay <> 0 then
+  begin
+    OldProc := Pointer(SetWindowLongPtr(Stay, GWLP_WNDPROC, NativeInt(@HomeStayWndProc)));
+    GHomeStayWnd := Stay;
+    GHomeStayOld := OldProc;
+  end;
+  try
+    ShowExplorerContextMenu(Wnd, Files, AX, AY, FColors.IsDark, Verb);
+  finally
+    if (Stay <> 0) and (OldProc <> nil) and IsWindow(Stay) then
+      SetWindowLongPtr(Stay, GWLP_WNDPROC, NativeInt(OldProc));
+    if GHomeStayWnd = Stay then
+    begin
+      GHomeStayWnd := 0;
+      GHomeStayOld := nil;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+procedure TFilePanel.DriveBarContext(Sender: TObject; const ARoot: string);
+{$IFDEF MSWINDOWS}
+var
+  Pt: TPoint;
+begin
+  GetCursorPos(Pt);
+  ShowRootMenu(ARoot, Pt.X, Pt.Y);
 end;
 {$ELSE}
 begin
@@ -3280,6 +3335,8 @@ end;
 
 procedure TFilePanel.CloseDriveHome;
 begin
+  if FHomeMenuGuard then
+    Exit;
   if Assigned(FBtnHome) then
     FBtnHome.SetSelected(False);
   if Assigned(FHomePop) and FHomePop.IsOpen then
@@ -3323,53 +3380,8 @@ begin
   ToggleDriveHome;
 end;
 
-procedure TFilePanel.HomePopupKeep(Sender: TObject; var Action: TCloseAction);
-begin
-  if FHomeHold then
-    Action := TCloseAction.caNone;
-end;
-
-procedure TFilePanel.HoldHomePopup;
-var
-  I: Integer;
-  F: TCommonCustomForm;
-begin
-  FHomeHold := True;
-  if not Assigned(FBtnHome) then
-    Exit;
-  for I := 0 to Screen.PopupFormCount - 1 do
-  begin
-    F := Screen.PopupForms[I];
-    if (F <> nil) and (F.Owner = FHomePop) then
-      F.OnClose := HomePopupKeep
-    else if (F is TCustomPopupForm) and
-            (TCustomPopupForm(F).PlacementTarget = FBtnHome) then
-      F.OnClose := HomePopupKeep;
-  end;
-end;
-
 procedure TFilePanel.HomePopClosed(Sender: TObject);
 begin
-  if FHomeHold then
-  begin
-    if Assigned(FBtnHome) then
-      FBtnHome.SetSelected(True);
-    if FHomeTries >= 3 then
-      Exit;
-    Inc(FHomeTries);
-    TThread.ForceQueue(nil,
-      procedure
-      begin
-        if FDestroying or not FHomeHold then
-          Exit;
-        if Assigned(FHomePop) and not FHomePop.IsOpen then
-          FHomePop.IsOpen := True;
-        HoldHomePopup;
-        if Assigned(FBtnHome) then
-          FBtnHome.SetSelected(True);
-      end);
-    Exit;
-  end;
   {$IFDEF MSWINDOWS}
   FHomeClosedAt := GetTickCount64;
   {$ENDIF}
@@ -3381,34 +3393,34 @@ procedure TFilePanel.HomeRowMouseUp(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Single);
 var
   RootPath: string;
-  Kind: Integer;
+  Kind, SX, SY: Integer;
   Btn: TMouseButton;
+  Spot: TPointF;
 begin
-  if not (Sender is TRectangle) then
+  if not (Sender is TControl) then
     Exit;
-  RootPath := TRectangle(Sender).TagString;
-  Kind := TRectangle(Sender).Tag;
+  RootPath := TControl(Sender).TagString;
+  Kind := TControl(Sender).Tag;
   Btn := Button;
+  Spot := TControl(Sender).LocalToScreen(TPointF.Create(X, Y));
+  SX := Round(Spot.X);
+  SY := Round(Spot.Y);
+  if Btn = TMouseButton.mbRight then
+    FHomeMenuGuard := True;
   TThread.ForceQueue(nil,
     procedure
     begin
       if FDestroying then
+      begin
+        FHomeMenuGuard := False;
         Exit;
+      end;
       if Btn = TMouseButton.mbRight then
       begin
-        HoldHomePopup;
-        FHomeTries := 0;
         try
-          DriveBarContext(Self, RootPath);
+          ShowRootMenu(RootPath, SX, SY);
         finally
-          FHomeHold := False;
-        end;
-        if not FDestroying and FShowDriveHome and Assigned(FBtnHome) then
-        begin
-          if not DriveHomeIsOpen then
-            OpenDriveHome
-          else
-            FBtnHome.SetSelected(True);
+          FHomeMenuGuard := False;
         end;
       end
       else if Btn = TMouseButton.mbLeft then
