@@ -2635,13 +2635,20 @@ begin
   Tile := TileOf(ATile);
   if (Tile = nil) or Tile.Removing or FReorderActive then
     Exit;
-  FTipText.Text := Tile.Caption;
+  var Tip := Tile.Caption;
+  if IsRecycleBinPath(Tile.ItemPath) then
+  begin
+    var Items, Bytes: Int64;
+    if QueryRecycleBin(Items, Bytes) and (Items > 0) then
+      Tip := L('bin.title') + ' ' + FormatFileSize(Bytes);
+  end;
+  FTipText.Text := Tip;
   W := 80;
   if (FTipText.Canvas <> nil) then
   begin
     FTipText.Canvas.Font.Family := FluentFontFamily;
     FTipText.Canvas.Font.Size := 11;
-    W := FTipText.Canvas.TextWidth(Tile.Caption);
+    W := FTipText.Canvas.TextWidth(Tip);
   end;
   FTip.Width := Max(56, W + 24) + 36;
   FTip.Height := 28 + 36;

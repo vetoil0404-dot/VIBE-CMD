@@ -226,6 +226,9 @@
         <DCCReference Include="uPdfium.pas"/>
         <DCCReference Include="uPsdPreview.pas"/>
         <DCCReference Include="uVecPreview.pas"/>
+        <DCCReference Include="uDxfPreview.pas"/>
+        <DCCReference Include="uMeshPreview.pas"/>
+        <DCCReference Include="uHdrPreview.pas"/>
         <DCCReference Include="uMpvPlayer.pas"/>
         <DCCReference Include="uMetaCache.pas"/>
         <DCCReference Include="uFolderSize.pas"/>

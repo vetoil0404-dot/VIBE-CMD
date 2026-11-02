@@ -164,6 +164,7 @@ type
     FMarkArmed: Boolean;
     FMarkActive: Boolean;
     FMarkRemove: Boolean;
+    FMarkOrigin: Integer;
     FMarkAcc: TArray<Integer>;
     FPendingExplorerMenu: Boolean;
     FMouseModeMenu: TFluentPopupMenu;
@@ -244,6 +245,8 @@ type
     FHomeList: TLayout;
     FHomeShadow: TShadowEffect;
     FHomeClosedAt: UInt64;
+    FHomeHold: Boolean;
+    FHomeTries: Integer;
     FNameFilter: string;
     FFilterReady: Boolean;
     FFilterMap: TList<Integer>;
@@ -515,6 +518,8 @@ type
     procedure OpenDriveHome;
     procedure HomeClick(Sender: TObject);
     procedure HomePopClosed(Sender: TObject);
+    procedure HomePopupKeep(Sender: TObject; var Action: TCloseAction);
+    procedure HoldHomePopup;
     procedure HomeRowMouseUp(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
     procedure HomeRowEnter(Sender: TObject);
@@ -964,6 +969,7 @@ begin
   FMarkArmed := False;
   FMarkActive := False;
   FMarkRemove := False;
+  FMarkOrigin := -1;
   FPendingExplorerMenu := False;
   FPendingNetHistMenu := False;
   FCrumbPaths := TStringList.Create;
@@ -1142,6 +1148,7 @@ begin
     if FSelectionManager.KeyDown(Key, Shift) then
     begin
       Key := 0;
+      UpdateStatusText;
     end;
   end;
 end;
@@ -3316,8 +3323,53 @@ begin
   ToggleDriveHome;
 end;
 
+procedure TFilePanel.HomePopupKeep(Sender: TObject; var Action: TCloseAction);
+begin
+  if FHomeHold then
+    Action := TCloseAction.caNone;
+end;
+
+procedure TFilePanel.HoldHomePopup;
+var
+  I: Integer;
+  F: TCommonCustomForm;
+begin
+  FHomeHold := True;
+  if not Assigned(FBtnHome) then
+    Exit;
+  for I := 0 to Screen.PopupFormCount - 1 do
+  begin
+    F := Screen.PopupForms[I];
+    if (F <> nil) and (F.Owner = FHomePop) then
+      F.OnClose := HomePopupKeep
+    else if (F is TCustomPopupForm) and
+            (TCustomPopupForm(F).PlacementTarget = FBtnHome) then
+      F.OnClose := HomePopupKeep;
+  end;
+end;
+
 procedure TFilePanel.HomePopClosed(Sender: TObject);
 begin
+  if FHomeHold then
+  begin
+    if Assigned(FBtnHome) then
+      FBtnHome.SetSelected(True);
+    if FHomeTries >= 3 then
+      Exit;
+    Inc(FHomeTries);
+    TThread.ForceQueue(nil,
+      procedure
+      begin
+        if FDestroying or not FHomeHold then
+          Exit;
+        if Assigned(FHomePop) and not FHomePop.IsOpen then
+          FHomePop.IsOpen := True;
+        HoldHomePopup;
+        if Assigned(FBtnHome) then
+          FBtnHome.SetSelected(True);
+      end);
+    Exit;
+  end;
   {$IFDEF MSWINDOWS}
   FHomeClosedAt := GetTickCount64;
   {$ENDIF}
@@ -3342,11 +3394,26 @@ begin
     begin
       if FDestroying then
         Exit;
-      CloseDriveHome;
       if Btn = TMouseButton.mbRight then
-        DriveBarContext(Self, RootPath)
+      begin
+        HoldHomePopup;
+        FHomeTries := 0;
+        try
+          DriveBarContext(Self, RootPath);
+        finally
+          FHomeHold := False;
+        end;
+        if not FDestroying and FShowDriveHome and Assigned(FBtnHome) then
+        begin
+          if not DriveHomeIsOpen then
+            OpenDriveHome
+          else
+            FBtnHome.SetSelected(True);
+        end;
+      end
       else if Btn = TMouseButton.mbLeft then
       begin
+        CloseDriveHome;
         if Kind = 2 then
           OpenHomeFolder(RootPath)
         else
@@ -4217,6 +4284,13 @@ begin
     else
       Inc(FileCount);
     TotalSize := TotalSize + EntryAccountedSize(Entry);
+  end;
+
+  if IsRecycleBinPath(GetCurrentPathImpl) then
+  begin
+    var BinItems, BinBytes: Int64;
+    if QueryRecycleBin(BinItems, BinBytes) then
+      TotalSize := BinBytes;
   end;
 
   // 2. Считаем выделенные элементы
@@ -9510,6 +9584,9 @@ begin
   FMarkArmed := True;
   FMarkActive := False;
   FMarkRemove := False;
+  FMarkOrigin := -1;
+  if FSelectionManager <> nil then
+    FMarkOrigin := FSelectionManager.CurrentIndex;
   FBandAnchor := TPointF.Create(X, Y);
   FBandCurrent := FBandAnchor;
   SetLength(FMarkAcc, 0);
@@ -9543,23 +9620,59 @@ procedure TFilePanel.ApplyMarkSelection(APaint: Boolean);
 var
   Hits, Want: TArray<Integer>;
   Seen: TDictionary<Integer, Byte>;
-  I, N: Integer;
+  I, N, Origin, Cur, Lo, Hi: Integer;
   Changed: Boolean;
 begin
-  CollectBandHits(Hits);
+  if ViewMode = vmTiles then
+  begin
+    Origin := FMarkOrigin;
+    Cur := GetSelectIndexAt(FBandCurrent.X, FBandCurrent.Y);
+    if Origin < 0 then
+      Origin := Cur;
+    SetLength(Hits, 0);
+    if (Origin >= 0) and (Cur >= 0) then
+    begin
+      Lo := Min(Origin, Cur);
+      Hi := Max(Origin, Cur);
+      SetLength(Hits, Hi - Lo + 1);
+      N := 0;
+      for I := Lo to Hi do
+      begin
+        if HasParentDirectory and (I = 0) then
+          Continue;
+        Hits[N] := I;
+        Inc(N);
+      end;
+      SetLength(Hits, N);
+    end;
+    FMarkAcc := Copy(Hits);
+  end
+  else
+  begin
+    CollectBandHits(Hits);
+    Seen := TDictionary<Integer, Byte>.Create;
+    try
+      for I := 0 to High(FMarkAcc) do
+        Seen.AddOrSetValue(FMarkAcc[I], 1);
+      for I := 0 to High(Hits) do
+        if not Seen.ContainsKey(Hits[I]) then
+        begin
+          Seen.Add(Hits[I], 1);
+          SetLength(FMarkAcc, Length(FMarkAcc) + 1);
+          FMarkAcc[High(FMarkAcc)] := Hits[I];
+        end;
+      Hits := Copy(FMarkAcc);
+    finally
+      Seen.Free;
+    end;
+  end;
+
   Seen := TDictionary<Integer, Byte>.Create;
   try
-    for I := 0 to High(FMarkAcc) do
-      Seen.AddOrSetValue(FMarkAcc[I], 1);
-    for I := 0 to High(Hits) do
-      if not Seen.ContainsKey(Hits[I]) then
-      begin
-        Seen.Add(Hits[I], 1);
-        SetLength(FMarkAcc, Length(FMarkAcc) + 1);
-        FMarkAcc[High(FMarkAcc)] := Hits[I];
-      end;
     if FMarkRemove then
     begin
+      for I := 0 to High(Hits) do
+        Seen.AddOrSetValue(Hits[I], 1);
       SetLength(Want, Length(FBandBase));
       N := 0;
       for I := 0 to High(FBandBase) do
@@ -9569,10 +9682,28 @@ begin
           Inc(N);
         end;
       SetLength(Want, N);
-      Changed := FSelectionManager.ApplyRubberBand(Want, True, nil);
     end
     else
-      Changed := FSelectionManager.ApplyRubberBand(FMarkAcc, False, FBandBase);
+    begin
+      SetLength(Want, Length(FBandBase) + Length(Hits));
+      N := 0;
+      for I := 0 to High(FBandBase) do
+        if not Seen.ContainsKey(FBandBase[I]) then
+        begin
+          Want[N] := FBandBase[I];
+          Inc(N);
+          Seen.Add(FBandBase[I], 1);
+        end;
+      for I := 0 to High(Hits) do
+        if not Seen.ContainsKey(Hits[I]) then
+        begin
+          Want[N] := Hits[I];
+          Inc(N);
+          Seen.Add(Hits[I], 1);
+        end;
+      SetLength(Want, N);
+    end;
+    Changed := FSelectionManager.ApplyRubberBand(Want, True, nil);
   finally
     Seen.Free;
   end;
@@ -11797,6 +11928,8 @@ begin
   Result := False;
   if Assigned(FSelectionManager) then
     Result := FSelectionManager.KeyDown(AKey, AShift);
+  if Result then
+    UpdateStatusText;
 end;
 
 procedure TFilePanel.MoveHome(const AShift: TShiftState);
