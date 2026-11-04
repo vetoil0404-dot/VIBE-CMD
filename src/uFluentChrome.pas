@@ -104,12 +104,13 @@ type
     procedure ItemLeave(Sender: TObject);
     procedure ItemClick(Sender: TObject);
     procedure ApplyItemTheme(ARow: TRectangle);
+    procedure PaintRowState(ARow: TRectangle; AHot: Boolean);
     procedure SyncPopupSize;
   public
     constructor Create(AOwner: TComponent); override;
     procedure ClearItems;
     procedure AddItem(const ACaption, AShortcut: string; AOnClick: TNotifyEvent;
-      AEnabled: Boolean = True);
+      AEnabled: Boolean = True; AAccent: Boolean = False);
     procedure AddSeparator;
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure PopupNear(ATarget: TControl; AOpenOnRight: Boolean);
@@ -722,6 +723,32 @@ begin
   SyncPopupSize;
 end;
 
+procedure TFluentPopupMenu.PaintRowState(ARow: TRectangle; AHot: Boolean);
+begin
+  if ARow = nil then
+    Exit;
+  { Tag 1 — текущий пункт, как активный диск в меню домика. }
+  if ARow.Tag = 1 then
+  begin
+    ARow.Stroke.Kind := TBrushKind.Solid;
+    ARow.Stroke.Thickness := 1;
+    if AHot then
+    begin
+      ARow.Fill.Color := FColors.ControlFillHover;
+      ARow.Stroke.Color := FColors.ControlStroke;
+    end
+    else
+    begin
+      ARow.Fill.Color := FColors.AccentSubtle;
+      ARow.Stroke.Color := FColors.SelectionColor;
+    end;
+  end
+  else if AHot then
+    ARow.Fill.Color := FColors.ItemHover
+  else
+    ARow.Fill.Color := TAlphaColors.Null;
+end;
+
 procedure TFluentPopupMenu.ApplyItemTheme(ARow: TRectangle);
 var
   I: Integer;
@@ -732,7 +759,7 @@ begin
     ARow.Fill.Color := FColors.DividerColor;
     Exit;
   end;
-  ARow.Fill.Color := TAlphaColors.Null;
+  PaintRowState(ARow, False);
   for I := 0 to ARow.ControlsCount - 1 do
     if ARow.Controls[I] is TText then
     begin
@@ -763,7 +790,7 @@ begin
 end;
 
 procedure TFluentPopupMenu.AddItem(const ACaption, AShortcut: string;
-  AOnClick: TNotifyEvent; AEnabled: Boolean);
+  AOnClick: TNotifyEvent; AEnabled: Boolean; AAccent: Boolean);
 var
   Row: TRectangle;
   Cap, Key: TText;
@@ -778,6 +805,8 @@ begin
   Row.Stroke.Kind := TBrushKind.None;
   Row.Fill.Kind := TBrushKind.Solid;
   Row.Fill.Color := TAlphaColors.Null;
+  if AAccent then
+    Row.Tag := 1;
   Row.HitTest := True;
   Row.Cursor := crHandPoint;
   Row.OnMouseEnter := ItemEnter;
@@ -826,6 +855,9 @@ begin
     Key.TextSettings.FontColor := FColors.SubTextColor;
   end;
 
+  if AAccent then
+    PaintRowState(Row, False);
+
   FList.Height := FList.Height + FItemH;
   SyncPopupSize;
 end;
@@ -833,13 +865,13 @@ end;
 procedure TFluentPopupMenu.ItemEnter(Sender: TObject);
 begin
   if Sender is TRectangle then
-    TRectangle(Sender).Fill.Color := FColors.ItemHover;
+    PaintRowState(TRectangle(Sender), True);
 end;
 
 procedure TFluentPopupMenu.ItemLeave(Sender: TObject);
 begin
   if Sender is TRectangle then
-    TRectangle(Sender).Fill.Color := TAlphaColors.Null;
+    PaintRowState(TRectangle(Sender), False);
 end;
 
 procedure TFluentPopupMenu.ItemClick(Sender: TObject);

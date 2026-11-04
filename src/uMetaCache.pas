@@ -17,6 +17,7 @@ function IsAudioMetaExt(const AExt: string): Boolean;
 function IsVideoMetaExt(const AExt: string): Boolean;
 function IsMediaMetaExt(const AExt: string): Boolean;
 function ProbeMediaDuration(const APath: string): Double;
+function ProbeVideoFrameSeconds(const APath: string): Double;
 function BuildWavePeaks(const APath: string; ACount: Integer): TArray<Single>;
 function ExportMediaClip(const ASrc, ADst: string; AStart, AEnd: Double;
   AVideo: Boolean; out AError: string): Boolean;
@@ -428,6 +429,32 @@ begin
 {$ENDIF}
 end;
 
+function ProbeVideoFrameSeconds(const APath: string): Double;
+const
+  PKEY_VideoFps: TPropertyKey = (
+    fmtid: '{64440491-4C8B-11D1-8B70-080036B11A03}'; pid: 6);
+var
+  Store: IPropertyStore;
+  V: UInt64;
+begin
+  Result := 0;
+  if (APath = '') or not TFile.Exists(APath) then
+    Exit;
+{$IFDEF MSWINDOWS}
+  Store := nil;
+  if Failed(SHGetPropertyStoreFromParsingName(PChar(APath), nil, GPS_BESTEFFORT,
+    IPropertyStore, Store)) or (Store = nil) then
+    Exit;
+  if not PropUInt(Store, PKEY_VideoFps, V) or (V = 0) then
+    Exit;
+  { Оболочка пишет кадры/с × 1000. Иногда значение уже в кадрах/с. }
+  if V >= 1000 then
+    Result := 1000 / V
+  else if V >= 5 then
+    Result := 1 / V;
+{$ENDIF}
+end;
+
 function ShellMetaText(const APath: string): string;
 var
   Store: IPropertyStore;
@@ -759,15 +786,22 @@ begin
     if A[I] > M then
       M := A[I];
   if M < 0.0001 then
+  begin
+    for I := 0 to High(A) do
+      A[I] := 0;
     Exit;
+  end;
   for I := 0 to High(A) do
-    A[I] := 0.08 + 0.92 * Power(A[I] / M, 0.55);
+    A[I] := A[I] / M;
 end;
 
 function BuildWavePeaks(const APath: string; ACount: Integer): TArray<Single>;
+const
+  GroupFrames = 64;
 var
   I: Integer;
 {$IFDEF MSWINDOWS}
+  B0, B1, B: Integer;
   NeedCo: Boolean;
   Reader: IMFSourceReader;
   Sample: IMFSample;
@@ -775,10 +809,34 @@ var
   Data: Pointer;
   Bytes, Flags, StreamIdx: DWORD;
   Ts: Int64;
-  Dur, T: Double;
-  N, Rate, Ch, Bits, V: Integer;
-  P: PSmallInt;
-  Peak: Single;
+  Rate, Ch, Bits, FrameBytes, Frames, Frame, Gi, GroupCount: Integer;
+  Chunks: TArray<Single>;
+  ChunkN, ChunkCap: Integer;
+  GroupPeak, SampleAbs: Single;
+  P16: PSmallInt;
+  P8: PByte;
+  P32: PSingle;
+  V: Integer;
+
+  procedure PushChunk(AValue: Single);
+  begin
+    if ChunkN >= ChunkCap then
+    begin
+      ChunkCap := ChunkCap + 2048 + ChunkCap div 2;
+      SetLength(Chunks, ChunkCap);
+    end;
+    Chunks[ChunkN] := AValue;
+    Inc(ChunkN);
+  end;
+
+  procedure FlushGroup;
+  begin
+    if GroupCount <= 0 then
+      Exit;
+    PushChunk(GroupPeak);
+    GroupPeak := 0;
+    GroupCount := 0;
+  end;
 {$ENDIF}
 begin
   if ACount < 8 then
@@ -787,18 +845,30 @@ begin
     ACount := 240;
   SetLength(Result, ACount);
   for I := 0 to ACount - 1 do
-    Result[I] := 0.1;
+    Result[I] := 0;
 {$IFDEF MSWINDOWS}
   NeedCo := Succeeded(CoInitializeEx(nil, COINIT_MULTITHREADED));
   try
     if not OpenPcmReader(APath, Reader, Rate, Ch, Bits) then
       Exit;
-    Dur := ReaderDurationSec(Reader);
-    if Dur <= 0 then
-      Dur := 1;
+    if Rate < 1000 then
+      Rate := 22050;
+    if (Ch < 1) or (Ch > 8) then
+      Ch := 1;
+    if (Bits <> 8) and (Bits <> 16) and (Bits <> 32) then
+      Bits := 16;
+    FrameBytes := (Bits div 8) * Ch;
+    if FrameBytes < 1 then
+      FrameBytes := 2;
+    ChunkCap := 2048;
+    SetLength(Chunks, ChunkCap);
+    ChunkN := 0;
+    GroupPeak := 0;
+    GroupCount := 0;
     while True do
     begin
       Sample := nil;
+      Buf := nil;
       if Failed(Reader.ReadSample(MF_SOURCE_READER_FIRST_AUDIO, 0, StreamIdx,
         Flags, Ts, Sample)) then
         Break;
@@ -806,32 +876,86 @@ begin
         Break;
       if Sample = nil then
         Continue;
-      T := Ts / 1.0e7;
-      I := EnsureRange(Trunc(T / Dur * ACount), 0, ACount - 1);
       if Failed(Sample.ConvertToContiguousBuffer(Buf)) then
+      begin
+        Sample := nil;
         Continue;
+      end;
       if Failed(Buf.Lock(Data, nil, Bytes)) then
+      begin
+        Buf := nil;
+        Sample := nil;
         Continue;
+      end;
       try
-        Peak := Result[I];
-        N := Integer(Bytes) div 2;
-        P := Data;
-        while N > 0 do
+        Frames := Integer(Bytes) div FrameBytes;
+        P16 := nil;
+        P8 := nil;
+        P32 := nil;
+        if Bits = 16 then
+          P16 := Data
+        else if Bits = 8 then
+          P8 := Data
+        else
+          P32 := Data;
+        for Frame := 0 to Frames - 1 do
         begin
-          V := Abs(P^);
-          if V / 32768.0 > Peak then
-            Peak := V / 32768.0;
-          Inc(P);
-          Dec(N);
+          SampleAbs := 0;
+          if Bits = 16 then
+            for Gi := 0 to Ch - 1 do
+            begin
+              V := P16^;
+              if V = -32768 then
+                V := 32768
+              else if V < 0 then
+                V := -V;
+              if V / 32768.0 > SampleAbs then
+                SampleAbs := V / 32768.0;
+              Inc(P16);
+            end
+          else if Bits = 8 then
+            for Gi := 0 to Ch - 1 do
+            begin
+              V := Abs(Integer(P8^) - 128);
+              if V / 128.0 > SampleAbs then
+                SampleAbs := V / 128.0;
+              Inc(P8);
+            end
+          else
+            for Gi := 0 to Ch - 1 do
+            begin
+              SampleAbs := Max(SampleAbs, Min(1.0, Abs(P32^)));
+              Inc(P32);
+            end;
+          if SampleAbs > GroupPeak then
+            GroupPeak := SampleAbs;
+          Inc(GroupCount);
+          if GroupCount >= GroupFrames then
+            FlushGroup;
         end;
-        Result[I] := Peak;
       finally
         Buf.Unlock;
       end;
       Buf := nil;
       Sample := nil;
     end;
+    FlushGroup;
     Reader := nil;
+    if ChunkN > 0 then
+      for I := 0 to ChunkN - 1 do
+      begin
+        B0 := Integer((Int64(I) * ACount) div ChunkN);
+        B1 := Integer((Int64(I + 1) * ACount) div ChunkN);
+        if B1 <= B0 then
+          B1 := B0 + 1;
+        if B0 < 0 then
+          B0 := 0;
+        if B1 > ACount then
+          B1 := ACount;
+        for B := B0 to B1 - 1 do
+          if Chunks[I] > Result[B] then
+            Result[B] := Chunks[I];
+      end;
     NormalizePeaks(Result);
   finally
     if NeedCo then
@@ -1221,13 +1345,17 @@ begin
   IsVid := MatchText(ExtS, ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.m4v',
     '.mpg', '.mpeg', '.3gp', '.mts']) or MatchText(ExtD, ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v']);
 
-  { 1) stream copy — тот же кодек/контейнер }
-  Params := Format(
-    '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -t %s -c copy -map 0 -avoid_negative_ts make_zero "%s"',
-    [Ss, ASrc, Td, ADst]);
-  Result := RunHidden(Exe, Params) and FileExists(ADst) and (TFile.GetSize(ADst) > 0);
-  if Result then
-    Exit;
+  { Копия с -ss до -i на длинной GOP начинается с нуля и длится до конечной метки.
+    Такой срез годится только когда старт и так в начале файла. }
+  if AStart <= 0.05 then
+  begin
+    Params := Format(
+      '-nostdin -hide_banner -loglevel error -y -ss %s -i "%s" -t %s -c copy -map 0 -avoid_negative_ts make_zero "%s"',
+      [Ss, ASrc, Td, ADst]);
+    Result := RunHidden(Exe, Params) and FileExists(ADst) and (TFile.GetSize(ADst) > 0);
+    if Result then
+      Exit;
+  end;
   if FileExists(ADst) then
   try
     TFile.Delete(ADst);
@@ -1472,6 +1600,8 @@ begin
   end;
   if AEnd <= AStart then
     AEnd := AStart + 0.2;
+  if AStart > 0.05 then
+    Exit(ExportClipEncode(ASrc, ADst, AStart, AEnd, 18, AError));
   Dur := Max(0.05, AEnd - AStart);
   if FileExists(ADst) then
   try

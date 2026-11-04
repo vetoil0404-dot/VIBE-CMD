@@ -107,6 +107,8 @@ type
     procedure MenuRemoveClick(Sender: TObject);
     procedure MenuEmptyBinClick(Sender: TObject);
     procedure MenuAddSepClick(Sender: TObject);
+    procedure MenuAddBinClick(Sender: TObject);
+    function HasRecycleBin: Boolean;
     procedure MenuAlignLeftClick(Sender: TObject);
     procedure MenuAlignCenterClick(Sender: TObject);
     procedure MenuAlignFreeClick(Sender: TObject);
@@ -836,6 +838,11 @@ begin
         AppendMenu(Pop, MF_STRING, 3, PChar(L('dock.resetpic')));
       AppendMenu(Pop, Flags, 4, PChar(L('dock.goto')));
       AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.remove')));
+      if not HasRecycleBin then
+      begin
+        AppendMenu(Pop, MF_SEPARATOR, 0, nil);
+        AppendMenu(Pop, MF_STRING, 7, PChar(L('dock.addbin')));
+      end;
     end;
     GetCursorPos(Pt);
     Cmd := UINT(TrackPopupMenuEx(Pop,
@@ -852,6 +859,7 @@ begin
     4: MenuGoToClick(nil);
     5: MenuRemoveClick(nil);
     6: MenuEmptyBinClick(nil);
+    7: MenuAddBinClick(nil);
   end;
   {$ENDIF}
 end;
@@ -886,6 +894,8 @@ begin
     FlFree := FlFree or MF_CHECKED;
   try
     AppendMenu(Pop, MF_STRING, 1, PChar(L('dock.addsep')));
+    if not HasRecycleBin then
+      AppendMenu(Pop, MF_STRING, 5, PChar(L('dock.addbin')));
     AppendMenu(Pop, MF_SEPARATOR, 0, nil);
     AppendMenu(Pop, FlLeft, 2, PChar(L('dock.align.left')));
     AppendMenu(Pop, FlCenter, 3, PChar(L('dock.align.center')));
@@ -903,6 +913,7 @@ begin
     2: MenuAlignLeftClick(nil);
     3: MenuAlignCenterClick(nil);
     4: MenuAlignFreeClick(nil);
+    5: MenuAddBinClick(nil);
   end;
   {$ENDIF}
 end;
@@ -1204,12 +1215,16 @@ begin
   end;
   if IndexOfPath(Path) >= 0 then
     Exit;
+  if IsRecycleBinPath(Path) and HasRecycleBin then
+    Exit;
 
   Tile := TDockTile.CreateTile(FStrip);
   Tile.Parent := FStrip;
   Tile.ItemPath := Path;
   Tile.Caption := MakeDockCaption(Path);
   Tile.Kind := KindFromName(Path);
+  if IsRecycleBinPath(Path) then
+    Tile.Kind := dkFolder;
   Tile.IsBroken := False;
   Tile.IconLocked := False;
   Tile.IconFile := '';
@@ -2610,6 +2625,28 @@ procedure TLaunchDock.MenuAddSepClick(Sender: TObject);
 begin
   FShowSeps := True;
   AddSeparatorAt(-1);
+end;
+
+function TLaunchDock.HasRecycleBin: Boolean;
+var
+  I: Integer;
+  Tile: TDockTile;
+begin
+  for I := 0 to FTiles.Count - 1 do
+  begin
+    Tile := TileOf(FTiles[I]);
+    if (Tile <> nil) and not Tile.Removing and not Tile.IsSep and
+       IsRecycleBinPath(Tile.ItemPath) then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
+procedure TLaunchDock.MenuAddBinClick(Sender: TObject);
+begin
+  if HasRecycleBin then
+    Exit;
+  PinPath(RecycleBinPath);
 end;
 
 procedure TLaunchDock.MenuAlignLeftClick(Sender: TObject);

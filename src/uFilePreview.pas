@@ -334,10 +334,18 @@ type
     FTrimB: Double;
     FWave: TArray<Single>;
     FSeekDrag: Integer;
+    FTrimDragX: Single;
+    FTrimDragBox: TPaintBox;
+    FTrimCarry: Boolean;
+    FTrimMovedHead: Boolean;
     FExporting: Boolean;
     FMediaPaused: Boolean;
     FMediaClockMs: Cardinal;
     FPosHoldUntil: Cardinal;
+    FVideoClickPending: Boolean;
+    FVideoClickAt: Cardinal;
+    FVideoFull: Boolean;
+    FFrameStep: Double;
     {$IFDEF MSWINDOWS}
     FHostWnd: HWND;
     FHandler: IPreviewHandler;
@@ -382,6 +390,9 @@ type
     FHdrEvVal: Single;
     FHdrShown: Single;
     FHdrDrag: Boolean;
+    class var
+      FVideoFullOwner: TFilePreview;
+      FMediaSpaceDown: Boolean;
     procedure BuildUI;
     procedure CloseClick(Sender: TObject);
     procedure DebounceTick(Sender: TObject);
@@ -671,6 +682,7 @@ type
     procedure RefreshVideoLabel;
     procedure ShowVideoStill;
     procedure HideVideoStill;
+    function CapturePlaybackBitmap: TBitmap;
     procedure SetMediaShelfLocked(ALock: Boolean);
     procedure PaintWave(Sender: TObject; Canvas: TCanvas);
     procedure PaintSeek(Sender: TObject; Canvas: TCanvas);
@@ -681,6 +693,9 @@ type
       Shift: TShiftState; X, Y: Single);
     procedure UpdateMediaHud;
     function XToMediaTime(X, AWidth: Single): Double;
+    function MediaTimeToX(ABox: TPaintBox; ATime: Double): Single;
+    function BarTimeAt(ABox: TPaintBox; X: Single): Double;
+    procedure DragTrimMarker(ABox: TPaintBox; X: Single);
     {$IFDEF MSWINDOWS}
     function LoadNativePreview(const APath: string): Boolean;
     procedure UnloadNative;
@@ -713,6 +728,15 @@ type
     procedure SetKindRaw(const AText: string);
     procedure ShowInfoKey(const AKey: string);
     procedure RefreshFontKind;
+    function PtInVideoPicture(X, Y: Single): Boolean;
+    procedure TakeVideoClick(ADouble: Boolean);
+    procedure SetVideoFullscreen(AOn: Boolean);
+    procedure StepVideoFrame(ADir: Integer);
+    procedure HandleVideoKey(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+    {$IFDEF MSWINDOWS}
+    procedure VideoWindowHit(Sender: TObject; ADouble: Boolean);
+    procedure VideoWindowKey(Sender: TObject; AKey: Word);
+    {$ENDIF}
   protected
     procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
     procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
@@ -726,6 +750,9 @@ type
     procedure ApplyLanguage;
     procedure FocusViewer;
     function HasKeyboardFocus: Boolean;
+    class function CloseVideoFullscreen: Boolean;
+    class procedure ResetMediaSpace;
+    function TryMediaSpace: Boolean;
     property FilePath: string read FPath;
     property LastSavedPath: string read FLastSaved;
     property ShowCloseButton: Boolean read FShowClose write SetShowClose;
@@ -940,6 +967,7 @@ begin
   HitTest := True;
   CanFocus := True;
   TabStop := True;
+  DisableFocusEffect := True;
   FShowClose := False;
   FCaptureKeys := False;
   FTextHi := True;
@@ -975,6 +1003,9 @@ end;
 destructor TFilePreview.Destroy;
 begin
   FDestroying := True;
+  FVideoClickPending := False;
+  if FVideoFullOwner = Self then
+    FVideoFullOwner := nil;
   Inc(FLoadGen);
   Inc(FMeshGen);
   FreeAndNil(FIcoFrames);
@@ -1837,8 +1868,223 @@ begin
   end;
 end;
 
+function TFilePreview.PtInVideoPicture(X, Y: Single): Boolean;
+var
+  P: TPointF;
+  Bottom: Single;
+begin
+  Result := False;
+  if FDestroying or not FIsVideo or FIsAudio then
+    Exit;
+  if Assigned(FSaveShade) and FSaveShade.Visible then
+    Exit;
+  if not Assigned(FBody) or not FBody.Visible then
+    Exit;
+  P := FBody.AbsoluteToLocal(LocalToAbsolute(TPointF.Create(X, Y)));
+  if (P.X < 0) or (P.Y < 0) or (P.X >= FBody.Width) or (P.Y >= FBody.Height) then
+    Exit;
+  Bottom := FBody.Height;
+  if Assigned(FMediaBar) and FMediaBar.Visible then
+    Bottom := FMediaBar.Position.Y;
+  Result := P.Y < Bottom;
+end;
+
+procedure TFilePreview.TakeVideoClick(ADouble: Boolean);
+begin
+  if FDestroying or not FIsVideo or FIsAudio then
+    Exit;
+  if Assigned(FSaveShade) and FSaveShade.Visible then
+    Exit;
+  if CanFocus and not FDestroying then
+    SetFocus;
+  if ADouble then
+  begin
+    FVideoClickPending := False;
+    SetVideoFullscreen(not FVideoFull);
+  end
+  else
+  begin
+    FVideoClickPending := True;
+    FVideoClickAt := TThread.GetTickCount;
+  end;
+end;
+
+procedure TFilePreview.SetVideoFullscreen(AOn: Boolean);
+begin
+  if FDestroying and AOn then
+    AOn := False;
+  if not FIsVideo or FIsAudio then
+    AOn := False;
+  FVideoClickPending := False;
+  {$IFDEF MSWINDOWS}
+  if Assigned(FMpv) then
+    FMpv.SetFullscreen(AOn);
+  if AOn and ((FMpv = nil) or not FMpv.Fullscreen) then
+    AOn := False;
+  {$ELSE}
+  AOn := False;
+  {$ENDIF}
+  if AOn = FVideoFull then
+    Exit;
+  FVideoFull := AOn;
+  if FVideoFull then
+    FVideoFullOwner := Self
+  else if FVideoFullOwner = Self then
+    FVideoFullOwner := nil;
+  { В полном экране фокус у окна видео, иначе клавиши до формы не доходят. }
+  if (not FVideoFull) and Visible and CanFocus and not FDestroying then
+    SetFocus;
+  {$IFDEF MSWINDOWS}
+  if not FDestroying then
+    SyncHostWnd;
+  {$ENDIF}
+end;
+
+class function TFilePreview.CloseVideoFullscreen: Boolean;
+begin
+  Result := Assigned(FVideoFullOwner) and FVideoFullOwner.FVideoFull and
+    not FVideoFullOwner.FDestroying;
+  if Result then
+    FVideoFullOwner.SetVideoFullscreen(False);
+end;
+
+class procedure TFilePreview.ResetMediaSpace;
+begin
+  FMediaSpaceDown := False;
+end;
+
+function TFilePreview.TryMediaSpace: Boolean;
+begin
+  Result := False;
+  if FMediaSpaceDown or FDestroying or not Visible then
+    Exit;
+  if not (FIsAudio or FIsVideo) then
+    Exit;
+  if Assigned(FSaveShade) and FSaveShade.Visible then
+    Exit;
+  FMediaSpaceDown := True;
+  FVideoClickPending := False;
+  MediaPlayClick(nil);
+  Result := True;
+end;
+
+procedure TFilePreview.StepVideoFrame(ADir: Integer);
+var
+  Dt, Next, Dur: Double;
+  AtEdge: Boolean;
+begin
+  if FDestroying or not FIsVideo or FIsAudio or (ADir = 0) then
+    Exit;
+  Dur := FMediaDur;
+  if Dur <= 0.05 then
+    Exit;
+  Dt := FFrameStep;
+  if (Dt < 0.001) or (Dt > 0.2) then
+    Dt := 1 / 30;
+  if ADir > 0 then
+    AtEdge := FMediaPos >= Dur - Dt * 0.45
+  else
+    AtEdge := FMediaPos <= Dt * 0.45;
+  { Во время ролика стрелка сначала ставит паузу, потом сдвигает кадр. }
+  if not FMediaPaused then
+  begin
+    {$IFDEF MSWINDOWS}
+    if Assigned(FMpv) then
+      FMpv.SetPaused(True);
+    {$ENDIF}
+    FMediaPaused := True;
+    if Assigned(FBtnPlay) then
+    begin
+      FBtnPlay.SetIcon(#$E768);
+      FBtnPlay.SetCaption(L('qv.start'));
+    end;
+  end;
+  if AtEdge then
+  begin
+    UpdateMediaHud;
+    Exit;
+  end;
+  Next := EnsureRange(FMediaPos + ADir * Dt, 0, Dur);
+  FMediaPos := Next;
+  FPosHoldUntil := TThread.GetTickCount + 600;
+  {$IFDEF MSWINDOWS}
+  if Assigned(FMpv) then
+    FMpv.Seek(Next);
+  {$ENDIF}
+  UpdateMediaHud;
+end;
+
+procedure TFilePreview.HandleVideoKey(var Key: Word; var KeyChar: WideChar;
+  Shift: TShiftState);
+begin
+  if not (FIsAudio or FIsVideo) then
+    Exit;
+  if (ssAlt in Shift) or (ssCtrl in Shift) or (ssShift in Shift) then
+    Exit;
+  { FMX обнуляет vkSpace и оставляет только символ пробела. }
+  if (Key = vkSpace) or (KeyChar = ' ') then
+  begin
+    TryMediaSpace;
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if not FIsVideo or FIsAudio then
+    Exit;
+  FVideoClickPending := False;
+  if (Key = vkEscape) and FVideoFull then
+  begin
+    SetVideoFullscreen(False);
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Key = vkRight then
+  begin
+    StepVideoFrame(1);
+    Key := 0;
+    KeyChar := #0;
+  end
+  else if Key = vkLeft then
+  begin
+    StepVideoFrame(-1);
+    Key := 0;
+    KeyChar := #0;
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TFilePreview.VideoWindowHit(Sender: TObject; ADouble: Boolean);
+begin
+  TakeVideoClick(ADouble);
+end;
+
+procedure TFilePreview.VideoWindowKey(Sender: TObject; AKey: Word);
+var
+  Key: Word;
+  KeyChar: WideChar;
+  Shift: TShiftState;
+begin
+  Key := AKey;
+  KeyChar := #0;
+  Shift := [];
+  if GetKeyState(VK_SHIFT) < 0 then
+    Include(Shift, ssShift);
+  if GetKeyState(VK_CONTROL) < 0 then
+    Include(Shift, ssCtrl);
+  if GetKeyState(VK_MENU) < 0 then
+    Include(Shift, ssAlt);
+  HandleVideoKey(Key, KeyChar, Shift);
+end;
+{$ENDIF}
+
 procedure TFilePreview.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
 begin
+  if (Button = TMouseButton.mbLeft) and PtInVideoPicture(X, Y) then
+  begin
+    TakeVideoClick(ssDouble in Shift);
+    Exit;
+  end;
   inherited;
   FocusViewer;
 end;
@@ -1910,6 +2156,7 @@ var
   NowMs: Cardinal;
   Dt: Double;
   EngPos: Double;
+  Wait: Cardinal;
 begin
   {$IFDEF MSWINDOWS}
   if FUsingNative or FUsingMpv then
@@ -1920,6 +2167,20 @@ begin
   if FIsAudio or FIsVideo then
   begin
     NowMs := TThread.GetTickCount;
+    {$IFDEF MSWINDOWS}
+    { Одинарный клик ждёт двойной, чтобы даблклик не стал двумя старт-стоп. }
+    if FVideoClickPending and FIsVideo and not FIsAudio then
+    begin
+      Wait := GetDoubleClickTime;
+      if Wait < 200 then
+        Wait := 200;
+      if NowMs - FVideoClickAt >= Wait + 40 then
+      begin
+        FVideoClickPending := False;
+        MediaPlayClick(nil);
+      end;
+    end;
+    {$ENDIF}
     if FMediaClockMs = 0 then
       FMediaClockMs := NowMs;
     Dt := (NowMs - FMediaClockMs) / 1000.0;
@@ -1940,7 +2201,7 @@ begin
       if (FMediaDur > 0.05) and (FTrimB <= 0.05) then
         FTrimB := FMediaDur;
     end;
-    if FSeekDrag = 0 then
+    if FSeekDrag <> 1 then
     begin
 {$IFDEF MSWINDOWS}
       if Assigned(FMpv) and FMpv.HasEngine then
@@ -1948,7 +2209,8 @@ begin
         EngPos := FMpv.Duration;
         if EngPos > 0.05 then
           FMediaDur := EngPos;
-        if (FPosHoldUntil = 0) or (NowMs >= FPosHoldUntil) then
+        if ((FPosHoldUntil = 0) or (NowMs >= FPosHoldUntil)) and
+           not FTrimMovedHead then
           FMediaPos := FMpv.Position;
         if (FMediaDur > 0.2) and (FMediaPos >= FMediaDur - 0.08) and
            ((FPosHoldUntil = 0) or (NowMs >= FPosHoldUntil)) then
@@ -1956,26 +2218,30 @@ begin
       end
       else
 {$ENDIF}
-      if not FMediaPaused then
+      if not FMediaPaused and not FTrimMovedHead then
         FMediaPos := FMediaPos + Dt;
-      if FTrimB > FTrimA + 0.05 then
+      { Пока маркер тянут или ролик на паузе, границы не подтягивают ползунок. }
+      if (FSeekDrag = 0) and not FMediaPaused then
       begin
-        if FMediaPos < FTrimA then
-          FMediaPos := FTrimA;
-        if FMediaPos >= FTrimB then
+        if FTrimB > FTrimA + 0.05 then
         begin
-          FMediaPos := FTrimB;
-          FMediaPaused := True;
+          if FMediaPos < FTrimA then
+            FMediaPos := FTrimA;
+          if FMediaPos >= FTrimB then
+          begin
+            FMediaPos := FTrimB;
+            FMediaPaused := True;
 {$IFDEF MSWINDOWS}
-          if Assigned(FMpv) then
-            FMpv.SetPaused(True);
+            if Assigned(FMpv) then
+              FMpv.SetPaused(True);
 {$ENDIF}
+          end;
+        end
+        else if (FMediaDur > 0) and (FMediaPos > FMediaDur) then
+        begin
+          FMediaPos := FMediaDur;
+          FMediaPaused := True;
         end;
-      end
-      else if (FMediaDur > 0) and (FMediaPos > FMediaDur) then
-      begin
-        FMediaPos := FMediaDur;
-        FMediaPaused := True;
       end;
     end;
     UpdateMediaHud;
@@ -4229,6 +4495,9 @@ begin
     KeyChar := #0;
     Exit;
   end;
+  HandleVideoKey(Key, KeyChar, Shift);
+  if Key = 0 then
+    Exit;
   inherited;
 end;
 
@@ -8248,6 +8517,14 @@ begin
   FTrimB := 0;
   FSeekDrag := 0;
   FMediaPaused := False;
+  FVideoClickPending := False;
+  FFrameStep := 0;
+  if not AAudio then
+  begin
+    FFrameStep := ProbeVideoFrameSeconds(FPath);
+    if (FFrameStep < 0.001) or (FFrameStep > 0.2) then
+      FFrameStep := 1 / 30;
+  end;
   FMediaClockMs := TThread.GetTickCount;
   SetLength(FWave, 0);
   if Assigned(FMediaBar) then
@@ -8327,8 +8604,12 @@ end;
 
 procedure TFilePreview.HideMediaChrome;
 begin
+  FVideoClickPending := False;
+  if FVideoFull then
+    SetVideoFullscreen(False);
   FIsAudio := False;
   FIsVideo := False;
+  FFrameStep := 0;
   FSeekDrag := 0;
   FMediaDur := 0;
   FMediaPos := 0;
@@ -8357,11 +8638,17 @@ begin
   if not (FIsAudio or FIsVideo) then
     Exit;
   FMediaPaused := not FMediaPaused;
-  if (not FMediaPaused) and (FMediaDur > 0.2) and (FMediaPos >= FMediaDur - 0.08) then
+  if not FMediaPaused then
   begin
-    FMediaPos := FTrimA;
-    if Assigned(FMpv) then
-      FMpv.Seek(FMediaPos);
+    { Конец ролика или стоп на конечной метке — старт снова с начальной. }
+    if ((FMediaDur > 0.2) and (FMediaPos >= FMediaDur - 0.08)) or
+       ((FTrimB > FTrimA + 0.05) and (FMediaPos >= FTrimB - 0.05)) then
+    begin
+      FMediaPos := FTrimA;
+      FPosHoldUntil := TThread.GetTickCount + 600;
+      if Assigned(FMpv) then
+        FMpv.Seek(FMediaPos);
+    end;
   end;
   if Assigned(FMpv) then
     FMpv.SetPaused(FMediaPaused);
@@ -8679,6 +8966,7 @@ var
   Src, Dst: string;
   At: Double;
   Gen, N: Integer;
+  Shot: TBitmap;
 begin
   if FExporting or not FIsVideo or (FPath = '') or not TFile.Exists(FPath) then
     Exit;
@@ -8690,6 +8978,17 @@ begin
     Dst := ExtractFilePath(Src) + ChangeFileExt(ExtractFileName(Src), '') +
       '_frame ' + IntToStr(N) + '.png';
     Inc(N);
+  end;
+  Shot := CapturePlaybackBitmap;
+  if Shot <> nil then
+  try
+    if SaveImage(Shot, Dst, isfPng, 100) then
+    begin
+      ShowToast(ExtractFileName(Dst));
+      Exit;
+    end;
+  finally
+    Shot.Free;
   end;
   At := FMediaPos;
   if At < 0 then
@@ -8830,9 +9129,10 @@ begin
           except
             Ok := False;
           end
-          else if CopyOnly then
+          else if CopyOnly and (A0 <= 0.05) then
             Ok := ExportClipCopy(Src, Path, A0, B0, Msg)
           else
+            { Копия потока с -ss до -i начинает файл с нуля и доходит до конечного маркера. }
             Ok := ExportClipEncode(Src, Path, A0, B0, Crf, Msg);
         end;
 {$ELSE}
@@ -8870,11 +9170,100 @@ begin
   Result := EnsureRange(X / AWidth, 0, 1) * FMediaDur;
 end;
 
+function TFilePreview.MediaTimeToX(ABox: TPaintBox; ATime: Double): Single;
+var
+  Dur, Left, Span: Single;
+begin
+  Result := 0;
+  if ABox = nil then
+    Exit;
+  Dur := FMediaDur;
+  if Dur <= 0 then
+    Dur := 1;
+  if ABox = FSeekBox then
+  begin
+    Left := 8;
+    Span := ABox.Width - 16;
+  end
+  else
+  begin
+    Left := 0;
+    Span := ABox.Width;
+  end;
+  if Span < 1 then
+    Span := 1;
+  Result := Left + EnsureRange(ATime / Dur, 0, 1) * Span;
+end;
+
+function TFilePreview.BarTimeAt(ABox: TPaintBox; X: Single): Double;
+var
+  Dur, Left, Span: Single;
+begin
+  Result := 0;
+  if (ABox = nil) or (FMediaDur <= 0) then
+    Exit;
+  Dur := FMediaDur;
+  if ABox = FSeekBox then
+  begin
+    Left := 8;
+    Span := ABox.Width - 16;
+  end
+  else
+  begin
+    Left := 0;
+    Span := ABox.Width;
+  end;
+  if Span < 1 then
+    Exit;
+  Result := EnsureRange((X - Left) / Span, 0, 1) * Dur;
+end;
+
+procedure TFilePreview.DragTrimMarker(ABox: TPaintBox; X: Single);
+const
+  MagnetPx = 8;
+var
+  Dur, T, OldPos: Double;
+  WasCarry, Stick: Boolean;
+begin
+  if (ABox = nil) or not (FSeekDrag in [2, 3]) then
+    Exit;
+  Dur := FMediaDur;
+  if Dur <= 0 then
+    Dur := 1;
+  OldPos := FMediaPos;
+  WasCarry := FTrimCarry;
+  { 8 пикселей по полосе: первое касание цепляет маркер к ползунку. }
+  Stick := (not WasCarry) and (FMediaDur > 0) and
+    (Abs(X - MediaTimeToX(ABox, FMediaPos)) <= MagnetPx);
+  if Stick then
+    FTrimCarry := True;
+  if FTrimCarry and not WasCarry then
+    T := FMediaPos
+  else
+    T := BarTimeAt(ABox, X);
+  if FSeekDrag = 2 then
+  begin
+    if FTrimCarry then
+      FTrimA := EnsureRange(T, 0, Max(0, FTrimB - 0.001))
+    else
+      FTrimA := EnsureRange(T, 0, Max(0, FTrimB - 0.05));
+  end
+  else if FTrimCarry then
+    FTrimB := EnsureRange(T, FTrimA + 0.001, Dur)
+  else
+    FTrimB := EnsureRange(T, FTrimA + 0.05, Dur);
+  { Маркер сдвигает ползунок только внутрь, когда диапазон сужается. }
+  if FTrimB > FTrimA then
+    FMediaPos := EnsureRange(FMediaPos, FTrimA, FTrimB);
+  if Abs(FMediaPos - OldPos) > 0.0005 then
+    FTrimMovedHead := True;
+end;
+
 procedure TFilePreview.PaintWave(Sender: TObject; Canvas: TCanvas);
 var
   R, Bar: TRectF;
   I, N: Integer;
-  Slot, BarW, H, Cy, Px, T: Single;
+  Slot, Gap, BarW, H, Cy, Px, T, Amp, Rad: Single;
   Peak, Op: Single;
   Played: Boolean;
   Col: TAlphaColor;
@@ -8887,18 +9276,29 @@ begin
   if N < 2 then
     Exit;
   Slot := R.Width / N;
-  BarW := Max(3, Min(5, Slot * 0.72));
+  Gap := Max(1, Slot * 0.28);
+  if Gap > Slot * 0.45 then
+    Gap := Slot * 0.45;
+  BarW := Slot - Gap;
+  if BarW < 0.8 then
+    BarW := Max(0.6, Slot * 0.62);
+  if BarW > Slot * 0.78 then
+    BarW := Slot * 0.78;
+  Amp := Min(R.Height * 0.42, 120);
   Cy := R.Top + R.Height * 0.5;
   for I := 0 to N - 1 do
   begin
     Peak := FWave[I];
-    H := Max(4, Peak * Min(R.Height * 0.42, 120));
+    if Peak <= 0.004 then
+      H := 1
+    else
+      H := Max(2, Peak * Amp);
     Px := R.Left + I * Slot + (Slot - BarW) * 0.5;
     Bar := TRectF.Create(Px, Cy - H * 0.5, Px + BarW, Cy + H * 0.5);
     T := 0;
     if FMediaDur > 0 then
       T := (I + 0.5) / N * FMediaDur;
-    Played := (FMediaDur > 0) and (T <= FMediaPos);
+    Played := (FMediaDur > 0) and (T >= FTrimA) and (T <= FMediaPos);
     Op := 1;
     if (FMediaDur > 0) and ((T < FTrimA) or (T > FTrimB)) then
       Op := 0.28;
@@ -8907,7 +9307,10 @@ begin
     else
       Col := FColors.ControlStroke;
     Canvas.Fill.Color := Col;
-    Canvas.FillRect(Bar, 1.5, 1.5, AllCorners, Op);
+    Rad := 0.8;
+    if (H <= 2) or (BarW < 2.2) then
+      Rad := 0;
+    Canvas.FillRect(Bar, Rad, Rad, AllCorners, Op);
   end;
   Canvas.Stroke.Kind := TBrushKind.Solid;
   if (FMediaDur > 0) and (FTrimB > FTrimA + 0.01) then
@@ -8931,7 +9334,7 @@ end;
 procedure TFilePreview.PaintSeek(Sender: TObject; Canvas: TCanvas);
 var
   R, Track, FillR, Hand: TRectF;
-  Dur, Pos, A, B, X: Single;
+  Dur, Pos, A, B, X, PlayL, PlayR: Single;
   Cy: Single;
 begin
   R := FSeekBox.LocalRect;
@@ -8955,10 +9358,18 @@ begin
     Track.Left + (B / Dur) * Track.Width, Track.Bottom);
   Canvas.Fill.Color := FColors.AccentSubtle;
   Canvas.FillRect(FillR, 3, 3, AllCorners, 1);
-  FillR := TRectF.Create(Track.Left, Track.Top,
-    Track.Left + (Pos / Dur) * Track.Width, Track.Bottom);
-  Canvas.Fill.Color := FColors.SelectionColor;
-  Canvas.FillRect(FillR, 3, 3, AllCorners, 1);
+  { Прогресс начинается с первого маркера, а не с края полосы. }
+  PlayL := A;
+  PlayR := Pos;
+  if PlayR < PlayL then
+    PlayR := PlayL;
+  if PlayR > PlayL then
+  begin
+    FillR := TRectF.Create(Track.Left + (PlayL / Dur) * Track.Width, Track.Top,
+      Track.Left + (PlayR / Dur) * Track.Width, Track.Bottom);
+    Canvas.Fill.Color := FColors.SelectionColor;
+    Canvas.FillRect(FillR, 3, 3, AllCorners, 1);
+  end;
   X := Track.Left + (A / Dur) * Track.Width;
   Hand := TRectF.Create(X - 4, Cy - 10, X + 4, Cy + 10);
   Canvas.Fill.Color := FColors.TextColor;
@@ -8980,42 +9391,63 @@ var
 begin
   if Button <> TMouseButton.mbLeft then
     Exit;
+  if CanFocus then
+    SetFocus;
   Box := Sender as TPaintBox;
   W := Box.Width;
   Dur := FMediaDur;
   if Dur <= 0 then
     Dur := 1;
-  XA := (FTrimA / Dur) * W;
-  XB := (FTrimB / Dur) * W;
-  if FTrimB <= FTrimA then
-    XB := W;
+  XA := MediaTimeToX(Box, FTrimA);
+  if FTrimB > FTrimA then
+    XB := MediaTimeToX(Box, FTrimB)
+  else
+    XB := MediaTimeToX(Box, Dur);
+  if ssDouble in Shift then
+  begin
+    if Abs(X - XA) <= 10 then
+      FSeekDrag := 2
+    else if Abs(X - XB) <= 10 then
+      FSeekDrag := 3
+    else
+      FSeekDrag := 0;
+    if FSeekDrag in [2, 3] then
+    begin
+      T := EnsureRange(FMediaPos, 0, Dur);
+      if FSeekDrag = 2 then
+        FTrimA := EnsureRange(T, 0, Max(0, FTrimB - 0.001))
+      else
+        FTrimB := EnsureRange(T, Min(Dur, FTrimA + 0.001), Dur);
+      FSeekDrag := 0;
+      FTrimCarry := False;
+      FTrimMovedHead := False;
+      Box.Repaint;
+      if Assigned(FSeekBox) then
+        FSeekBox.Repaint;
+      if Assigned(FWaveBox) and FWaveBox.Visible then
+        FWaveBox.Repaint;
+      Exit;
+    end;
+  end;
+  FTrimDragBox := Box;
+  FTrimDragX := X;
+  FTrimCarry := False;
+  FTrimMovedHead := False;
   if Abs(X - XA) <= 10 then
     FSeekDrag := 2
   else if Abs(X - XB) <= 10 then
     FSeekDrag := 3
   else
     FSeekDrag := 1;
-  T := XToMediaTime(X, W);
-  case FSeekDrag of
-    1:
-      begin
-        if FTrimB > FTrimA + 0.05 then
-          T := EnsureRange(T, FTrimA, FTrimB);
-        FMediaPos := T;
-      end;
-    2:
-      begin
-        FTrimA := EnsureRange(T, 0, Max(0, FTrimB - 0.05));
-        if FMediaPos < FTrimA then
-          FMediaPos := FTrimA;
-      end;
-    3:
-      begin
-        FTrimB := EnsureRange(T, FTrimA + 0.05, Dur);
-        if FMediaPos > FTrimB then
-          FMediaPos := FTrimB;
-      end;
-  end;
+  if FSeekDrag = 1 then
+  begin
+    T := XToMediaTime(X, W);
+    if FTrimB > FTrimA + 0.05 then
+      T := EnsureRange(T, FTrimA, FTrimB);
+    FMediaPos := T;
+  end
+  else
+    DragTrimMarker(Box, X);
   Box.Repaint;
   if Assigned(FWaveBox) and FWaveBox.Visible then
     FWaveBox.Repaint;
@@ -9023,7 +9455,7 @@ end;
 
 procedure TFilePreview.SeekMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
 var
-  W, Dur, T: Double;
+  W, T: Double;
   Box: TPaintBox;
 begin
   { Отпустили кнопку за окном — FMX не шлёт MouseUp контролу. }
@@ -9037,30 +9469,17 @@ begin
     Exit;
   Box := Sender as TPaintBox;
   W := Box.Width;
-  Dur := FMediaDur;
-  if Dur <= 0 then
-    Dur := 1;
-  T := XToMediaTime(X, W);
-  case FSeekDrag of
-    1:
-      begin
-        if FTrimB > FTrimA + 0.05 then
-          T := EnsureRange(T, FTrimA, FTrimB);
-        FMediaPos := T;
-      end;
-    2:
-      begin
-        FTrimA := EnsureRange(T, 0, Max(0, FTrimB - 0.05));
-        if FMediaPos < FTrimA then
-          FMediaPos := FTrimA;
-      end;
-    3:
-      begin
-        FTrimB := EnsureRange(T, FTrimA + 0.05, Dur);
-        if FMediaPos > FTrimB then
-          FMediaPos := FTrimB;
-      end;
-  end;
+  FTrimDragBox := Box;
+  FTrimDragX := X;
+  if FSeekDrag = 1 then
+  begin
+    T := XToMediaTime(X, W);
+    if FTrimB > FTrimA + 0.05 then
+      T := EnsureRange(T, FTrimA, FTrimB);
+    FMediaPos := T;
+  end
+  else
+    DragTrimMarker(Box, X);
   Box.Repaint;
   if Assigned(FSeekBox) then
     FSeekBox.Repaint;
@@ -9091,20 +9510,23 @@ begin
     if Assigned(FMpv) then
       FMpv.Seek(FMediaPos);
 {$ENDIF}
+    FPosHoldUntil := TThread.GetTickCount + 600;
   end
-  else if FSeekDrag in [2, 3] then
+  else if (FSeekDrag in [2, 3]) and (Sender is TPaintBox) then
   begin
-    if FMediaPos < FTrimA then
-      FMediaPos := FTrimA;
-    if (FTrimB > 0) and (FMediaPos > FTrimB) then
-      FMediaPos := FTrimB;
+    DragTrimMarker(TPaintBox(Sender), X);
+    if FTrimMovedHead then
+    begin
 {$IFDEF MSWINDOWS}
-    if Assigned(FMpv) then
-      FMpv.Seek(FMediaPos);
+      if Assigned(FMpv) then
+        FMpv.Seek(FMediaPos);
 {$ENDIF}
+      FPosHoldUntil := TThread.GetTickCount + 600;
+    end;
   end;
   FSeekDrag := 0;
-  FPosHoldUntil := TThread.GetTickCount + 600;
+  FTrimCarry := False;
+  FTrimMovedHead := False;
   UpdateMediaHud;
 end;
 
@@ -9119,7 +9541,8 @@ begin
   begin
     D := FMpv.Duration;
     Eng := FMpv.Position;
-    if (FSeekDrag = 0) and ((FPosHoldUntil = 0) or (TThread.GetTickCount >= FPosHoldUntil)) then
+    if (FSeekDrag <> 1) and not FTrimMovedHead and
+       ((FPosHoldUntil = 0) or (TThread.GetTickCount >= FPosHoldUntil)) then
       FMediaPos := Eng;
     if D <= 0 then
       D := FMediaDur;
@@ -11719,32 +12142,89 @@ end;
 function PrintWindow(hwnd: HWND; hdcBlt: HDC; nFlags: UINT): BOOL; stdcall;
   external 'user32.dll' name 'PrintWindow';
 
-procedure TFilePreview.ShowVideoStill;
-{$IFDEF MSWINDOWS}
+function BitmapFromBgra(const APixels: TBytes; AWidth, AHeight: Integer): TBitmap;
+var
+  Data: FMX.Graphics.TBitmapData;
+  Y, Row: Integer;
+  Src, Dst: PByte;
+begin
+  Result := nil;
+  if (AWidth < 8) or (AHeight < 8) or (Length(APixels) < AWidth * AHeight * 4) then
+    Exit;
+  Result := TBitmap.Create(AWidth, AHeight);
+  if not Result.Map(TMapAccess.Write, Data) then
+  begin
+    FreeAndNil(Result);
+    Exit;
+  end;
+  try
+    Row := AWidth * 4;
+    Src := @APixels[0];
+    Dst := PByte(Data.Data);
+    if Dst <> nil then
+      for Y := 0 to AHeight - 1 do
+      begin
+        System.Move(Src^, Dst^, Row);
+        Inc(Src, Row);
+        Inc(Dst, Data.Pitch);
+      end;
+  finally
+    Result.Unmap(Data);
+  end;
+end;
+
+function BitmapLooksBlank(Bmp: TBitmap): Boolean;
+var
+  Data: FMX.Graphics.TBitmapData;
+  X, Y, Step, Hits, Seen: Integer;
+  Row: PByte;
+begin
+  Result := True;
+  if (Bmp = nil) or (Bmp.Width < 8) or (Bmp.Height < 8) then
+    Exit;
+  if not Bmp.Map(TMapAccess.Read, Data) then
+    Exit;
+  try
+    Hits := 0;
+    Seen := 0;
+    Step := 8;
+    Y := 0;
+    while Y < Bmp.Height do
+    begin
+      Row := PByte(Data.Data);
+      Inc(Row, Y * Data.Pitch);
+      X := 0;
+      while X < Bmp.Width do
+      begin
+        Inc(Seen);
+        if (Row[X * 4] > 16) or (Row[X * 4 + 1] > 16) or (Row[X * 4 + 2] > 16) then
+          Inc(Hits);
+        Inc(X, Step);
+      end;
+      Inc(Y, Step);
+    end;
+    Result := Hits * 50 < Seen;
+  finally
+    Bmp.Unmap(Data);
+  end;
+end;
+
+function CaptureWindowBitmap(Wnd: HWND): TBitmap;
 const
   PW_RENDERFULLCONTENT = 2;
 var
-  Wnd: HWND;
   WR: TRect;
   DC, Mem: HDC;
   Dib: HBITMAP;
   OldBmp: HGDIOBJ;
   Info: TBitmapInfo;
   Bits: Pointer;
-  W, H, Y, Row: Integer;
-  Shot: TBitmap;
+  W, H, Y, X, Row: Integer;
   Data: FMX.Graphics.TBitmapData;
   Src, Dst: PByte;
-  P: TPointF;
-{$ENDIF}
 begin
-  HideVideoStill;
-  if not FIsVideo then
-    Exit;
-{$IFDEF MSWINDOWS}
-  if not Assigned(FMpv) or not FMpv.HostWindow(Wnd) then
-    Exit;
-  if not GetClientRect(Wnd, WR) then
+  Result := nil;
+  if (Wnd = 0) or not IsWindow(Wnd) or not GetClientRect(Wnd, WR) then
     Exit;
   W := WR.Right - WR.Left;
   H := WR.Bottom - WR.Top;
@@ -11753,7 +12233,6 @@ begin
   DC := GetDC(Wnd);
   if DC = 0 then
     Exit;
-  Shot := nil;
   Dib := 0;
   Mem := 0;
   try
@@ -11773,8 +12252,8 @@ begin
     if not PrintWindow(Wnd, Mem, PW_RENDERFULLCONTENT) then
       BitBlt(Mem, 0, 0, W, H, DC, 0, 0, SRCCOPY);
     SelectObject(Mem, OldBmp);
-    Shot := TBitmap.Create(W, H);
-    if Shot.Map(TMapAccess.Write, Data) then
+    Result := TBitmap.Create(W, H);
+    if Result.Map(TMapAccess.Write, Data) then
     try
       Row := W * 4;
       Src := PByte(Bits);
@@ -11783,12 +12262,69 @@ begin
         for Y := 0 to H - 1 do
         begin
           System.Move(Src^, Dst^, Row);
+          for X := 0 to W - 1 do
+            Dst[X * 4 + 3] := 255;
           Inc(Src, Row);
           Inc(Dst, Data.Pitch);
         end;
     finally
-      Shot.Unmap(Data);
+      Result.Unmap(Data);
     end;
+  finally
+    if Dib <> 0 then
+      DeleteObject(Dib);
+    if Mem <> 0 then
+      DeleteDC(Mem);
+    ReleaseDC(Wnd, DC);
+  end;
+end;
+
+function TFilePreview.CapturePlaybackBitmap: TBitmap;
+{$IFDEF MSWINDOWS}
+var
+  W, H: Integer;
+  Pixels: TBytes;
+  Wnd: HWND;
+  Host: TBitmap;
+{$ENDIF}
+begin
+  Result := nil;
+{$IFDEF MSWINDOWS}
+  if Assigned(FMpv) and FMpv.GrabFrame(W, H, Pixels) then
+    Result := BitmapFromBgra(Pixels, W, H);
+  if Result <> nil then
+    Exit;
+  if not Assigned(FMpv) or not FMpv.HostWindow(Wnd) then
+    Exit;
+  Host := CaptureWindowBitmap(Wnd);
+  if Host = nil then
+    Exit;
+  if BitmapLooksBlank(Host) then
+    Host.Free
+  else
+    Result := Host;
+{$ENDIF}
+end;
+
+procedure TFilePreview.ShowVideoStill;
+{$IFDEF MSWINDOWS}
+var
+  Wnd: HWND;
+  WR: TRect;
+  Shot: TBitmap;
+  P: TPointF;
+{$ENDIF}
+begin
+  HideVideoStill;
+  if not FIsVideo then
+    Exit;
+{$IFDEF MSWINDOWS}
+  if not Assigned(FMpv) or not FMpv.HostWindow(Wnd) then
+    Exit;
+  Shot := CaptureWindowBitmap(Wnd);
+  if Shot = nil then
+    Exit;
+  try
     if FSaveStill = nil then
     begin
       FSaveStill := TImage.Create(Self);
@@ -11807,11 +12343,6 @@ begin
     FSaveStill.Visible := True;
   finally
     Shot.Free;
-    if Dib <> 0 then
-      DeleteObject(Dib);
-    if Mem <> 0 then
-      DeleteDC(Mem);
-    ReleaseDC(Wnd, DC);
   end;
 {$ENDIF}
 end;
@@ -12800,6 +13331,14 @@ end;
 
 procedure TFilePreview.StopMpv;
 begin
+  FVideoClickPending := False;
+  if Assigned(FMpv) then
+  begin
+    FMpv.OnVideoHit := nil;
+    FMpv.OnVideoKey := nil;
+  end;
+  if FVideoFull then
+    SetVideoFullscreen(False);
   FUsingMpv := False;
   if Assigned(FMpv) then
   try
@@ -12825,6 +13364,8 @@ begin
     Exit;
   if FMpv = nil then
     FMpv := TMpvSession.Create;
+  FMpv.OnVideoHit := VideoWindowHit;
+  FMpv.OnVideoKey := VideoWindowKey;
   FMpv.Attach(OwnerWnd);
   FUsingMpv := True;
   FIsVideo := AVideo;

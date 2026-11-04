@@ -26,6 +26,7 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     procedure KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: Char; Shift: TShiftState); override;
     procedure ShowFile(const APath: string);
     { Тот же Load, без Show, Activate и фокуса. Тот же путь не грузится снова. }
     procedure FollowFile(const APath: string);
@@ -81,9 +82,31 @@ begin
   ApplyNativeChrome;
 end;
 
+procedure TQuickViewForm.KeyUp(var Key: Word; var KeyChar: Char; Shift: TShiftState);
+begin
+  if (Key = vkSpace) or (KeyChar = ' ') then
+    TFilePreview.ResetMediaSpace;
+  inherited;
+end;
+
 procedure TQuickViewForm.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
 begin
+  if (Key = vkEscape) and not (ssAlt in Shift) and not (ssCtrl in Shift) and
+     TFilePreview.CloseVideoFullscreen then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
   inherited;
+  if ((Key = vkSpace) or (KeyChar = ' ')) and
+     not (ssAlt in Shift) and not (ssCtrl in Shift) and not (ssShift in Shift) and
+     Assigned(FPreview) and FPreview.TryMediaSpace then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
   if Key = 0 then
     Exit;
   if Assigned(FPreview) and FPreview.HandleFontKey(Key, Shift) then

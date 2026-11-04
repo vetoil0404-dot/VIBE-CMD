@@ -758,6 +758,7 @@ type
     function IsOffline: Boolean;
     function IsPreviewActive: Boolean;
     function PreviewHasFocus: Boolean;
+    function PreviewMediaSpace: Boolean;
     procedure ShowPreview(const APath: string);
     procedure HidePreview;
     procedure PreviewFile(const APath: string);
@@ -765,7 +766,7 @@ type
     procedure MoveHome(const AShift: TShiftState);
     procedure MoveEnd(const AShift: TShiftState);
     procedure MovePage(ADirection: Integer; const AShift: TShiftState);
-    procedure ToggleCurrentAndMove;
+    procedure ToggleCurrentAndMove(AMove: Boolean = True);
     function CardHost: TFmxObject;
     function FooterHost: TFmxObject;
     function FooterOffset: Single;
@@ -2086,6 +2087,11 @@ end;
 function TFilePanel.PreviewHasFocus: Boolean;
 begin
   Result := Assigned(FPreview) and FPreview.Visible and FPreview.HasKeyboardFocus;
+end;
+
+function TFilePanel.PreviewMediaSpace: Boolean;
+begin
+  Result := IsPreviewActive and FPreview.TryMediaSpace;
 end;
 
 procedure TFilePanel.SyncPreviewList;
@@ -11998,7 +12004,7 @@ begin
   MoveSelection(ADirection * VisibleRows, AShift);
 end;
 
-procedure TFilePanel.ToggleCurrentAndMove;
+procedure TFilePanel.ToggleCurrentAndMove(AMove: Boolean);
 var
   Idx: Integer;
   SelectedIndicesRef: TList<Integer>;
@@ -12027,11 +12033,12 @@ begin
   else
     SelectedIndicesRef.Add(Idx);
 
-  // Перемещаем фокус/курсор на один элемент вниз
-  if ViewMode = vmDetails then
-    MoveSelection(1, [])
-  else
-    MoveSelectionGrid(0, 1, []);
+  { Insert сдвигает курсор. Пробел оставляет его на том же файле. }
+  if AMove then
+    if ViewMode = vmDetails then
+      MoveSelection(1, [])
+    else
+      MoveSelectionGrid(0, 1, []);
 
   // Перерисовываем панель, чтобы сразу увидеть изменения
   Repaint;

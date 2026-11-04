@@ -616,6 +616,13 @@ begin
     EnterApply(nil);
     Exit;
   end;
+  if (Key = vkEscape) and not (ssAlt in Shift) and not (ssCtrl in Shift) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    CloseClick(nil);
+    Exit;
+  end;
   inherited;
 end;
 

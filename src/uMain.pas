@@ -349,6 +349,7 @@ type
     procedure DoShow; override;
     procedure DoClose(var CloseAction: TCloseAction); override;
     procedure KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: Char; Shift: TShiftState); override;
 
   public
     constructor Create(AOwner: TComponent); override;
@@ -369,7 +370,7 @@ uses
   Winapi.MultiMon,
   System.Win.Registry, System.IniFiles,
   FMX.Platform,
-  uFileOpProgressForm, uDriveBar;
+  uFileOpProgressForm, uDriveBar, uFilePreview;
 
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
@@ -4100,21 +4101,12 @@ begin
 end;
 
 procedure TMainForm.BuildSelMenu;
-  function Mark(AOn: Boolean): string;
-  begin
-    if AOn then
-      Result := #$2713
-    else
-      Result := '';
-  end;
 begin
   if FSelMenu = nil then
     Exit;
   FSelMenu.ClearItems;
-    FSelMenu.AddItem(L('set.sel.explorer'),
-    Mark(FSettings.MouseSelectMode = msmExplorer), OnSelModeExplorer);
-
-
+  FSelMenu.AddItem(L('set.sel.explorer'), '', OnSelModeExplorer, True,
+    FSettings.MouseSelectMode = msmExplorer);
   FSelMenu.AddItem(L('main.sel.compare'), '', OnSelCompare);
   FSelMenu.AddSeparator;
   FSelMenu.AddItem(L('main.sel.folders'), '', OnSelFolders);
@@ -4126,11 +4118,10 @@ begin
   FSelMenu.AddSeparator;
   FSelMenu.AddItem(L('main.sel.invert'), '*', OnSelInvert);
   FSelMenu.AddItem(L('main.sel.none'), 'Ctrl+-', OnSelNone);
-    FSelMenu.AddItem(L('main.sel.all'), 'Ctrl+A', OnSelAll);
+  FSelMenu.AddItem(L('main.sel.all'), 'Ctrl+A', OnSelAll);
   FSelMenu.AddSeparator;
-  FSelMenu.AddItem(L('set.sel.vibe'),
-    Mark(FSettings.MouseSelectMode <> msmExplorer), OnSelModeVibe);
-
+  FSelMenu.AddItem(L('set.sel.vibe'), '', OnSelModeVibe, True,
+    FSettings.MouseSelectMode <> msmExplorer);
 end;
 
 procedure TMainForm.SetMouseSelectMode(AExplorer: Boolean);
@@ -6496,6 +6487,13 @@ begin
     Panel.HistoryForward;
 end;
 
+procedure TMainForm.KeyUp(var Key: Word; var KeyChar: Char; Shift: TShiftState);
+begin
+  if (Key = vkSpace) or (KeyChar = ' ') then
+    TFilePreview.ResetMediaSpace;
+  inherited;
+end;
+
 procedure TMainForm.KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState);
 begin
   if Key = vkEscape then
@@ -6511,6 +6509,16 @@ begin
        (Assigned(FRightPanel) and FRightPanel.DriveHomeIsOpen) then
     begin
       CloseDriveHomes;
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    if not CmdLineFocused and
+       not (Assigned(FActivePanel) and
+         (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+       not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) and
+       TFilePreview.CloseVideoFullscreen then
+    begin
       Key := 0;
       KeyChar := #0;
       Exit;
@@ -6634,6 +6642,32 @@ begin
   end;
 
   inherited;
+
+  { Пробел в FMX приходит с Key = 0 и KeyChar = ' '. Дальше процедура его отбрасывает. }
+  if ((Key = vkSpace) or (KeyChar = ' ')) and
+     not (ssAlt in Shift) and not (ssCtrl in Shift) and not (ssShift in Shift) and
+     not CmdLineFocused and
+     not (Assigned(FActivePanel) and
+       (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+     not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) then
+  begin
+    if (Assigned(FActivePanel) and FActivePanel.PreviewMediaSpace) or
+       (Assigned(FLeftPanel) and (FLeftPanel <> FActivePanel) and FLeftPanel.PreviewMediaSpace) or
+       (Assigned(FRightPanel) and (FRightPanel <> FActivePanel) and FRightPanel.PreviewMediaSpace) then
+    begin
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+    if Assigned(FActivePanel) and not FActivePanel.IsPreviewActive and
+       not FActivePanel.IsPathEditing then
+    begin
+      FActivePanel.ToggleCurrentAndMove(False);
+      Key := 0;
+      KeyChar := #0;
+      Exit;
+    end;
+  end;
 
   if Key = 0 then
     Exit;
@@ -6797,6 +6831,13 @@ begin
       FActivePanel.AddTab;
     Key := 0;
   end
+  else if (Key = vkW) and (ssCtrl in Shift) and not (ssAlt in Shift) and
+     not (ssShift in Shift) then
+  begin
+    if Assigned(FActivePanel) and not FActivePanel.IsPathEditing then
+      FActivePanel.CloseCurrentTab;
+    Key := 0;
+  end
   else if Key = 442 then
   begin
     if FActivePanel = FLeftPanel then
@@ -6882,7 +6923,7 @@ begin
   end
   else if KeyChar = ' ' then
   begin
-    FActivePanel.ToggleCurrentAndMove;
+    FActivePanel.ToggleCurrentAndMove(False);
     Key := 0;
   end;
 end;

@@ -10,13 +10,16 @@ interface
 
 {$IFDEF MSWINDOWS}
 uses
-  Winapi.Windows;
+  System.SysUtils, Winapi.Windows;
 
 function MpvAvailable: Boolean;
 function MpvExportClip(const ASrc, ADst: string; AStart, AEnd: Double;
   AVideo: Boolean; out AError: string): Boolean;
 
 type
+  TMpvVideoHit = procedure(Sender: TObject; ADouble: Boolean) of object;
+  TMpvVideoKey = procedure(Sender: TObject; AKey: Word) of object;
+
   TMpvSession = class
   private
     FPlayer: IUnknown;
@@ -25,6 +28,7 @@ type
     FOwnWnd: Boolean;
     FShowVideo: Boolean;
     FWantVisible: Boolean;
+    FFullscreen: Boolean;
     FMci: Boolean;
     FCoInit: Boolean;
     FLastPos: Double;
@@ -33,6 +37,8 @@ type
     FPixW: Integer;
     FPixH: Integer;
     FLastBounds: TRect;
+    FOnVideoHit: TMpvVideoHit;
+    FOnVideoKey: TMpvVideoKey;
     function EnsureCom: Boolean;
     function AsPlayer(out P: IUnknown): Boolean;
     function Mci(const ACmd: string): Boolean;
@@ -44,6 +50,7 @@ type
     procedure ShutdownMf;
     procedure ApplyVisible;
     procedure SafeUpdateVideo(P: IUnknown; ASetAr: Boolean);
+    procedure PlaceFullscreen;
   public
     destructor Destroy; override;
     function Attach(AOwnerWnd: HWND): Boolean;
@@ -56,6 +63,8 @@ type
     function Duration: Double;
     function Position: Double;
     procedure Seek(ASeconds: Double);
+    procedure SetFullscreen(AOn: Boolean);
+    function Fullscreen: Boolean;
     procedure SetBoundsScreen(const ARect: TRect);
     procedure NotifyLayout;
     procedure Pump;
@@ -63,6 +72,11 @@ type
     function HasEngine: Boolean;
     function VideoPixelSize(out W, H: Integer): Boolean;
     function HostWindow(out AWnd: HWND): Boolean;
+    function GrabFrame(out AWidth, AHeight: Integer; out APixels: TBytes): Boolean;
+    procedure NotifyVideoHit(ADouble: Boolean);
+    procedure NotifyVideoKey(AKey: Word);
+    property OnVideoHit: TMpvVideoHit read FOnVideoHit write FOnVideoHit;
+    property OnVideoKey: TMpvVideoKey read FOnVideoKey write FOnVideoKey;
   end;
 {$ENDIF}
 
@@ -70,8 +84,8 @@ implementation
 
 {$IFDEF MSWINDOWS}
 uses
-  System.SysUtils, System.Classes, System.SyncObjs, System.IOUtils, System.Math,
-  Winapi.Messages, Winapi.ActiveX, uMetaCache;
+  System.Classes, System.SyncObjs, System.IOUtils, System.Math,
+  Winapi.Messages, Winapi.ActiveX, Winapi.MultiMon, uMetaCache;
 
 function mciSendStringW(Cmd, Ret: PWideChar; RetLen: UINT; Cb: HWND): UINT; stdcall;
   external 'winmm.dll' name 'mciSendStringW';
@@ -84,6 +98,8 @@ const
   MFP_OPTION_NONE = 0;
   MFVideoARMode_PreservePicture = 1;
   CLASS_NAME: PChar = 'VibeMediaHost3';
+  MR_VIDEO_RENDER_SERVICE: TGUID = '{1092A86C-AB1A-459A-A336-831FBC4D11FF}';
+  IID_IMFVideoDisplayControl: TGUID = '{A490B1E4-AB84-4D31-A1B2-181E03B1077A}';
 
 type
   { IID из mfplay.h: a714590a-58af-430a-85bf-44f5ec838d85.
@@ -128,6 +144,26 @@ type
     function RemoveEffect(pEffect: IUnknown): HResult; stdcall;
     function RemoveAllEffects: HResult; stdcall;
     function Shutdown: HResult; stdcall;
+  end;
+
+  IMFGetService = interface(IUnknown)
+    ['{FA993888-4383-415A-A930-DD472A8CF6F7}']
+    function GetService(const guidService, riid: TGUID; out ppvObject): HResult; stdcall;
+  end;
+
+  IMFVideoDisplayControl = interface(IUnknown)
+    ['{A490B1E4-AB84-4D31-A1B2-181E03B1077A}']
+    function GetNativeVideoSize(pszVideo, pszAR: Pointer): HResult; stdcall;
+    function GetIdealVideoSize(pszMin, pszMax: Pointer): HResult; stdcall;
+    function SetVideoPosition(pnrcSource, prcDest: Pointer): HResult; stdcall;
+    function GetVideoPosition(pnrcSource, prcDest: Pointer): HResult; stdcall;
+    function SetAspectRatioMode(dwMode: DWORD): HResult; stdcall;
+    function GetAspectRatioMode(pdwMode: Pointer): HResult; stdcall;
+    function SetVideoWindow(hwndVideo: HWND): HResult; stdcall;
+    function GetVideoWindow(phwndVideo: Pointer): HResult; stdcall;
+    function RepaintVideo: HResult; stdcall;
+    function GetCurrentImage(pBih: PBitmapInfoHeader; out ppDib: PByte;
+      out pcbDib: DWORD; pTimeStamp: PInt64): HResult; stdcall;
   end;
 
   TMFStartup = function(Version: ULONG; dwFlags: DWORD): HResult; stdcall;
@@ -184,10 +220,25 @@ begin
   Result := GMfOk;
 end;
 
+function SessionAt(Wnd: HWND): TMpvSession;
+var
+  P: NativeInt;
+begin
+  Result := nil;
+  if Wnd = 0 then
+    Exit;
+  P := GetWindowLongPtr(Wnd, GWLP_USERDATA);
+  if P <> 0 then
+    Result := TMpvSession(P);
+end;
+
 function OverlayWndProc(Wnd: HWND; Msg: UINT; WParam: WPARAM; LParam: LPARAM): LRESULT; stdcall;
 var
   PS: TPaintStruct;
+  Session: TMpvSession;
+  Key: Word;
 begin
+  Session := SessionAt(Wnd);
   case Msg of
     Winapi.Messages.WM_ERASEBKGND:
       Exit(1);
@@ -198,7 +249,45 @@ begin
         Exit(0);
       end;
     Winapi.Messages.WM_NCHITTEST:
-      Exit(HTTRANSPARENT);
+      if (Session <> nil) and Session.Fullscreen then
+        Exit(HTCLIENT)
+      else
+        Exit(HTTRANSPARENT);
+    Winapi.Messages.WM_GETDLGCODE:
+      if (Session <> nil) and Session.Fullscreen then
+        Exit(DLGC_WANTALLKEYS or DLGC_WANTARROWS or DLGC_WANTCHARS);
+    Winapi.Messages.WM_KEYDOWN, Winapi.Messages.WM_SYSKEYDOWN:
+      if (Session <> nil) and Session.Fullscreen then
+      begin
+        Key := Word(WParam);
+        { Повтор пробела и Esc не должен дёргать паузу несколько раз. }
+        if ((LParam and $40000000) <> 0) and
+           ((Key = VK_SPACE) or (Key = VK_ESCAPE)) then
+          Exit(0);
+        case Key of
+          VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SPACE:
+            Session.NotifyVideoKey(Key);
+          VK_UP, VK_DOWN:
+            ;
+        else
+          Exit(DefWindowProc(Wnd, Msg, WParam, LParam));
+        end;
+        Exit(0);
+      end;
+    Winapi.Messages.WM_LBUTTONDBLCLK:
+      if (Session <> nil) and Session.Fullscreen then
+      begin
+        SetFocus(Wnd);
+        Session.NotifyVideoHit(True);
+        Exit(0);
+      end;
+    Winapi.Messages.WM_LBUTTONDOWN:
+      if (Session <> nil) and Session.Fullscreen then
+      begin
+        SetFocus(Wnd);
+        Session.NotifyVideoHit(False);
+        Exit(0);
+      end;
   end;
   Result := DefWindowProc(Wnd, Msg, WParam, LParam);
 end;
@@ -210,7 +299,7 @@ begin
   if GClassAtom <> 0 then
     Exit;
   FillChar(WC, SizeOf(WC), 0);
-  WC.style := CS_HREDRAW or CS_VREDRAW;
+  WC.style := CS_HREDRAW or CS_VREDRAW or CS_DBLCLKS;
   WC.lpfnWndProc := @OverlayWndProc;
   WC.hInstance := HInstance;
   WC.hCursor := LoadCursor(0, IDC_ARROW);
@@ -303,6 +392,7 @@ begin
     Exit;
   end;
   FOwnWnd := True;
+  SetWindowLongPtr(FWnd, GWLP_USERDATA, NativeInt(Self));
   ShowWindow(FWnd, SW_HIDE);
   Result := True;
 end;
@@ -472,8 +562,13 @@ begin
     ShutdownMf;
   except
   end;
+  if FFullscreen then
+    SetFullscreen(False);
   if FOwnWnd and (FWnd <> 0) and IsWindow(FWnd) then
+  begin
+    SetWindowLongPtr(FWnd, GWLP_USERDATA, 0);
     DestroyWindow(FWnd);
+  end;
   FWnd := 0;
   if FCoInit then
   try
@@ -560,6 +655,8 @@ end;
 
 procedure TMpvSession.Stop;
 begin
+  if FFullscreen then
+    SetFullscreen(False);
   FWantVisible := False;
   try
     ShutdownMci;
@@ -763,6 +860,101 @@ begin
   end;
 end;
 
+procedure TMpvSession.NotifyVideoHit(ADouble: Boolean);
+begin
+  if Assigned(FOnVideoHit) then
+    FOnVideoHit(Self, ADouble);
+end;
+
+procedure TMpvSession.NotifyVideoKey(AKey: Word);
+begin
+  if Assigned(FOnVideoKey) then
+    FOnVideoKey(Self, AKey);
+end;
+
+function TMpvSession.Fullscreen: Boolean;
+begin
+  Result := FFullscreen;
+end;
+
+procedure TMpvSession.PlaceFullscreen;
+var
+  Mon: HMONITOR;
+  Info: TMonitorInfo;
+  R: TRect;
+  Same: Boolean;
+  P: IUnknown;
+begin
+  if (FWnd = 0) or not IsWindow(FWnd) then
+    Exit;
+  Info.cbSize := SizeOf(Info);
+  Mon := MonitorFromWindow(FOwner, MONITOR_DEFAULTTONEAREST);
+  if (Mon = 0) or not GetMonitorInfo(Mon, @Info) then
+    Exit;
+  R := Info.rcMonitor;
+  Same := (FLastBounds.Left = R.Left) and (FLastBounds.Top = R.Top) and
+    (FLastBounds.Right = R.Right) and (FLastBounds.Bottom = R.Bottom);
+  if not Same then
+  try
+    SetWindowPos(FWnd, HWND_TOPMOST, R.Left, R.Top, R.Right - R.Left,
+      R.Bottom - R.Top, SWP_SHOWWINDOW or SWP_NOACTIVATE);
+    FLastBounds := R;
+  except
+  end;
+  if FWantVisible then
+    ShowWindow(FWnd, SW_SHOWNOACTIVATE);
+  if not Same then
+    if AsPlayer(P) then
+      SafeUpdateVideo(P, False);
+end;
+
+procedure TMpvSession.SetFullscreen(AOn: Boolean);
+var
+  Style, Ex: NativeInt;
+begin
+  if AOn = FFullscreen then
+  begin
+    if AOn then
+    begin
+      PlaceFullscreen;
+      SetFocus(FWnd);
+    end;
+    Exit;
+  end;
+  if (FWnd = 0) or not IsWindow(FWnd) or (FOwner = 0) then
+    Exit;
+  if AOn then
+  begin
+    Style := GetWindowLongPtr(FWnd, GWL_STYLE);
+    SetWindowLongPtr(FWnd, GWL_STYLE, (Style and not WS_CHILD) or WS_POPUP or WS_VISIBLE);
+    Ex := GetWindowLongPtr(FWnd, GWL_EXSTYLE);
+    SetWindowLongPtr(FWnd, GWL_EXSTYLE, Ex and not WS_EX_NOACTIVATE);
+    SetParent(FWnd, 0);
+    SetWindowLongPtr(FWnd, GWLP_HWNDPARENT, NativeInt(FOwner));
+    FFullscreen := True;
+    FillChar(FLastBounds, SizeOf(FLastBounds), 0);
+    PlaceFullscreen;
+    SetWindowPos(FWnd, HWND_TOPMOST, 0, 0, 0, 0,
+      SWP_NOMOVE or SWP_NOSIZE or SWP_FRAMECHANGED or SWP_SHOWWINDOW);
+    SetFocus(FWnd);
+  end
+  else
+  begin
+    FFullscreen := False;
+    Style := GetWindowLongPtr(FWnd, GWL_STYLE);
+    SetWindowLongPtr(FWnd, GWL_STYLE,
+      (Style and not WS_POPUP) or WS_CHILD or WS_CLIPCHILDREN or WS_CLIPSIBLINGS);
+    Ex := GetWindowLongPtr(FWnd, GWL_EXSTYLE);
+    SetWindowLongPtr(FWnd, GWL_EXSTYLE, Ex or WS_EX_NOACTIVATE);
+    SetParent(FWnd, FOwner);
+    SetWindowPos(FWnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+      SWP_NOMOVE or SWP_NOSIZE or SWP_NOACTIVATE or SWP_FRAMECHANGED);
+    FillChar(FLastBounds, SizeOf(FLastBounds), 0);
+    if IsWindow(FOwner) then
+      SetForegroundWindow(FOwner);
+  end;
+end;
+
 procedure TMpvSession.SetBoundsScreen(const ARect: TRect);
 var
   P: IUnknown;
@@ -773,6 +965,11 @@ var
   Vid, AR: TSize;
   VW, VH, AW, AH, FW, FH: Integer;
 begin
+  if FFullscreen then
+  begin
+    PlaceFullscreen;
+    Exit;
+  end;
   if (FWnd = 0) or not IsWindow(FWnd) or (FOwner = 0) then
     Exit;
   if (not FShowVideo) or (ARect.Width < 8) or (ARect.Height < 8) then
@@ -901,6 +1098,95 @@ function TMpvSession.HostWindow(out AWnd: HWND): Boolean;
 begin
   AWnd := FWnd;
   Result := FShowVideo and (FWnd <> 0) and IsWindow(FWnd) and IsWindowVisible(FWnd);
+end;
+
+function TMpvSession.GrabFrame(out AWidth, AHeight: Integer;
+  out APixels: TBytes): Boolean;
+var
+  P: IUnknown;
+  Svc: IMFGetService;
+  Disp: IMFVideoDisplayControl;
+  Raw: Pointer;
+  Bih: TBitmapInfoHeader;
+  Dib: PByte;
+  Cb: DWORD;
+  Ts: Int64;
+  W, H, Y, X, SrcY, Bpp, Stride, Need: Integer;
+  TopDown: Boolean;
+  Src, Dst: PByte;
+begin
+  Result := False;
+  AWidth := 0;
+  AHeight := 0;
+  SetLength(APixels, 0);
+  if not FShowVideo or not AsPlayer(P) then
+    Exit;
+  SafeUpdateVideo(P, False);
+  if not Supports(P, IMFGetService, Svc) then
+    Exit;
+  Raw := nil;
+  Disp := nil;
+  Dib := nil;
+  try
+    if Failed(Svc.GetService(MR_VIDEO_RENDER_SERVICE, IID_IMFVideoDisplayControl, Raw)) or
+       (Raw = nil) then
+      Exit;
+    Pointer(Disp) := Raw;
+    Raw := nil;
+    FillChar(Bih, SizeOf(Bih), 0);
+    Bih.biSize := SizeOf(Bih);
+    Ts := 0;
+    if Failed(Disp.GetCurrentImage(@Bih, Dib, Cb, @Ts)) or (Dib = nil) then
+      Exit;
+    if (Bih.biCompression <> BI_RGB) and (Bih.biCompression <> BI_BITFIELDS) then
+      Exit;
+    if (Bih.biBitCount <> 24) and (Bih.biBitCount <> 32) then
+      Exit;
+    W := Bih.biWidth;
+    TopDown := Bih.biHeight < 0;
+    H := Abs(Bih.biHeight);
+    if (W < 8) or (H < 8) or (W > 7680) or (H > 4320) then
+      Exit;
+    Bpp := Bih.biBitCount div 8;
+    Stride := ((W * Bih.biBitCount + 31) div 32) * 4;
+    Need := Stride * H;
+    if (Need <= 0) or ((Cb > 0) and (Cb < DWORD(Need))) then
+      Exit;
+    SetLength(APixels, W * H * 4);
+    for Y := 0 to H - 1 do
+    begin
+      if TopDown then
+        SrcY := Y
+      else
+        SrcY := H - 1 - Y;
+      Src := Dib;
+      Inc(Src, SrcY * Stride);
+      Dst := @APixels[Y * W * 4];
+      if Bpp = 4 then
+      begin
+        System.Move(Src^, Dst^, W * 4);
+        for X := 0 to W - 1 do
+          Dst[X * 4 + 3] := 255;
+      end
+      else
+        for X := 0 to W - 1 do
+        begin
+          Dst[0] := Src[0];
+          Dst[1] := Src[1];
+          Dst[2] := Src[2];
+          Dst[3] := 255;
+          Inc(Src, 3);
+          Inc(Dst, 4);
+        end;
+    end;
+    AWidth := W;
+    AHeight := H;
+    Result := True;
+  finally
+    if Dib <> nil then
+      CoTaskMemFree(Dib);
+    Disp := nil;
+  end;
 end;
 
 function MpvExportClip(const ASrc, ADst: string; AStart, AEnd: Double;
