@@ -35,9 +35,9 @@ type
     FBody: TLayout;
     FNav: TRectangle;
     FNavStack: TLayout;
-    FNavBtns: array[0..3] of TFluentButton;
+    FNavBtns: array[0..4] of TFluentButton;
     FContent: TRectangle;
-    FPages: array[0..3] of TVertScrollBox;
+    FPages: array[0..4] of TVertScrollBox;
     FFooter: TLayout;
     FBtnClose: TFluentButton;
 
@@ -56,14 +56,18 @@ type
     FOpacityDrag: Boolean;
     FOpacitySync: Boolean;
     FCbDock, FCbMid, FCbDrives, FCbDriveHome, FCbFn, FCbQuick, FCbCmd: TFluentCheckRow;
-    FCbFollow: TFluentCheckRow;
+    FCbFollow, FCbPreviewFill: TFluentCheckRow;
     FCbSelExplorer, FCbSelVibe: TFluentCheckRow;
     FCbHidden, FCbFolderSize, FCbNetwork: TFluentCheckRow;
     FCbAutoStart, FCbSingleInstance: TFluentCheckRow;
+    FEdUpdRepo, FEdUpdMask: TFluentEdit;
+    FUpdRepoLbl, FUpdMaskLbl: TText;
+    FUpdHost: TLayout;
+    FCbUpdAuto, FCbUpdStable, FCbUpdTest: TFluentCheckRow;
+    FBtnUpdCheck: TFluentButton;
     FCbOpQuiet, FCbOpExplorer, FCbOpVibe: TFluentCheckRow;
     FCbTabIcons, FCbEqualTabs: TFluentCheckRow;
     FCbDockLeft, FCbDockCenter, FCbDockFree, FCbDockSeps: TFluentCheckRow;
-    FFontSizeEdit: TFluentEdit;
     FLangCard: TRectangle;
     FLangRows: TList<TFluentCheckRow>;
     FOnLanguageChanged: TProc;
@@ -115,6 +119,9 @@ type
     procedure DockAlignClick(Sender: TObject);
     procedure FileOpModeClick(Sender: TObject);
     procedure MouseModeClick(Sender: TObject);
+    procedure UpdateChannelClick(Sender: TObject);
+    procedure UpdateCheckClick(Sender: TObject);
+    procedure LockUpdateOrder;
     procedure LangClick(Sender: TObject);
     procedure CloseClick(Sender: TObject);
     procedure SaveTimerTick(Sender: TObject);
@@ -141,6 +148,9 @@ type
   end;
 
 implementation
+
+uses
+  uUpdate;
 
 constructor TSettingsForm.Create(AOwner: TComponent; ASettings: TAppSettings;
   AOnThemeChanged: TThemeChangedProc);
@@ -918,9 +928,10 @@ end;
 
 procedure TSettingsForm.BuildNav;
 const
-  Keys: array[0..3] of string = (
-    'set.nav.general', 'set.nav.view', 'set.nav.ops', 'set.nav.lang');
-  Icons: array[0..3] of string = ('', '', #$E8C8, #$E774);
+  Keys: array[0..4] of string = (
+    'set.nav.general', 'set.nav.view', 'set.nav.ops', 'set.nav.lang',
+    'set.nav.update');
+  Icons: array[0..4] of string = ('', '', #$E8C8, #$E774, #$E895);
 var
   I: Integer;
 begin
@@ -938,9 +949,9 @@ begin
   FNavStack := TLayout.Create(Self);
   FNavStack.Parent := FNav;
   FNavStack.Align := TAlignLayout.Top;
-  FNavStack.Height := 4 * 44;
+  FNavStack.Height := Length(Keys) * 44;
 
-  for I := 0 to 3 do
+  for I := 0 to High(Keys) do
   begin
     FNavBtns[I] := CreateFluentButton(Self, FNavStack, Icons[I], L(Keys[I]),
       fbkSubtle, 212, NavClick);
@@ -955,7 +966,22 @@ end;
 procedure TSettingsForm.BuildPages;
 var
   Card, Row: TRectangle;
-  Hint: TText;
+
+  function AddSub(AParent: TFmxObject; const AKey: string): TText;
+  begin
+    Result := TText.Create(Self);
+    Result.Parent := AParent;
+    Result.Align := TAlignLayout.Top;
+    Result.Height := 18;
+    Result.Margins.Top := 4;
+    Result.HitTest := False;
+    Result.Tag := 8;
+    ApplyFluentText(Result, 12, False);
+    Result.TextSettings.HorzAlign := TTextAlign.Leading;
+    if AKey <> '' then
+      TrText(Result, AKey);
+  end;
+
 begin
   FContent := TRectangle.Create(Self);
   FContent.Parent := FBody;
@@ -969,6 +995,7 @@ begin
   FPages[1] := AddPage;
   FPages[2] := AddPage;
   FPages[3] := AddPage;
+  FPages[4] := AddPage;
 
   { Список в карточке идёт снизу вверх: последний пункт оказывается сверху. }
   Card := AddCard(FPages[0], 'set.card.ui');
@@ -1011,7 +1038,10 @@ begin
     FSettings.MouseSelectMode = msmExplorer, MouseModeClick);
 
   Card := AddCard(FPages[0], 'set.card.view');
-  Card.Height := 22 + 36 + 16;
+  Card.Height := 22 + 2 * 36 + 16;
+  { Снизу вверх: последняя галка оказывается под заголовком. }
+  FCbPreviewFill := AddCheck(Card, 'set.view.fill',
+    FSettings.PreviewFill, OptionChanged);
   FCbFollow := AddCheck(Card, 'set.view.follow',
     FSettings.FollowCursor, OptionChanged);
 
@@ -1051,23 +1081,6 @@ begin
     FCardMatMica := nil;
   end;
 
-  Card := AddCard(FPages[1], 'set.card.font');
-  Card.Height := 22 + 40 + 16;
-  Hint := TText.Create(Self);
-  Hint.Parent := Card;
-  Hint.Align := TAlignLayout.Top;
-  Hint.Height := 20;
-  Hint.HitTest := False;
-  Hint.Tag := 8;
-  ApplyFluentText(Hint, 12, False);
-  TrText(Hint, 'set.font.size');
-  FFontSizeEdit := CreateFluentEdit(Self, Card);
-  FFontSizeEdit.Align := TAlignLayout.Top;
-  FFontSizeEdit.Height := 32;
-  FFontSizeEdit.FillMode := fefSubtle;
-  FFontSizeEdit.Text := IntToStr(FSettings.ListFontSize);
-  FFontSizeEdit.OnChange := OptionChanged;
-
   Card := AddCard(FPages[2], 'set.card.ops');
   Card.Height := 22 + 3 * 36 + 16;
   FCbOpVibe := AddCheck(Card, 'set.ops.vibe', FSettings.FileOpMode = fomVibe, FileOpModeClick);
@@ -1077,6 +1090,44 @@ begin
   FLangCard := AddCard(FPages[3], 'lang.title');
   FLangRows := TList<TFluentCheckRow>.Create;
   RebuildLangPage;
+
+  Card := AddCard(FPages[4], 'set.card.update');
+  Card.Height := 320;
+  Card.BeginUpdate;
+  try
+    FUpdRepoLbl := AddSub(Card, 'set.upd.repo');
+    FEdUpdRepo := CreateFluentEdit(Self, Card);
+    FEdUpdRepo.Align := TAlignLayout.Top;
+    FEdUpdRepo.Height := 32;
+    FEdUpdRepo.Margins.Rect := TRectF.Create(0, 0, 0, 6);
+    FEdUpdRepo.FillMode := fefSubtle;
+    FEdUpdRepo.Text := FSettings.UpdateRepo;
+    FEdUpdRepo.OnChange := OptionChanged;
+    FUpdMaskLbl := AddSub(Card, 'set.upd.mask');
+    FEdUpdMask := CreateFluentEdit(Self, Card);
+    FEdUpdMask.Align := TAlignLayout.Top;
+    FEdUpdMask.Height := 32;
+    FEdUpdMask.Margins.Rect := TRectF.Create(0, 0, 0, 6);
+    FEdUpdMask.FillMode := fefSubtle;
+    FEdUpdMask.Text := FSettings.UpdateMask;
+    FEdUpdMask.OnChange := OptionChanged;
+    FCbUpdAuto := AddCheck(Card, 'set.upd.auto', FSettings.UpdateAuto, OptionChanged);
+    FCbUpdStable := AddCheck(Card, 'set.upd.stable', not FSettings.UpdatePrerelease,
+      UpdateChannelClick);
+    FCbUpdTest := AddCheck(Card, 'set.upd.test', FSettings.UpdatePrerelease,
+      UpdateChannelClick);
+    FUpdHost := TLayout.Create(Self);
+    FUpdHost.Parent := Card;
+    FUpdHost.Align := TAlignLayout.Top;
+    FUpdHost.Height := 40;
+    FUpdHost.Margins.Rect := TRectF.Create(0, 8, 0, 0);
+    FBtnUpdCheck := CreateFluentButton(Self, FUpdHost, '', L('set.upd.check'),
+      fbkAccent, 240, UpdateCheckClick);
+    TrButton(FBtnUpdCheck, 'set.upd.check');
+  finally
+    LockUpdateOrder;
+    Card.EndUpdate;
+  end;
 end;
 
 procedure TSettingsForm.BuildUI;
@@ -1124,6 +1175,8 @@ begin
     FPages[I].Visible := I = AIndex;
     FNavBtns[I].SetSelected(I = AIndex);
   end;
+  if AIndex = 4 then
+    LockUpdateOrder;
 end;
 
 function TSettingsForm.ThemeOfCard(ACard: TRectangle): TAppTheme;
@@ -1251,8 +1304,6 @@ begin
 end;
 
 procedure TSettingsForm.CollectFromUI;
-var
-  N: Integer;
 begin
   FSettings.ShowDock := FCbDock.Checked;
   FSettings.ShowMidBar := FCbMid.Checked;
@@ -1262,6 +1313,7 @@ begin
   FSettings.ShowQuickAccess := FCbQuick.Checked;
   FSettings.ShowCommandLine := FCbCmd.Checked;
   FSettings.FollowCursor := FCbFollow.Checked;
+  FSettings.PreviewFill := FCbPreviewFill.Checked;
   if FCbSelExplorer.Checked then
     FSettings.MouseSelectMode := msmExplorer
   else
@@ -1271,6 +1323,14 @@ begin
   FSettings.ShowFolderSizes := FCbFolderSize.Checked;
   FSettings.AutoStart := FCbAutoStart.Checked;
   FSettings.SingleInstance := FCbSingleInstance.Checked;
+  if Assigned(FEdUpdRepo) then
+    FSettings.UpdateRepo := Trim(FEdUpdRepo.Text);
+  if Assigned(FEdUpdMask) then
+    FSettings.UpdateMask := Trim(FEdUpdMask.Text);
+  if Assigned(FCbUpdAuto) then
+    FSettings.UpdateAuto := FCbUpdAuto.Checked;
+  if Assigned(FCbUpdTest) then
+    FSettings.UpdatePrerelease := FCbUpdTest.Checked;
   FSettings.ShowTabIcons := FCbTabIcons.Checked;
   FSettings.EqualTabWidth := FCbEqualTabs.Checked;
   FSettings.DockShowSeparators := FCbDockSeps.Checked;
@@ -1286,8 +1346,70 @@ begin
     FSettings.FileOpMode := fomExplorer
   else
     FSettings.FileOpMode := fomVibe;
-  N := StrToIntDef(Trim(FFontSizeEdit.Text), FSettings.ListFontSize);
-  FSettings.ListFontSize := EnsureRange(N, 10, 22);
+end;
+
+procedure TSettingsForm.LockUpdateOrder;
+var
+  I: Integer;
+  Card: TRectangle;
+begin
+  if not Assigned(FEdUpdRepo) or not (FEdUpdRepo.Parent is TRectangle) then
+    Exit;
+  Card := TRectangle(FEdUpdRepo.Parent);
+  { Align=Top сортирует по текущему Top. Пока страница скрыта ширина нулевая,
+    раскладка не идёт, и все Top остаются 0. Меньший Top оказывается выше. }
+  Card.BeginUpdate;
+  try
+    for I := 0 to Card.ControlsCount - 1 do
+      if (Card.Controls[I] is TText) and (TText(Card.Controls[I]).Tag = 7) then
+        TText(Card.Controls[I]).Position.Y := 0;
+    if Assigned(FUpdRepoLbl) then
+      FUpdRepoLbl.Position.Y := 10;
+    FEdUpdRepo.Position.Y := 20;
+    if Assigned(FUpdMaskLbl) then
+      FUpdMaskLbl.Position.Y := 30;
+    if Assigned(FEdUpdMask) then
+      FEdUpdMask.Position.Y := 40;
+    if Assigned(FCbUpdAuto) then
+      FCbUpdAuto.Position.Y := 50;
+    if Assigned(FCbUpdStable) then
+      FCbUpdStable.Position.Y := 60;
+    if Assigned(FCbUpdTest) then
+      FCbUpdTest.Position.Y := 70;
+    if Assigned(FUpdHost) then
+      FUpdHost.Position.Y := 80;
+  finally
+    Card.EndUpdate;
+  end;
+end;
+
+procedure TSettingsForm.UpdateChannelClick(Sender: TObject);
+begin
+  if Sender = FCbUpdTest then
+  begin
+    FCbUpdTest.Checked := True;
+    FCbUpdStable.Checked := False;
+  end
+  else
+  begin
+    FCbUpdStable.Checked := True;
+    FCbUpdTest.Checked := False;
+  end;
+  OptionChanged(Sender);
+end;
+
+procedure TSettingsForm.UpdateCheckClick(Sender: TObject);
+var
+  Host: TCommonCustomForm;
+begin
+  if not Assigned(FSettings) then
+    Exit;
+  CollectFromUI;
+  FSettings.SaveAsync;
+  Host := nil;
+  if Owner is TCommonCustomForm then
+    Host := TCommonCustomForm(Owner);
+  CheckUpdatesNow(Host, FSettings);
 end;
 
 procedure TSettingsForm.MouseModeClick(Sender: TObject);
@@ -1465,6 +1587,7 @@ type
     DockAlign: TDockAlign;
     ShowDriveBar, ShowDriveHome, ShowQuickAccess, ShowNetworkButton: Boolean;
     ShowTabIcons, EqualTabWidth, ShowHiddenFiles, ShowFolderSizes: Boolean;
+    PreviewFill: Boolean;
     MouseSelectMode: TMouseSelectMode;
     ListFontSize: Integer;
     AutoStart, SingleInstance: Boolean;
@@ -1487,6 +1610,7 @@ type
     Result.EqualTabWidth := FSettings.EqualTabWidth;
     Result.ShowHiddenFiles := FSettings.ShowHiddenFiles;
     Result.ShowFolderSizes := FSettings.ShowFolderSizes;
+    Result.PreviewFill := FSettings.PreviewFill;
     Result.MouseSelectMode := FSettings.MouseSelectMode;
     Result.ListFontSize := FSettings.ListFontSize;
     Result.AutoStart := FSettings.AutoStart;
@@ -1509,6 +1633,7 @@ type
        (A.ShowTabIcons <> B.ShowTabIcons) or (A.EqualTabWidth <> B.EqualTabWidth) or
        (A.ShowHiddenFiles <> B.ShowHiddenFiles) or
        (A.ShowFolderSizes <> B.ShowFolderSizes) or
+       (A.PreviewFill <> B.PreviewFill) or
        (A.MouseSelectMode <> B.MouseSelectMode) or
        (A.ListFontSize <> B.ListFontSize) then
       Include(Result, saPanels);
@@ -1567,7 +1692,7 @@ var
   I: Integer;
   procedure PaintCard(ACard: TRectangle);
   var
-    J: Integer;
+    J, K: Integer;
     C: TFmxObject;
   begin
     if ACard = nil then
@@ -1582,7 +1707,15 @@ var
       else if (C is TText) and (TText(C).Tag = 8) then
         TText(C).TextSettings.FontColor := AColors.SubTextColor
       else if C is TFluentCheckRow then
-        TFluentCheckRow(C).ApplyTheme(AColors);
+        TFluentCheckRow(C).ApplyTheme(AColors)
+      else if C is TFluentEdit then
+        TFluentEdit(C).ApplyTheme(AColors)
+      else if C is TFluentButton then
+        TFluentButton(C).ApplyTheme(AColors)
+      else if C is TLayout then
+        for K := 0 to TLayout(C).ControlsCount - 1 do
+          if TLayout(C).Controls[K] is TFluentButton then
+            TFluentButton(TLayout(C).Controls[K]).ApplyTheme(AColors);
     end;
   end;
 begin
@@ -1597,8 +1730,6 @@ begin
   FBtnClose.ApplyTheme(AColors);
   for I := 0 to High(FNavBtns) do
     FNavBtns[I].ApplyTheme(AColors);
-  if Assigned(FFontSizeEdit) then
-    FFontSizeEdit.ApplyTheme(AColors);
 
   for var P := 0 to High(FPages) do
     if Assigned(FPages[P]) then

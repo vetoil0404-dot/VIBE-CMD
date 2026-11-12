@@ -374,6 +374,9 @@ type
     FMeshBytes: Int64;
     FMeshPicW: Integer;
     FMeshPicH: Integer;
+    FMeshObjects: Integer;
+    FMeshTooBig: Boolean;
+    FMeshUnit: string;
     FMeshKind: Integer;
     FMeshPath: string;
     FMeshExt: string;
@@ -402,6 +405,7 @@ type
     procedure ScheduleMeshFrame;
     procedure ApplyMeshFrame(ABmp: TBitmap; AErr: Integer; APicture, ASimple: Boolean;
       AKind: Integer; AVerts, ATris, APoints, ABytes: Int64; APicW, APicH: Integer;
+      AObjects: Integer; const AUnit: string; ATooBig: Boolean;
       AGen, ALoadGen: Integer);
     procedure ApplyMeshChrome;
     procedure FinishOrdinary(const ALocal, AExt: string);
@@ -769,7 +773,7 @@ uses
   System.Zip, uThumbCache, uIconCache, System.Variants, uVecPreview, uDxfPreview,
   uHdrPreview,
   FMX.Platform,
-  FMX.Skia.Canvas, uQuickViewForm
+  FMX.Skia.Canvas, uQuickViewForm, uDeps
   {$IFDEF MSWINDOWS}, Winapi.ShLwApi, SHDocVw, Winapi.EdgeUtils{$ENDIF};
 
 function LBreak(const AKey: string): string;
@@ -1794,10 +1798,10 @@ begin
       Exit;
     FMeshAz := FMeshAz - (X - FMeshDragX) * 0.4;
     FMeshEl := FMeshEl + (Y - FMeshDragY) * 0.4;
-    if FMeshEl > 89 then
-      FMeshEl := 89
-    else if FMeshEl < -89 then
-      FMeshEl := -89;
+    if FMeshEl > 90 then
+      FMeshEl := 90
+    else if FMeshEl < -90 then
+      FMeshEl := -90;
     FMeshDragX := X;
     FMeshDragY := Y;
     ScheduleMeshFrame;
@@ -2279,6 +2283,9 @@ begin
   FMeshDrag := False;
   FMeshPending := False;
   FMeshPicture := False;
+  FMeshTooBig := False;
+  FMeshUnit := '';
+  FMeshObjects := 0;
   Inc(FMeshGen);
   if Assigned(FMeshHint) then
     FMeshHint.Visible := False;
@@ -2434,7 +2441,7 @@ begin
   if ExtIn(AExt, ['.docx', '.docm', '.dotx', '.dotm', '.odt', '.rtf', '.doc',
     '.ppt', '.vsd', '.vsdx']) then
     Exit(PK_DOC);
-  if ExtIn(LowerCase(AExt), ['.stl', '.obj', '.ply', '.gltf', '.glb', '.blend']) then
+  if ExtIn(LowerCase(AExt), ['.stl', '.obj', '.ply', '.gltf', '.glb', '.blend', '.3mf']) then
     Exit(PK_MESH);
 
   Result := PK_OTHER;
@@ -9038,7 +9045,7 @@ end;
 
 procedure TFilePreview.CommitMediaSave;
 var
-  Path, Src: string;
+  Path, Src, Err: string;
   Kind, Ix, Q, Crf, Bitrate, Gen: Integer;
   A0, B0, Dur0, At: Double;
   CopyOnly, Full: Boolean;
@@ -9101,6 +9108,16 @@ begin
   if B0 <= A0 then
     B0 := A0 + 0.2;
   CopyOnly := (Kind = 0) and (Ix <= 0);
+  {$IFDEF MSWINDOWS}
+  if not ((Kind = 0) and CopyOnly and Full and
+      SameText(ExtractFileExt(Src), ExtractFileExt(Path))) then
+    if not EnsureFfmpeg(Err) then
+    begin
+      if Err <> '' then
+        ShowInfo(Err);
+      Exit;
+    end;
+  {$ENDIF}
   CloseSaveCard;
   FExporting := True;
   if Assigned(FBtnSaveClip) then
@@ -11190,9 +11207,20 @@ begin
 end;
 
 procedure TFilePreview.ImgResetClick(Sender: TObject);
+var
+  Pending: Boolean;
 begin
   if not FEditing or FImgBuilding then
     Exit;
+  { Пока есть правки, кадрирование или размер — Сброс их снимает.
+    Повторное нажатие на уже чистой картинке закрывает режим. }
+  Pending := (Length(FImgOps) > 0) or FCropping or
+    (Assigned(FSizeStrip) and FSizeStrip.Visible);
+  if not Pending then
+  begin
+    LeaveEdit(True);
+    Exit;
+  end;
   SetLength(FImgOps, 0);
   FImgDirty := False;
   FEditWarnOn := False;
@@ -13569,13 +13597,34 @@ begin
 end;
 
 procedure TFilePreview.MeshRenderSize(out AW, AH: Integer);
-begin
-  AW := 640;
-  AH := 480;
-  if Assigned(FImgHost) and (FImgHost.Width >= 32) and (FImgHost.Height >= 32) then
+var
+  Src: TControl;
+
+  function LaidOut(ACtrl: TControl): Boolean;
   begin
-    AW := Round(FImgHost.Width);
-    AH := Round(FImgHost.Height);
+    { Скрытый Align=Client не раскладывается и остаётся 50×50 по умолчанию.
+      Такой размер — мыльная превьюха на всё окно. }
+    Result := Assigned(ACtrl) and not ACtrl.Size.PlatformDefault and
+      (ACtrl.Width >= 32) and (ACtrl.Height >= 32);
+  end;
+
+begin
+  Src := nil;
+  if Assigned(FImgHost) and FImgHost.Visible and LaidOut(FImgHost) then
+    Src := FImgHost
+  else if LaidOut(FBody) then
+    Src := FBody
+  else if LaidOut(FImgHost) then
+    Src := FImgHost;
+  if Src <> nil then
+  begin
+    AW := Round(Src.Width);
+    AH := Round(Src.Height);
+  end
+  else
+  begin
+    AW := 640;
+    AH := 480;
   end;
   if AW < 32 then
     AW := 32;
@@ -13607,14 +13656,31 @@ end;
 
 procedure TFilePreview.ApplyMeshChrome;
 var
-  Count, Line, Name: string;
+  Count, Line, Name, UnitName: string;
 begin
   Name := MeshKindName(TMeshKind(FMeshKind));
   if Name = '' then
     Name := UpperCase(Copy(FMeshExt, 2, 8));
   FKindKey := '';
   SetKindRaw(Name);
-  if FMeshPicture then
+  if FMeshTooBig then
+    Line := L('qv.mesh.big')
+  else if TMeshKind(FMeshKind) = mk3mf then
+  begin
+    UnitName := FMeshUnit;
+    if UnitName = '' then
+      UnitName := 'millimeter';
+    if FMeshPoints > 0 then
+      Count := Lf('qv.mesh.pts', [IntToStr(FMeshPoints)])
+    else
+      Count := Lf('qv.mesh.tris', [IntToStr(FMeshTris)]);
+    if FMeshSimple then
+      Count := Count + ' ~';
+    Line := UnitName + ' · ' + Lf('qv.mesh.objs', [IntToStr(FMeshObjects)]) +
+      ' · ' + Lf('qv.mesh.verts', [IntToStr(FMeshVerts)]) +
+      ' · ' + Count + ' · ' + FormatFileSize(FMeshBytes);
+  end
+  else if FMeshPicture then
     Line := Name + ' · ' + IntToStr(FMeshPicW) + '×' + IntToStr(FMeshPicH) +
       ' · ' + FormatFileSize(FMeshBytes)
   else
@@ -13635,7 +13701,7 @@ begin
   if Assigned(FMeshHint) then
   begin
     FMeshHint.Text := L('qv.mesh.turn');
-    FMeshHint.Visible := FMeshOn and not FMeshPicture and not FMeshHintGone;
+    FMeshHint.Visible := FMeshOn and not FMeshPicture and not FMeshTooBig and not FMeshHintGone;
     if FMeshHint.Visible then
       FMeshHint.BringToFront;
   end;
@@ -13665,7 +13731,8 @@ end;
 
 procedure TFilePreview.ApplyMeshFrame(ABmp: TBitmap; AErr: Integer;
   APicture, ASimple: Boolean; AKind: Integer; AVerts, ATris, APoints, ABytes: Int64;
-  APicW, APicH: Integer; AGen, ALoadGen: Integer);
+  APicW, APicH: Integer; AObjects: Integer; const AUnit: string; ATooBig: Boolean;
+  AGen, ALoadGen: Integer);
 begin
   FMeshBusy := False;
   try
@@ -13688,9 +13755,26 @@ begin
     FMeshBytes := ABytes;
     FMeshPicW := APicW;
     FMeshPicH := APicH;
+    FMeshObjects := AObjects;
+    FMeshUnit := AUnit;
+    FMeshTooBig := ATooBig;
     if (ABmp = nil) or (AErr <> Ord(meNone)) then
     begin
-      if AErr <> Ord(meNone) then
+      if ATooBig and (AErr = Ord(meNone)) then
+      begin
+        if Assigned(FImgHost) then
+          FImgHost.Visible := False;
+        if Assigned(FMeshHint) then
+          FMeshHint.Visible := False;
+        ShowInfoKey('qv.mesh.big');
+        SetKindRaw(MeshKindName(mk3mf));
+        if Assigned(FMeta) then
+        begin
+          FMeta.Visible := True;
+          FMeta.Text := L('qv.mesh.big');
+        end;
+      end
+      else if AErr <> Ord(meNone) then
         ShowMeshFail(AErr);
       Exit;
     end;
@@ -13703,6 +13787,12 @@ begin
     ApplyMeshChrome;
     if not FMeshPicture and Assigned(FImgHost) then
       FImgHost.Cursor := crHandPoint;
+    { Хозяин картинки получил размер только сейчас. Мелкий первый кадр переснять. }
+    if Assigned(FImgHost) and Assigned(FImage) and (FImage.Bitmap.Width > 0) and
+       (FImgHost.Width >= 32) and (FImgHost.Height >= 32) and
+       ((Abs(Round(FImgHost.Width) - FImage.Bitmap.Width) > 16) or
+        (Abs(Round(FImgHost.Height) - FImage.Bitmap.Height) > 16)) then
+      ScheduleMeshFrame;
   finally
     FreeAndNil(ABmp);
     if FMeshPending and FMeshOn and not FDestroying and not FMeshBusy then
@@ -13743,6 +13833,9 @@ begin
       Err, Kind, PicW, PicH: Integer;
       Picture, Simple: Boolean;
       Verts, Tris, Points, Bytes: Int64;
+      ObjN: Integer;
+      UnitNm: string;
+      Big: Boolean;
     begin
       Bmp := nil;
       Err := Ord(meBad);
@@ -13755,6 +13848,9 @@ begin
       Bytes := 0;
       PicW := 0;
       PicH := 0;
+      ObjN := 0;
+      UnitNm := '';
+      Big := False;
       try
         Bmp := RenderMeshView(Path, W, H, Cam, Info,
           function: Boolean
@@ -13771,6 +13867,9 @@ begin
         Bytes := Info.Bytes;
         PicW := Info.PicW;
         PicH := Info.PicH;
+        ObjN := Info.Objects;
+        UnitNm := Info.UnitName;
+        Big := Info.TooBig;
       except
         FreeAndNil(Bmp);
         Err := Ord(meBad);
@@ -13785,7 +13884,7 @@ begin
             Exit;
           end;
           ApplyMeshFrame(Bmp, Err, Picture, Simple, Kind, Verts, Tris, Points, Bytes,
-            PicW, PicH, Gen, LoadGen);
+            PicW, PicH, ObjN, UnitNm, Big, Gen, LoadGen);
         end);
     end).Start;
 end;
@@ -13813,6 +13912,9 @@ begin
   FMeshBytes := 0;
   FMeshPicW := 0;
   FMeshPicH := 0;
+  FMeshObjects := 0;
+  FMeshTooBig := False;
+  FMeshUnit := '';
   FMeshRendW := 0;
   FMeshRendH := 0;
   if FMeshExt = '.gltf' then

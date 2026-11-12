@@ -2561,7 +2561,9 @@ begin
               Success := RenderPsdThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
             if not Success and (Bmp = nil) and IsMeshExt(Ext) then
             begin
-              SkipFallback := True;
+              { 3MF: зіпсований zip лишає системну іконку. Інші сітки — ні. }
+              if not SameText(Ext, '.3mf') then
+                SkipFallback := True;
               if ReadPath <> '' then
               try
                 Bmp := RenderMeshThumb(ReadPath, RenderSize);

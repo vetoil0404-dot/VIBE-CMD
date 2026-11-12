@@ -58,7 +58,8 @@ type
 implementation
 
 uses
-  System.IOUtils, System.StrUtils, System.DateUtils, uFileOps;
+  System.IOUtils, System.StrUtils, System.DateUtils, uFileOps, uFileLock
+  {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 function IsBadNameChar(C: Char): Boolean;
 begin
@@ -462,6 +463,7 @@ var
   Info: TLiveOpInfo;
 begin
   Result := 0;
+  FileLockReset;
   RebuildPreview;
   SetLength(Temped, Length(FItems));
   SetLength(Orig, Length(FItems));
@@ -477,6 +479,8 @@ begin
     if not RenamePath(FItems[I].OldPath, TempName, Dummy) then
     begin
       FItems[I].Skipped := True;
+      if FileLockHalted then
+        Break;
       Continue;
     end;
     FItems[I].OldPath := Dummy;
@@ -497,6 +501,8 @@ begin
       Info.IsDir := FItems[I].IsDirectory;
       Info.Size := -1;
       PublishLiveOp(Info);
+      if FileLockHalted then
+        Break;
       Continue;
     end;
     FItems[I].OldPath := FinalPath;
@@ -511,6 +517,33 @@ begin
     PublishLiveOp(Info);
     Inc(Result);
   end;
+  { Отмена на втором проходе: готовые имена остаются, остальные temp возвращаются. }
+  if not FileLockHalted then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  for I := 0 to High(FItems) do
+  begin
+    if not Temped[I] then
+      Continue;
+    Folder := ExtractFilePath(Orig[I]);
+    if SameText(FItems[I].OldPath, TPath.Combine(Folder, FItems[I].NewName)) then
+      Continue;
+    if SameText(FItems[I].OldPath, Orig[I]) then
+      Continue;
+    if not MoveFile(PChar(FItems[I].OldPath), PChar(Orig[I])) then
+      Continue;
+    Info := Default(TLiveOpInfo);
+    Info.Kind := lokRename;
+    Info.Source := FItems[I].OldPath;
+    Info.Dest := Orig[I];
+    Info.Ok := True;
+    Info.IsDir := FItems[I].IsDirectory;
+    Info.Size := -1;
+    PublishLiveOp(Info);
+    FItems[I].OldPath := Orig[I];
+    FItems[I].Skipped := True;
+  end;
+  {$ENDIF}
 end;
 
 end.

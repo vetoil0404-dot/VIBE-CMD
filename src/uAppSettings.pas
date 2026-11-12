@@ -13,6 +13,11 @@ uses
   System.SysUtils, System.IniFiles, System.Classes, System.Math,
   System.SyncObjs, System.Threading, uLang;
 
+const
+  { Публичный репозиторий. Пустой ключ в ini сюда не подменяется. }
+  DEFAULT_UPDATE_REPO = 'vetoil0404-dot/VIBE-CMD';
+  DEFAULT_UPDATE_MASK = '*Setup*.exe;*.zip';
+
 type
   TAppTheme = (atSystem, atLight, atDark);
   TWindowMaterial = (wmNormal, wmAcrylic, wmMica);
@@ -70,6 +75,8 @@ type
     QuickViewEnabled: Boolean;
     { Окно F3. Колонку Ctrl+Q не включает и не выключает. }
     FollowCursor: Boolean;
+    { Колонка Ctrl+Q: спрятать вкладки, диски и крошки. Окно F3 не трогает. }
+    PreviewFill: Boolean;
     WindowAnimate: Boolean;
     ShowNetworkButton: Boolean;
     { Секция Network: последний диапазон и до 20 путей через «|». }
@@ -105,6 +112,14 @@ type
     MouseSelectMode: TMouseSelectMode;
     AutoStart: Boolean;
     SingleInstance: Boolean;
+    { GitHub owner/repo, маска файла релиза, автопроверка, канал test,
+      пропущенные tag_name через «|», дата последней проверки yyyy-mm-dd. }
+    UpdateRepo: string;
+    UpdateMask: string;
+    UpdateAuto: Boolean;
+    UpdatePrerelease: Boolean;
+    UpdateSkip: string;
+    UpdateLastCheck: string;
 
     WindowLeft, WindowTop, WindowWidth, WindowHeight: Integer;
     WindowMaximized: Boolean;
@@ -195,6 +210,7 @@ begin
   Language := 'system';
   QuickViewEnabled := True;
   FollowCursor := True;
+  PreviewFill := False;
   WindowAnimate := True;
   ShowNetworkButton := True;
   ShowHiddenFiles := False;
@@ -226,6 +242,12 @@ begin
   MouseSelectMode := msmExplorer;
   AutoStart := False;
   SingleInstance := True;
+  UpdateRepo := DEFAULT_UPDATE_REPO;
+  UpdateMask := DEFAULT_UPDATE_MASK;
+  UpdateAuto := True;
+  UpdatePrerelease := False;
+  UpdateSkip := '';
+  UpdateLastCheck := '';
 
   WindowLeft := -1;
   WindowTop := -1;
@@ -503,6 +525,7 @@ begin
       Transparency := 0;
     QuickViewEnabled := True;
     FollowCursor := StrToBoolDef(Ini.ReadString('View', 'FollowCursor', '1'), True);
+    PreviewFill := StrToBoolDef(Ini.ReadString('View', 'PreviewFill', '0'), False);
     { Нет ключа — как в конструкторе. SaveSession эти поля не пишет. }
     if SameText(Ini.ReadString('Select', 'MouseMode', 'explorer'), 'explorer') then
       MouseSelectMode := msmExplorer
@@ -564,6 +587,18 @@ begin
 
     AutoStart := StrToBoolDef(Ini.ReadString('Behavior', 'AutoStart', '0'), False);
     SingleInstance := StrToBoolDef(Ini.ReadString('Behavior', 'SingleInstance', '1'), True);
+    if Ini.ValueExists('Update', 'Repo') then
+      UpdateRepo := Trim(Ini.ReadString('Update', 'Repo', ''))
+    else
+      UpdateRepo := DEFAULT_UPDATE_REPO;
+    if Ini.ValueExists('Update', 'Mask') then
+      UpdateMask := Trim(Ini.ReadString('Update', 'Mask', ''))
+    else
+      UpdateMask := DEFAULT_UPDATE_MASK;
+    UpdateAuto := StrToBoolDef(Ini.ReadString('Update', 'Auto', '1'), True);
+    UpdatePrerelease := SameText(Ini.ReadString('Update', 'Channel', 'stable'), 'test');
+    UpdateSkip := Ini.ReadString('Update', 'Skip', '');
+    UpdateLastCheck := Ini.ReadString('Update', 'LastCheck', '');
 
     ThumbCacheEnabled := StrToBoolDef(Ini.ReadString('Performance', 'Thumbs', '1'), True);
     ThumbCacheMaxItems := Ini.ReadInteger('Performance', 'ThumbMaxItems', ThumbCacheMaxItems);
@@ -843,6 +878,7 @@ type
     ShowQuickAccess: Boolean;
     ShowCommandLine: Boolean;
     FollowCursor: Boolean;
+    PreviewFill: Boolean;
     MouseSelectMode: TMouseSelectMode;
     ListFontFamily: string;
     ListFontSize: Integer;
@@ -859,6 +895,12 @@ type
     DockIconLocked: TArray<Boolean>;
     AutoStart: Boolean;
     SingleInstance: Boolean;
+    UpdateRepo: string;
+    UpdateMask: string;
+    UpdateAuto: Boolean;
+    UpdatePrerelease: Boolean;
+    UpdateSkip: string;
+    UpdateLastCheck: string;
     FileOpMode: TFileOpMode;
   end;
 
@@ -924,6 +966,7 @@ begin
   Result.ShowQuickAccess := S.ShowQuickAccess;
   Result.ShowCommandLine := S.ShowCommandLine;
   Result.FollowCursor := S.FollowCursor;
+  Result.PreviewFill := S.PreviewFill;
   Result.MouseSelectMode := S.MouseSelectMode;
   Result.ListFontFamily := S.ListFontFamily;
   Result.ListFontSize := S.ListFontSize;
@@ -940,6 +983,12 @@ begin
   Result.DockIconLocked := Copy(S.DockIconLocked);
   Result.AutoStart := S.AutoStart;
   Result.SingleInstance := S.SingleInstance;
+  Result.UpdateRepo := S.UpdateRepo;
+  Result.UpdateMask := S.UpdateMask;
+  Result.UpdateAuto := S.UpdateAuto;
+  Result.UpdatePrerelease := S.UpdatePrerelease;
+  Result.UpdateSkip := S.UpdateSkip;
+  Result.UpdateLastCheck := S.UpdateLastCheck;
   Result.FileOpMode := S.FileOpMode;
 end;
 
@@ -973,6 +1022,7 @@ begin
       Ini.WriteString('Layout', 'QuickAccess', IniBoolStr(Snap.ShowQuickAccess));
       Ini.WriteString('Layout', 'CommandLine', IniBoolStr(Snap.ShowCommandLine));
       Ini.WriteString('View', 'FollowCursor', IniBoolStr(Snap.FollowCursor));
+      Ini.WriteString('View', 'PreviewFill', IniBoolStr(Snap.PreviewFill));
       if Snap.MouseSelectMode = msmExplorer then
         Ini.WriteString('Select', 'MouseMode', 'explorer')
       else
@@ -987,6 +1037,15 @@ begin
           Snap.DockIcons, Snap.DockIconLocked);
       Ini.WriteString('Behavior', 'AutoStart', IniBoolStr(Snap.AutoStart));
       Ini.WriteString('Behavior', 'SingleInstance', IniBoolStr(Snap.SingleInstance));
+      Ini.WriteString('Update', 'Repo', Snap.UpdateRepo);
+      Ini.WriteString('Update', 'Mask', Snap.UpdateMask);
+      Ini.WriteString('Update', 'Auto', IniBoolStr(Snap.UpdateAuto));
+      if Snap.UpdatePrerelease then
+        Ini.WriteString('Update', 'Channel', 'test')
+      else
+        Ini.WriteString('Update', 'Channel', 'stable');
+      Ini.WriteString('Update', 'Skip', Snap.UpdateSkip);
+      Ini.WriteString('Update', 'LastCheck', Snap.UpdateLastCheck);
       Ini.WriteInteger('FileOps', 'Mode', Ord(Snap.FileOpMode));
     end);
 end;

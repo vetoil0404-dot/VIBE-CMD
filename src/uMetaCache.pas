@@ -976,6 +976,8 @@ begin
   Dir := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
   Cands := [
     Dir + 'ffmpeg.exe',
+    IncludeTrailingPathDelimiter(GetEnvironmentVariable('LOCALAPPDATA')) +
+      'VibeCmd\ffmpeg.exe',
     Dir + 'ffmpeg\ffmpeg.exe',
     Dir + 'ffmpeg\bin\ffmpeg.exe',
     Dir + 'bin\ffmpeg.exe',

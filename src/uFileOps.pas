@@ -114,7 +114,7 @@ implementation
 
 uses
   System.SyncObjs, System.DateUtils, FMX.Types, FMX.Forms,
-  uFileOpEngine, uArchiveEngine, uLang, uNetworkVfs
+  uFileOpEngine, uArchiveEngine, uLang, uNetworkVfs, uFileLock
   {$IFDEF MSWINDOWS}, Winapi.ShlObj, Winapi.PropSys, Winapi.ActiveX{$ENDIF};
 
 type
@@ -989,15 +989,30 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
-function ShellDeletePath(const APath: string; APermanent: Boolean): Boolean;
+function ShellDeletePath(const APath: string; APermanent: Boolean;
+  out ACode: Cardinal): Boolean;
+var
+  Aborted: Boolean;
 begin
-  Result := ShellFileOp(FO_DELETE, [APath], '', not APermanent);
+  Result := ShellFileOpEx(FO_DELETE, [APath], '', ShellFlags(not APermanent),
+    ACode, Aborted);
 end;
 {$ENDIF}
 
 procedure DeletePathCore(const APath: string; APermanent: Boolean);
 var
   Z, Inner: string;
+  {$IFDEF MSWINDOWS}
+  Code: Cardinal;
+  procedure FailOs(ACode: Cardinal; const AMsg: string);
+  var
+    E: EOSError;
+  begin
+    E := EOSError.Create(AMsg);
+    E.ErrorCode := ACode;
+    raise E;
+  end;
+  {$ENDIF}
 begin
   if TryZipItem(APath, Z, Inner) and (Inner <> '') then
   begin
@@ -1008,24 +1023,36 @@ begin
   {$IFDEF MSWINDOWS}
   if UseShellDiskOps then
   begin
-    if not ShellDeletePath(APath, APermanent) then
+    if not ShellDeletePath(APath, APermanent, Code) then
     begin
       if APermanent then
       begin
         if TDirectory.Exists(APath) then
           TDirectory.Delete(APath, True)
-        else
-          TFile.Delete(APath);
+        else if not DeleteFile(PChar(APath)) then
+        begin
+          Code := GetLastError;
+          FailOs(Code, SysErrorMessage(Code) + sLineBreak + '[' + APath + ']');
+        end;
       end
       else
-        raise Exception.Create(L('ops.recycle'));
+        FailOs(Code, L('ops.recycle'));
     end;
     Exit;
   end;
   if not APermanent then
   begin
-    if not ShellDeletePath(APath, False) then
-      raise Exception.Create(L('ops.recycle'));
+    if not ShellDeletePath(APath, False, Code) then
+      FailOs(Code, L('ops.recycle'));
+    Exit;
+  end;
+  if not TDirectory.Exists(APath) then
+  begin
+    if not DeleteFile(PChar(APath)) then
+    begin
+      Code := GetLastError;
+      FailOs(Code, SysErrorMessage(Code) + sLineBreak + '[' + APath + ']');
+    end;
     Exit;
   end;
   {$ENDIF}
@@ -1065,15 +1092,20 @@ end;
 
 function RenamePath(const AOldPath, ANewName: string; out ANewPath: string): Boolean;
 var
-  ParentDir, Z, Inner, Temp, Err: string;
-  IsDir: Boolean;
+  ParentDir, Z, Inner, Temp: string;
 
-  procedure MoveEntry(const AFrom, ATo: string);
+  function TryWinMove(const AFrom, ATo: string): Boolean;
+  var
+    Code: Cardinal;
   begin
-    if IsDir then
-      TDirectory.Move(AFrom, ATo)
-    else
-      TFile.Move(AFrom, ATo);
+    repeat
+      if MoveFile(PChar(ExcludeTrailingPathDelimiter(AFrom)),
+                  PChar(ExcludeTrailingPathDelimiter(ATo))) then
+        Exit(True);
+      Code := GetLastError;
+      if FileLockOffer(AFrom, Code) <> flcRetry then
+        Exit(False);
+    until False;
   end;
 
   function CaseTempPath(const ADir, ALeaf: string): string;
@@ -1097,6 +1129,7 @@ var
 begin
   Result := False;
   ANewPath := '';
+  FileLockReset;
   if (AOldPath = '') or (ANewName = '') then
     Exit;
 
@@ -1116,7 +1149,6 @@ begin
   { Тот же путь с тем же регистром: диск не трогаем. }
   if SameStr(AOldPath, ANewPath) then
     Exit(True);
-  IsDir := TDirectory.Exists(AOldPath);
   { NTFS не меняет регистр прямым Move: имя для системы то же. }
   if SameText(AOldPath, ANewPath) then
   begin
@@ -1124,35 +1156,17 @@ begin
       ExtractFileName(ExcludeTrailingPathDelimiter(AOldPath)));
     if Temp = '' then
       Exit;
-    try
-      MoveEntry(AOldPath, Temp);
-    except
+    if not TryWinMove(AOldPath, Temp) then
+      Exit;
+    if not TryWinMove(Temp, ANewPath) then
+    begin
+      if not TryWinMove(Temp, AOldPath) then
+        raise Exception.Create(L('op.noaccess') + sLineBreak + Temp);
       Exit;
     end;
-    try
-      MoveEntry(Temp, ANewPath);
-      Result := True;
-    except
-      on E: Exception do
-      begin
-        Err := E.Message;
-        try
-          MoveEntry(Temp, AOldPath);
-          Result := False;
-        except
-          on E2: Exception do
-            raise Exception.Create(Err + sLineBreak + E2.Message);
-        end;
-      end;
-    end;
-    Exit;
+    Exit(True);
   end;
-  try
-    MoveEntry(AOldPath, ANewPath);
-    Result := True;
-  except
-    Result := False;
-  end;
+  Result := TryWinMove(AOldPath, ANewPath);
 end;
 
 procedure ArchivePathsCore(const ASources: TArray<string>; const AZipFile: string);
@@ -1863,6 +1877,33 @@ begin
     end).Start;
 end;
 
+function NormBinPath(const S: string): string;
+begin
+  Result := Trim(S);
+  if Result = '' then
+    Exit;
+  Result := StringReplace(Result, '/', '\', [rfReplaceAll]);
+  if StartsText('\\?\', Result) then
+    Delete(Result, 1, 4);
+  Result := UpperCase(ExcludeTrailingPathDelimiter(Result));
+end;
+
+function CombineBinPath(const ADir, AName: string): string;
+var
+  Dir, Name: string;
+begin
+  Dir := ExcludeTrailingPathDelimiter(Trim(StringReplace(ADir, '/', '\', [rfReplaceAll])));
+  Name := Trim(StringReplace(AName, '/', '\', [rfReplaceAll]));
+  if Name <> '' then
+    Name := ExtractFileName(ExcludeTrailingPathDelimiter(Name));
+  if (Dir <> '') and (Name <> '') then
+    Result := Dir + '\' + Name
+  else if Dir <> '' then
+    Result := Dir
+  else
+    Result := Name;
+end;
+
 {$IFDEF MSWINDOWS}
 type
   { shell32 пишет Int64 вплотную к cbSize. Без packed читаем на 4 байта мимо. }
@@ -1886,74 +1927,670 @@ begin
     Assigned(AItem);
 end;
 
-function RestoreOneItem(const APath: string): Boolean;
+type
+  TBinHit = record
+    Rel: PItemIDList;
+    Body: string;
+    Parse: string;
+    Orig: string;
+    From: string;
+    Leaf: string;
+    Item: IShellItem;
+    WasThere: Boolean;
+    Listed: Boolean;
+  end;
+
+procedure FreeBinHits(var AHits: TArray<TBinHit>);
 var
-  Item: IShellItem;
-  Menu: IContextMenu;
-  ICI: TCMInvokeCommandInfo;
+  I: Integer;
 begin
-  Result := False;
-  if not ShellItemFromPath(APath, Item) then
-    Exit;
-  if Failed(Item.BindToHandler(nil, BHID_SFUIObject, IID_IContextMenu, Menu)) or
-     (Menu = nil) then
-    Exit;
-  FillChar(ICI, SizeOf(ICI), 0);
-  ICI.cbSize := SizeOf(ICI);
-  ICI.fMask := 0;
-  ICI.lpVerb := PAnsiChar(AnsiString('undelete'));
-  ICI.nShow := SW_SHOWNORMAL;
-  Result := Succeeded(Menu.InvokeCommand(ICI));
+  for I := 0 to High(AHits) do
+  begin
+    if AHits[I].Rel <> nil then
+      ILFree(AHits[I].Rel);
+    AHits[I].Rel := nil;
+    AHits[I].Item := nil;
+  end;
+  SetLength(AHits, 0);
 end;
 
-function RestoreBatch(const APaths: TArray<string>): Boolean;
+function RecycleBodyPresent(const APath: string): Boolean;
 var
-  Bin: IShellItem;
-  Folder: IShellFolder;
-  Item: IShellItem;
-  AbsPidl, RelPidl: PItemIDList;
-  Rel: TArray<PItemIDList>;
-  Menu: IContextMenu;
-  ICI: TCMInvokeCommandInfo;
-  I, N: Integer;
+  Attr: DWORD;
 begin
   Result := False;
-  if not ShellItemFromPath(RecycleBinPath, Bin) then
+  if APath = '' then
     Exit;
-  if Failed(Bin.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, Folder)) or
-     (Folder = nil) then
+  Attr := GetFileAttributes(PChar(APath));
+  Result := Attr <> INVALID_FILE_ATTRIBUTES;
+end;
+
+function RecycleFsBody(const APath: string): Boolean;
+begin
+  Result := IsRecycleItemPath(APath) and
+    (Pos('\$RECYCLE.BIN\', UpperCase(APath)) > 0);
+end;
+
+function OpenRecycleFolder(out ABin: IShellItem; out AFolder: IShellFolder;
+  out AParent: PItemIDList): Boolean;
+begin
+  ABin := nil;
+  AFolder := nil;
+  AParent := nil;
+  Result := ShellItemFromPath(RecycleBinPath, ABin) and
+    Succeeded(ABin.BindToHandler(nil, BHID_SFObject, IID_IShellFolder, AFolder)) and
+    (AFolder <> nil);
+  if not Result then
     Exit;
-  SetLength(Rel, Length(APaths));
-  N := 0;
-  for I := 0 to High(APaths) do
-  begin
-    AbsPidl := nil;
-    Item := nil;
-    if not ShellItemFromPath(APaths[I], Item) then
-      Continue;
-    if Failed(SHGetIDListFromObject(Item, AbsPidl)) or (AbsPidl = nil) then
-      Continue;
-    RelPidl := ILClone(ILFindLastID(AbsPidl));
-    CoTaskMemFree(AbsPidl);
-    if RelPidl = nil then
-      Continue;
-    Rel[N] := RelPidl;
-    Inc(N);
-  end;
-  if N = 0 then
+  SHGetIDListFromObject(ABin, AParent);
+end;
+
+function CollectBinHits(const APaths: TArray<string>; const AFolder: IShellFolder;
+  AParent: PItemIDList; out AHits: TArray<TBinHit>): Integer;
+const
+  KeyFrom: TPropertyKey = (
+    fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 2);
+var
+  Want, Seen: TDictionary<string, Byte>;
+  Enum: IEnumIDList;
+  Child: PItemIDList;
+  Fetched: ULONG;
+  ChildItem: IShellItem;
+  Item2: IShellItem2;
+  P: PWideChar;
+  S, Body, Parse, Disp, From, Key: string;
+  Hit: TBinHit;
+  N: Integer;
+begin
+  SetLength(AHits, 0);
+  Result := 0;
+  if (AFolder = nil) or (Length(APaths) = 0) then
     Exit;
+  Want := TDictionary<string, Byte>.Create;
+  Seen := TDictionary<string, Byte>.Create;
   try
-    if Failed(Folder.GetUIObjectOf(0, N, Rel[0], IID_IContextMenu, nil, Menu)) or
-       (Menu = nil) then
+    for S in APaths do
+    begin
+      Key := NormBinPath(S);
+      if Key <> '' then
+        Want.AddOrSetValue(Key, 0);
+    end;
+    if Want.Count = 0 then
+      Exit;
+    if Failed(AFolder.EnumObjects(0, SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or
+       SHCONTF_INCLUDEHIDDEN or SHCONTF_STORAGE, Enum)) or (Enum = nil) then
+      Exit;
+    Fetched := 0;
+    N := 0;
+    while Enum.Next(1, Child, Fetched) = S_OK do
+    try
+      ChildItem := nil;
+      if Failed(SHCreateItemWithParent(AParent, AFolder, Child, IID_IShellItem,
+         ChildItem)) or (ChildItem = nil) then
+        Continue;
+      Body := '';
+      Parse := '';
+      Disp := '';
+      From := '';
+      P := nil;
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_FILESYSPATH, P)) and (P <> nil) then
+      begin
+        Body := string(P);
+        CoTaskMemFree(P);
+      end;
+      P := nil;
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, P)) and
+         (P <> nil) then
+      begin
+        Parse := string(P);
+        CoTaskMemFree(P);
+      end;
+      if Body = '' then
+        Body := Parse;
+      Key := NormBinPath(Body);
+      if (Key = '') or not Want.ContainsKey(Key) then
+      begin
+        Key := NormBinPath(Parse);
+        if (Key = '') or not Want.ContainsKey(Key) then
+          Continue;
+      end;
+      if Seen.ContainsKey(Key) then
+        Continue;
+      P := nil;
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_NORMALDISPLAY, P)) and
+         (P <> nil) then
+      begin
+        Disp := StringReplace(string(P), '/', '\', [rfReplaceAll]);
+        CoTaskMemFree(P);
+      end;
+      Item2 := nil;
+      if Supports(ChildItem, IShellItem2, Item2) then
+      begin
+        P := nil;
+        if Succeeded(Item2.GetString(KeyFrom, P)) and (P <> nil) then
+        begin
+          From := string(P);
+          CoTaskMemFree(P);
+        end;
+      end;
+      Hit := Default(TBinHit);
+      Hit.Rel := ILClone(Child);
+      if Hit.Rel = nil then
+        Continue;
+      { FILESYSPATH иногда равен исходному пути. Его нет на диске ещё до
+        восстановления, и по нему нельзя решить, что элемент ушёл из Корзины. }
+      Hit.Parse := Parse;
+      if RecycleFsBody(Parse) then
+        Hit.Body := Parse
+      else if RecycleFsBody(Body) then
+        Hit.Body := Body
+      else
+        Hit.Body := '';
+      Hit.From := From;
+      Hit.Leaf := Disp;
+      if (Disp <> '') and
+         ((Pos('\', Disp) > 0) or (Pos(':', Disp) > 0) or StartsText('\\', Disp)) then
+        Hit.Orig := Disp
+      else
+        Hit.Orig := CombineBinPath(From, Disp);
+      Hit.Item := ChildItem;
+      Hit.WasThere := (Hit.Body <> '') and RecycleBodyPresent(Hit.Body);
+      Hit.Listed := True;
+      Seen.Add(Key, 0);
+      if N > High(AHits) then
+        SetLength(AHits, N + 8);
+      AHits[N] := Hit;
+      Inc(N);
+    finally
+      CoTaskMemFree(Child);
+    end;
+    SetLength(AHits, N);
+    Result := N;
+  finally
+    Want.Free;
+    Seen.Free;
+  end;
+end;
+
+function MenuVerbId(const AMenu: IContextMenu; APop: HMENU;
+  const AVerb: string): UINT;
+var
+  I, Count: Integer;
+  Id: UINT;
+  Name: string;
+  WideBuf: array[0..127] of WideChar;
+  AnsiBuf: array[0..127] of AnsiChar;
+begin
+  Result := 0;
+  if (AMenu = nil) or (APop = 0) or (AVerb = '') then
+    Exit;
+  Count := GetMenuItemCount(APop);
+  for I := 0 to Count - 1 do
+  begin
+    Id := GetMenuItemID(APop, I);
+    if (Id = 0) or (Id = High(UINT)) then
+      Continue;
+    Name := '';
+    FillChar(WideBuf, SizeOf(WideBuf), 0);
+    if Succeeded(AMenu.GetCommandString(Id - 1, GCS_VERBW, nil,
+         PAnsiChar(@WideBuf[0]), Length(WideBuf))) then
+      Name := WideBuf;
+    if Name = '' then
+    begin
+      FillChar(AnsiBuf, SizeOf(AnsiBuf), 0);
+      if Succeeded(AMenu.GetCommandString(Id - 1, GCS_VERBA, nil,
+           @AnsiBuf[0], Length(AnsiBuf))) then
+        Name := string(AnsiBuf);
+    end;
+    if SameText(Name, AVerb) then
+      Exit(Id);
+  end;
+end;
+
+function InvokeUndeleteMenu(const AMenu: IContextMenu; out ACancelled: Boolean): Boolean;
+const
+  MenuFlags = CMF_NORMAL or CMF_EXPLORE or CMF_ITEMMENU;
+var
+  Pop: HMENU;
+  ICI: TCMInvokeCommandInfoEx;
+  Hr: HRESULT;
+  Id: UINT;
+begin
+  Result := False;
+  ACancelled := False;
+  if AMenu = nil then
+    Exit;
+  Pop := CreatePopupMenu;
+  if Pop = 0 then
+    Exit;
+  { Меню собирается до InvokeCommand. Строковый undelete без пункта в меню
+    возвращает S_OK и ничего не делает, поэтому зовём только найденный id. }
+  try
+    Hr := AMenu.QueryContextMenu(Pop, 0, 1, $7FFF, MenuFlags);
+    if Failed(Hr) then
+      Exit;
+    Id := MenuVerbId(AMenu, Pop, 'undelete');
+    if Id = 0 then
       Exit;
     FillChar(ICI, SizeOf(ICI), 0);
     ICI.cbSize := SizeOf(ICI);
-    ICI.lpVerb := PAnsiChar(AnsiString('undelete'));
+    ICI.fMask := CMIC_MASK_UNICODE;
+    ICI.hwnd := DeleteOpOwnerWnd;
     ICI.nShow := SW_SHOWNORMAL;
-    Result := Succeeded(Menu.InvokeCommand(ICI));
+    ICI.lpVerb := MakeIntResourceA(Id - 1);
+    ICI.lpVerbW := MakeIntResource(Id - 1);
+    Hr := AMenu.InvokeCommand(PCMInvokeCommandInfo(@ICI)^);
+    if HrIsUserCancel(Hr) then
+    begin
+      ACancelled := True;
+      Exit;
+    end;
+    Result := Succeeded(Hr);
   finally
-    for I := 0 to N - 1 do
-      ILFree(Rel[I]);
+    DestroyMenu(Pop);
+  end;
+end;
+
+function InvokeUndelete(const AFolder: IShellFolder; const ARel: TArray<PItemIDList>;
+  out ACancelled: Boolean): Boolean;
+var
+  Menu: IContextMenu;
+begin
+  Result := False;
+  ACancelled := False;
+  Menu := nil;
+  if (AFolder = nil) or (Length(ARel) = 0) or (ARel[0] = nil) then
+    Exit;
+  if Failed(AFolder.GetUIObjectOf(DeleteOpOwnerWnd, Length(ARel), ARel[0],
+       IID_IContextMenu, nil, Menu)) or (Menu = nil) then
+    Exit;
+  Result := InvokeUndeleteMenu(Menu, ACancelled);
+end;
+
+function InvokeUndeleteItem(const AItem: IShellItem; out ACancelled: Boolean): Boolean;
+var
+  Menu: IContextMenu;
+begin
+  Result := False;
+  ACancelled := False;
+  Menu := nil;
+  if AItem = nil then
+    Exit;
+  if Failed(AItem.BindToHandler(nil, BHID_SFUIObject, IID_IContextMenu, Menu)) or
+     (Menu = nil) then
+    Exit;
+  Result := InvokeUndeleteMenu(Menu, ACancelled);
+end;
+
+function HitStillThere(const AHit: TBinHit): Boolean;
+begin
+  Result := AHit.Listed;
+end;
+
+function ListedCount(const AHits: TArray<TBinHit>): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 0 to High(AHits) do
+    if AHits[I].Listed then
+      Inc(Result);
+end;
+
+procedure MarkBinListed(const AFolder: IShellFolder; AParent: PItemIDList;
+  var AHits: TArray<TBinHit>);
+var
+  Want: TDictionary<string, Integer>;
+  Seen: TDictionary<Integer, Byte>;
+  Enum: IEnumIDList;
+  Child: PItemIDList;
+  Fetched: ULONG;
+  ChildItem: IShellItem;
+  P: PWideChar;
+  S, Key: string;
+  I, Idx: Integer;
+
+  procedure Take(const AName: string);
+  begin
+    Key := NormBinPath(AName);
+    if (Key = '') or not Want.TryGetValue(Key, Idx) or Seen.ContainsKey(Idx) then
+      Exit;
+    Seen.Add(Idx, 0);
+    AHits[Idx].Listed := True;
+    if AHits[Idx].Rel <> nil then
+      ILFree(AHits[Idx].Rel);
+    AHits[Idx].Rel := ILClone(Child);
+    AHits[Idx].Item := ChildItem;
+  end;
+
+begin
+  for I := 0 to High(AHits) do
+    AHits[I].Listed := False;
+  if (AFolder = nil) or (Length(AHits) = 0) then
+    Exit;
+  Want := TDictionary<string, Integer>.Create;
+  Seen := TDictionary<Integer, Byte>.Create;
+  try
+    for I := 0 to High(AHits) do
+    begin
+      Key := NormBinPath(AHits[I].Parse);
+      if Key <> '' then
+        Want.AddOrSetValue(Key, I);
+      Key := NormBinPath(AHits[I].Body);
+      if Key <> '' then
+        Want.AddOrSetValue(Key, I);
+    end;
+    if Want.Count = 0 then
+      Exit;
+    if Failed(AFolder.EnumObjects(0, SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or
+       SHCONTF_INCLUDEHIDDEN or SHCONTF_STORAGE, Enum)) or (Enum = nil) then
+    begin
+      for I := 0 to High(AHits) do
+        AHits[I].Listed := True;
+      Exit;
+    end;
+    Fetched := 0;
+    while Enum.Next(1, Child, Fetched) = S_OK do
+    try
+      ChildItem := nil;
+      if Failed(SHCreateItemWithParent(AParent, AFolder, Child, IID_IShellItem,
+         ChildItem)) or (ChildItem = nil) then
+        Continue;
+      P := nil;
+      S := '';
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, P)) and
+         (P <> nil) then
+      begin
+        S := string(P);
+        CoTaskMemFree(P);
+      end;
+      Take(S);
+      P := nil;
+      if Succeeded(ChildItem.GetDisplayName(SIGDN_FILESYSPATH, P)) and (P <> nil) then
+      begin
+        S := string(P);
+        CoTaskMemFree(P);
+        Take(S);
+      end;
+    finally
+      CoTaskMemFree(Child);
+    end;
+  finally
+    Want.Free;
+    Seen.Free;
+  end;
+end;
+
+procedure WaitBinListed(const AFolder: IShellFolder; AParent: PItemIDList;
+  var AHits: TArray<TBinHit>; ATries: Integer);
+var
+  N: Integer;
+begin
+  if ATries < 1 then
+    ATries := 1;
+  for N := 1 to ATries do
+  begin
+    MarkBinListed(AFolder, AParent, AHits);
+    if ListedCount(AHits) = 0 then
+      Exit;
+    if N < ATries then
+      Sleep(80);
+  end;
+end;
+
+function SiblingInfoPath(const ABody: string): string;
+var
+  Leaf: string;
+begin
+  Result := '';
+  if not RecycleFsBody(ABody) then
+    Exit;
+  Leaf := ExtractFileName(ABody);
+  if (Length(Leaf) < 3) or (Leaf[1] <> '$') or (UpCase(Leaf[2]) <> 'R') then
+    Exit;
+  Leaf[2] := 'I';
+  Result := ExtractFileDir(ABody) + '\' + Leaf;
+end;
+
+procedure DropRestoredGhost(const AHit: TBinHit);
+var
+  Info, Orig: string;
+begin
+  if not AHit.Listed then
+    Exit;
+  { Тело $R уже ушло, файл на месте, а оболочка ещё показывает элемент.
+    Это осиротевший $I: без него Корзина прячет запись. }
+  if (AHit.Body = '') or RecycleBodyPresent(AHit.Body) then
+    Exit;
+  Orig := AHit.Orig;
+  if (Orig = '') or not (TFile.Exists(Orig) or TDirectory.Exists(Orig)) then
+    Exit;
+  Info := SiblingInfoPath(AHit.Body);
+  if (Info = '') or not RecycleBodyPresent(Info) then
+    Exit;
+  SetFileAttributes(PChar(Info), FILE_ATTRIBUTE_NORMAL);
+  System.SysUtils.DeleteFile(Info);
+end;
+
+function EnsureRestoreFolder(const AFolder: string): Boolean;
+begin
+  Result := (AFolder <> '') and TDirectory.Exists(AFolder);
+  if Result then
+    Exit;
+  if not IsWin32FsPath(AFolder) and not IsUncPath(AFolder) then
+    Exit;
+  try
+    TDirectory.CreateDirectory(AFolder);
+  except
+    Exit;
+  end;
+  Result := TDirectory.Exists(AFolder);
+end;
+
+procedure PrepareRestoreFolders(const AHits: TArray<TBinHit>);
+var
+  I: Integer;
+  Folder: string;
+begin
+  for I := 0 to High(AHits) do
+  begin
+    Folder := '';
+    if AHits[I].Orig <> '' then
+      Folder := ExtractFileDir(ExcludeTrailingPathDelimiter(AHits[I].Orig));
+    if Folder = '' then
+      Folder := ExcludeTrailingPathDelimiter(Trim(AHits[I].From));
+    if Folder <> '' then
+      EnsureRestoreFolder(Folder);
+  end;
+end;
+
+function MoveHitsBack(const AHits: TArray<TBinHit>; const AIndex: TArray<Integer>;
+  out ACancelled: Boolean): Boolean;
+var
+  HrInit, Hr: HRESULT;
+  NeedUninit: Boolean;
+  Op: IFileOperation;
+  Dest: IShellItem;
+  Folder, Leaf: string;
+  Added, I, K: Integer;
+  Aborted: BOOL;
+begin
+  Result := False;
+  ACancelled := False;
+  if Length(AIndex) = 0 then
+    Exit;
+  HrInit := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+  NeedUninit := HrInit = S_OK;
+  Op := nil;
+  try
+    if Failed(CoCreateInstance(CLSID_FileOperation, nil, CLSCTX_ALL,
+        IFileOperation, Op)) or (Op = nil) then
+      Exit;
+    Op.SetOperationFlags(DWORD(FOF_NOCONFIRMATION) or DWORD(FOF_RENAMEONCOLLISION) or
+      DWORD(FOF_NOCONFIRMMKDIR) or DWORD(FOFX_SHOWELEVATIONPROMPT));
+    if DeleteOpOwnerWnd <> 0 then
+      Op.SetOwnerWindow(DeleteOpOwnerWnd);
+    Added := 0;
+    for K := 0 to High(AIndex) do
+    begin
+      I := AIndex[K];
+      if (I < 0) or (I > High(AHits)) or (AHits[I].Item = nil) then
+        Continue;
+      if not HitStillThere(AHits[I]) then
+        Continue;
+      Folder := '';
+      Leaf := '';
+      if AHits[I].Orig <> '' then
+      begin
+        Folder := ExtractFileDir(ExcludeTrailingPathDelimiter(AHits[I].Orig));
+        Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(AHits[I].Orig));
+      end;
+      if (Folder = '') or (Leaf = '') then
+      begin
+        Folder := ExcludeTrailingPathDelimiter(Trim(AHits[I].From));
+        Leaf := ExtractFileName(Trim(AHits[I].Leaf));
+      end;
+      if (Folder = '') or (Leaf = '') then
+        Continue;
+      if not EnsureRestoreFolder(Folder) then
+        Continue;
+      Dest := nil;
+      if Failed(SHCreateItemFromParsingName(PChar(Folder), nil, IID_IShellItem, Dest)) or
+         (Dest = nil) then
+        Continue;
+      if Succeeded(Op.MoveItem(AHits[I].Item, Dest, PChar(Leaf), nil)) then
+        Inc(Added);
+    end;
+    if Added = 0 then
+      Exit;
+    Hr := Op.PerformOperations;
+    Aborted := False;
+    Op.GetAnyOperationsAborted(Aborted);
+    if Aborted or HrIsUserCancel(Hr) then
+    begin
+      ACancelled := True;
+      Exit;
+    end;
+    Result := Succeeded(Hr);
+  finally
+    Op := nil;
+    if NeedUninit then
+      CoUninitialize;
+  end;
+end;
+
+function RestoreBinPaths(const APaths: TArray<string>; out AError: string): Boolean;
+var
+  Bin: IShellItem;
+  Folder: IShellFolder;
+  Parent: PItemIDList;
+  Hits: TArray<TBinHit>;
+  Rel: TArray<PItemIDList>;
+  Left: TArray<Integer>;
+  One: TArray<PItemIDList>;
+  Cancelled: Boolean;
+  Did: Boolean;
+  I, N, LeftN: Integer;
+begin
+  AError := '';
+  Result := False;
+  Hits := nil;
+  Parent := nil;
+  Bin := nil;
+  Folder := nil;
+  if not OpenRecycleFolder(Bin, Folder, Parent) then
+  begin
+    AError := L('bin.fail');
+    Exit;
+  end;
+  try
+    if CollectBinHits(APaths, Folder, Parent, Hits) = 0 then
+    begin
+      AError := L('bin.fail');
+      Exit;
+    end;
+    PrepareRestoreFolders(Hits);
+    SetLength(Rel, Length(Hits));
+    N := 0;
+    for I := 0 to High(Hits) do
+      if Hits[I].Rel <> nil then
+      begin
+        Rel[N] := Hits[I].Rel;
+        Inc(N);
+      end;
+    SetLength(Rel, N);
+    Cancelled := False;
+    if N > 0 then
+      InvokeUndelete(Folder, Rel, Cancelled);
+    if Cancelled then
+    begin
+      AError := L('op.cancelled');
+      Exit;
+    end;
+    { Успех — элемент исчез из оболочки, а не пропал файл по чужому пути. }
+    WaitBinListed(Folder, Parent, Hits, 6);
+    if ListedCount(Hits) > 0 then
+    begin
+      SetLength(One, 1);
+      for I := 0 to High(Hits) do
+      begin
+        if not Hits[I].Listed then
+          Continue;
+        Did := False;
+        Cancelled := False;
+        if Hits[I].Rel <> nil then
+        begin
+          One[0] := Hits[I].Rel;
+          Did := InvokeUndelete(Folder, One, Cancelled);
+        end;
+        if Cancelled then
+        begin
+          AError := L('op.cancelled');
+          Exit;
+        end;
+        if not Did then
+          InvokeUndeleteItem(Hits[I].Item, Cancelled);
+        if Cancelled then
+        begin
+          AError := L('op.cancelled');
+          Exit;
+        end;
+      end;
+      WaitBinListed(Folder, Parent, Hits, 4);
+    end;
+    LeftN := 0;
+    SetLength(Left, Length(Hits));
+    for I := 0 to High(Hits) do
+      if Hits[I].Listed then
+      begin
+        Left[LeftN] := I;
+        Inc(LeftN);
+      end;
+    SetLength(Left, LeftN);
+    if LeftN > 0 then
+    begin
+      MoveHitsBack(Hits, Left, Cancelled);
+      if Cancelled then
+      begin
+        AError := L('op.cancelled');
+        Exit;
+      end;
+      WaitBinListed(Folder, Parent, Hits, 4);
+    end;
+    for I := 0 to High(Hits) do
+      DropRestoredGhost(Hits[I]);
+    NotifyRecycleBinChanged;
+    WaitBinListed(Folder, Parent, Hits, 3);
+    if ListedCount(Hits) = 0 then
+      Result := True
+    else
+      AError := L('bin.fail');
+  finally
+    FreeBinHits(Hits);
+    if Parent <> nil then
+      CoTaskMemFree(Parent);
+    Folder := nil;
+    Bin := nil;
   end;
 end;
 {$ENDIF}
@@ -1979,9 +2616,6 @@ begin
 end;
 
 function RestoreRecycleItems(const APaths: TArray<string>; out AError: string): Boolean;
-var
-  I: Integer;
-  Any: Boolean;
 begin
   AError := '';
   Result := False;
@@ -1991,15 +2625,7 @@ begin
     Exit;
   end;
   {$IFDEF MSWINDOWS}
-  if RestoreBatch(APaths) then
-    Exit(True);
-  Any := False;
-  for I := 0 to High(APaths) do
-    if RestoreOneItem(APaths[I]) then
-      Any := True;
-  Result := Any;
-  if not Result then
-    AError := L('bin.fail');
+  Result := RestoreBinPaths(APaths, AError);
   {$ELSE}
   AError := L('bin.fail');
   {$ENDIF}
@@ -2035,29 +2661,36 @@ begin
   end;
 end;
 
-procedure PushRecycleUndo(const AItems: TArray<string>);
+procedure PushUndoBatch(const ABatch: TUndoDelete);
 const
   MaxUndo = 16;
-var
-  Batch: TUndoDelete;
-  Mark: TFileTime;
 begin
-  if (Length(AItems) = 0) or (GUndoLock = nil) then
+  if (Length(ABatch.Sources) = 0) or (GUndoLock = nil) then
     Exit;
-  FillChar(Mark, SizeOf(Mark), 0);
-  GetSystemTimeAsFileTime(Mark);
-  Batch.Sources := Copy(AItems);
-  Batch.Mark := Int64(Mark.dwLowDateTime) or (Int64(Mark.dwHighDateTime) shl 32);
   GUndoLock.Enter;
   try
     if GUndo = nil then
       GUndo := TList<TUndoDelete>.Create;
-    GUndo.Add(Batch);
+    GUndo.Add(ABatch);
     while GUndo.Count > MaxUndo do
       GUndo.Delete(0);
   finally
     GUndoLock.Leave;
   end;
+end;
+
+procedure PushRecycleUndo(const AItems: TArray<string>);
+var
+  Batch: TUndoDelete;
+  Mark: TFileTime;
+begin
+  if Length(AItems) = 0 then
+    Exit;
+  FillChar(Mark, SizeOf(Mark), 0);
+  GetSystemTimeAsFileTime(Mark);
+  Batch.Sources := Copy(AItems);
+  Batch.Mark := Int64(Mark.dwLowDateTime) or (Int64(Mark.dwHighDateTime) shl 32);
+  PushUndoBatch(Batch);
 end;
 
 function PopRecycleUndo: TUndoDelete;
@@ -2084,7 +2717,7 @@ const
     fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 2);
   KeyWhen: TPropertyKey = (
     fmtid: '{9B174B33-40FF-11D2-A27E-00C04FC30871}'; pid: 3);
-  Tick30s = Int64(30) * 10000000;
+  Tick3Min = Int64(180) * 10000000;
 var
   WantPath, WantName: TDictionary<string, Byte>;
   Hits: TList<string>;
@@ -2095,11 +2728,13 @@ var
   Fetched: ULONG;
   ChildItem: IShellItem;
   ParentPidl: PItemIDList;
-  Origin, Parse, Name, S: string;
+  Origin, Parse, Name, Disp, S: string;
+  Came, Joined, FromKey: string;
   Item2: IShellItem2;
   P: PWideChar;
   FT: TFileTime;
-  Stamp, Floor: Int64;
+  Stamp: Int64;
+  Exact: Boolean;
   I: Integer;
 {$ENDIF}
 begin
@@ -2114,11 +2749,11 @@ begin
   try
     for S in ABatch.Sources do
     begin
-      Origin := UpperCase(ExcludeTrailingPathDelimiter(Trim(S)));
+      Origin := NormBinPath(S);
       if Origin = '' then
         Continue;
       WantPath.AddOrSetValue(Origin, 0);
-      Name := UpperCase(ExtractFileName(Origin));
+      Name := ExtractFileName(Origin);
       if Name <> '' then
         WantName.AddOrSetValue(Name, 0);
     end;
@@ -2131,7 +2766,6 @@ begin
     if Failed(Folder.EnumObjects(0, SHCONTF_FOLDERS or SHCONTF_NONFOLDERS or
        SHCONTF_INCLUDEHIDDEN or SHCONTF_STORAGE, Enum)) or (Enum = nil) then
       Exit;
-    Floor := ABatch.Mark - Tick30s;
     Fetched := 0;
     while Enum.Next(1, Child, Fetched) = S_OK do
     try
@@ -2140,6 +2774,7 @@ begin
          ChildItem)) or (ChildItem = nil) then
         Continue;
       Origin := '';
+      Disp := '';
       Name := '';
       Stamp := 0;
       Item2 := nil;
@@ -2148,7 +2783,7 @@ begin
         P := nil;
         if Succeeded(Item2.GetString(KeyFrom, P)) and (P <> nil) then
         begin
-          Origin := UpperCase(ExcludeTrailingPathDelimiter(Trim(string(P))));
+          Origin := string(P);
           CoTaskMemFree(P);
         end;
         FillChar(FT, SizeOf(FT), 0);
@@ -2159,15 +2794,28 @@ begin
       if Succeeded(ChildItem.GetDisplayName(SIGDN_NORMALDISPLAY, P)) and
          (P <> nil) then
       begin
-        Name := UpperCase(ExtractFileName(StringReplace(string(P), '/', '\',
-          [rfReplaceAll])));
+        { У элемента Корзины это исходный полный путь, не только имя. }
+        Disp := StringReplace(string(P), '/', '\', [rfReplaceAll]);
         CoTaskMemFree(P);
       end;
-      if (Stamp <> 0) and (Stamp < Floor) then
-        Continue;
-      if (Origin = '') or not WantPath.ContainsKey(Origin) then
+      Name := UpperCase(ExtractFileName(ExcludeTrailingPathDelimiter(Disp)));
+      Came := NormBinPath(Disp);
+      if (Disp <> '') and (Pos('\', Disp) = 0) and (Pos(':', Disp) = 0) and
+         not StartsText('\\', Disp) then
+        Came := NormBinPath(CombineBinPath(Origin, Disp));
+      Joined := NormBinPath(CombineBinPath(Origin, Name));
+      FromKey := NormBinPath(Origin);
+      { FromKey — это папка «откуда удалили». Совпадает с пачкой, только если
+        свойство уже хранит полный путь, а не родительский каталог. }
+      Exact := ((Came <> '') and WantPath.ContainsKey(Came)) or
+        ((Joined <> '') and WantPath.ContainsKey(Joined)) or
+        ((FromKey <> '') and (Name <> '') and (ExtractFileName(FromKey) = Name) and
+         WantPath.ContainsKey(FromKey));
+      { Дата удаления обрезана до минуты. Окно в 30 с отсекало точное совпадение. }
+      if not Exact then
       begin
-        if (Name = '') or not WantName.ContainsKey(Name) or (Stamp = 0) then
+        if (Name = '') or not WantName.ContainsKey(Name) or (Stamp = 0) or
+           (Stamp + Tick3Min < ABatch.Mark) then
           Continue;
       end;
       P := nil;
@@ -2225,29 +2873,37 @@ begin
   end;
   if Length(Found) = 0 then
   begin
-    if GUndoLock <> nil then
-    begin
-      GUndoLock.Enter;
-      try
-        if GUndo = nil then
-          GUndo := TList<TUndoDelete>.Create;
-        GUndo.Add(Batch);
-      finally
-        GUndoLock.Leave;
-      end;
-    end;
+    PushUndoBatch(Batch);
     AError := L('bin.fail');
     Exit(False);
   end;
   Result := RestoreRecycleItems(Found, AError);
-  if not Result and (AError = '') then
-    AError := L('bin.fail');
+  if not Result then
+  begin
+    PushUndoBatch(Batch);
+    if AError = '' then
+      AError := L('bin.fail');
+  end;
 end;
 
 procedure NotifyRecycleBinChanged;
+{$IFDEF MSWINDOWS}
+var
+  Bin: IShellItem;
+  Pidl: PItemIDList;
+{$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
   SHUpdateRecycleBinIcon;
+  Bin := nil;
+  Pidl := nil;
+  if ShellItemFromPath(RecycleBinPath, Bin) and Assigned(Bin) and
+     Succeeded(SHGetIDListFromObject(Bin, Pidl)) and (Pidl <> nil) then
+  try
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_IDLIST or SHCNF_FLUSHNOWAIT, Pidl, nil);
+  finally
+    CoTaskMemFree(Pidl);
+  end;
   {$ENDIF}
 end;
 

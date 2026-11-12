@@ -488,9 +488,17 @@ end;
 function IsRecycleItemPath(const APath: string): Boolean;
 const
   CLSID_RecycleBin = '645FF040-5081-101B-9F08-00AA002F954E';
+var
+  U, Leaf: string;
 begin
-  Result := (Pos(CLSID_RecycleBin, UpperCase(APath)) > 0) and
-    not IsRecycleBinPath(APath);
+  U := UpperCase(APath);
+  if (Pos(CLSID_RecycleBin, U) > 0) and not IsRecycleBinPath(APath) then
+    Exit(True);
+  { Список Корзины отдаёт parsing-имя C:\$Recycle.Bin\<SID>\$R.... }
+  if Pos('\$RECYCLE.BIN\', U) <= 0 then
+    Exit(False);
+  Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(U));
+  Result := (Length(Leaf) > 2) and (Leaf[1] = '$') and (Leaf[2] = 'R');
 end;
 
 function ExtractWpdId(const APath: string): string; forward;

@@ -245,6 +245,7 @@ type
     procedure PinDockPath(Sender: TObject; const APath: string);
     procedure DockEmptyBin(Sender: TObject);
     procedure RefreshAfterBin;
+    procedure RefreshRestoredPlaces;
     procedure UndoLastBinDelete;
     procedure RefreshBinIcons;
     procedure BinRefreshTick(Sender: TObject);
@@ -363,6 +364,8 @@ var
 procedure NoteAppStart;
 function TryActivateRunningInstance: Boolean;
 procedure StartupLog(const AStage: string);
+{ До Application.Initialize. False — выйти: библиотеки нет или перезапуск не удался. }
+function PrepareSkiaLibrary: Boolean;
 
 implementation
 
@@ -370,7 +373,7 @@ uses
   Winapi.MultiMon,
   System.Win.Registry, System.IniFiles,
   FMX.Platform,
-  uFileOpProgressForm, uDriveBar, uFilePreview;
+  uFileOpProgressForm, uDriveBar, uFilePreview, uUpdate, uDeps;
 
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
@@ -406,6 +409,7 @@ const
   MID_BTN_Y0 = 4;
   MIN_WINDOW_SLACK = 8;
   MIN_WINDOW_FLOOR = 480;
+  MIN_WINDOW_WIDTH = 500;
   MIN_WINDOW_HEIGHT = 700;
 
 type
@@ -471,6 +475,58 @@ begin
   OutputDebugString(PChar(Format('VIBE %4d ms  %s',
     [GetTickCount64 - GAppStartTick, AStage])));
   {$ENDIF}
+end;
+
+function RelaunchSelf: Boolean;
+{$IFDEF MSWINDOWS}
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  Cmd: string;
+begin
+  Result := False;
+  if GAppMutex <> 0 then
+  begin
+    CloseHandle(GAppMutex);
+    GAppMutex := 0;
+  end;
+  Cmd := GetCommandLine;
+  UniqueString(Cmd);
+  if Cmd = '' then
+    Exit;
+  FillChar(SI, SizeOf(SI), 0);
+  FillChar(PI, SizeOf(PI), 0);
+  SI.cb := SizeOf(SI);
+  if not CreateProcess(nil, PChar(Cmd), nil, nil, False, 0,
+    nil, nil, SI, PI) then
+    Exit;
+  CloseHandle(PI.hThread);
+  CloseHandle(PI.hProcess);
+  Result := True;
+end;
+{$ELSE}
+begin
+  Result := False;
+end;
+{$ENDIF}
+
+function PrepareSkiaLibrary: Boolean;
+begin
+  case EnsureSk4d of
+    skLoaded:
+      Result := True;
+    skFetched:
+      begin
+        Result := False;
+        if RelaunchSelf then
+          Halt(0)
+        else
+          MessageBox(0, PChar(L('dep.sk.restart')), 'V!BE CMD',
+            MB_OK or MB_ICONINFORMATION or MB_SETFOREGROUND);
+      end;
+  else
+    Result := False;
+  end;
 end;
 
 procedure NoteAppStart;
@@ -902,6 +958,7 @@ begin
   SetActiveAppTheme(FSettings.Theme);
   SetFileOpMode(FSettings.FileOpMode);
 
+  Constraints.MinWidth := MIN_WINDOW_WIDTH;
   Constraints.MinHeight := MIN_WINDOW_FLOOR;
   Constraints.MaxHeight := 0;
   ApplyStartupGeometry;
@@ -962,6 +1019,7 @@ end;
 
 destructor TMainForm.Destroy;
 begin
+  StopUpdate;
   GMainAlive := False;
   SetLiveOpHandler(nil);
   SetFileOpHubChanged(nil);
@@ -1413,6 +1471,7 @@ begin
     FStartupPhase := 1;
     FStartupTimer.Enabled := True;
   end;
+  ArmAutoUpdate(Self, FSettings);
 end;
 
 procedure TMainForm.DoClose(var CloseAction: TCloseAction);
@@ -2037,7 +2096,7 @@ begin
 
   FSettings.WindowLeft := Round(Left);
   FSettings.WindowTop := Round(Top);
-  FSettings.WindowWidth := Round(Width);
+  FSettings.WindowWidth := Max(Round(Width), MIN_WINDOW_WIDTH);
   FSettings.WindowHeight := Max(Round(Height), Round(Constraints.MinHeight));
 end;
 
@@ -2062,7 +2121,9 @@ begin
   W := FSettings.WindowWidth;
   H := FSettings.WindowHeight;
   if W < 400 then
-    W := 1200;
+    W := 1200
+  else if W < MIN_WINDOW_WIDTH then
+    W := MIN_WINDOW_WIDTH;
   if H < MIN_WINDOW_FLOOR then
     H := MIN_WINDOW_FLOOR;
 
@@ -2094,7 +2155,7 @@ begin
   if FPendingMaximized then
   begin
     if W > WA.Width * 0.92 then
-      W := Min(1200, Max(480, WA.Width * 0.72));
+      W := Min(1200, Max(MIN_WINDOW_WIDTH, WA.Width * 0.72));
     if H > WA.Height * 0.92 then
       H := Min(Max(MIN_WINDOW_HEIGHT, 700), Max(MIN_WINDOW_HEIGHT, WA.Height * 0.72));
   end
@@ -2102,6 +2163,8 @@ begin
   begin
     if W > WA.Width then
       W := WA.Width;
+    if W < MIN_WINDOW_WIDTH then
+      W := MIN_WINDOW_WIDTH;
     if H > WA.Height then
       H := WA.Height;
   end;
@@ -2230,6 +2293,8 @@ begin
     Exit;
   if PxW > WaW then
     PxW := WaW;
+  if PxW < Round(MIN_WINDOW_WIDTH * Scale) then
+    PxW := Round(MIN_WINDOW_WIDTH * Scale);
   if PxH > WaH then
     PxH := WaH;
   L := Info.rcWork.Left + (WaW - PxW) div 2;
@@ -2304,9 +2369,9 @@ var
   Info: TMonitorInfo;
   Scan: TMonWorkScan;
   Scale, MonScale: Single;
-  DipW, DipH, MinDip: Integer;
+  DipW, DipH, MinDip, MinDipW: Integer;
   Saved: TRect;
-  WorkW, WorkH, PxW, PxH, MinPx, FitL, FitT: Integer;
+  WorkW, WorkH, PxW, PxH, MinPx, MinPxW, FitL, FitT: Integer;
   Dp: TPointF;
 
   function ScaleOf(AMon: HMONITOR): Single;
@@ -2360,7 +2425,9 @@ begin
   DipW := FSettings.WindowWidth;
   DipH := FSettings.WindowHeight;
   if DipW < 400 then
-    DipW := 1200;
+    DipW := 1200
+  else if DipW < MIN_WINDOW_WIDTH then
+    DipW := MIN_WINDOW_WIDTH;
   if DipH < MIN_WINDOW_FLOOR then
     DipH := MIN_WINDOW_FLOOR;
 
@@ -2419,15 +2486,19 @@ begin
   MinDip := Round(Constraints.MinHeight);
   if MinDip < MIN_WINDOW_FLOOR then
     MinDip := MIN_WINDOW_FLOOR;
+  MinDipW := Round(Constraints.MinWidth);
+  if MinDipW < MIN_WINDOW_WIDTH then
+    MinDipW := MIN_WINDOW_WIDTH;
   MinPx := Max(1, Round(MinDip * Scale));
+  MinPxW := Max(1, Round(MinDipW * Scale));
   if PxW > WorkW then
     PxW := WorkW;
   if PxH > WorkH then
     PxH := WorkH;
   if PxH < MinPx then
     PxH := MinPx;
-  if PxW < 1 then
-    PxW := 1;
+  if PxW < MinPxW then
+    PxW := MinPxW;
 
   { Сначала правый и нижний край, потом левый и верхний: заголовок остаётся у Work.Top. }
   FitL := Saved.Left;
@@ -5752,9 +5823,14 @@ begin
   if (Length(ASources) > 0) and IsRecycleItemPath(ASources[0]) then
   begin
     var Err: string;
-    if not RestoreRecycleItems(ASources, Err) and (Err <> '') and Assigned(ASrcPanel) then
-      ASrcPanel.ShowNotice(Err);
-    RefreshAfterBin;
+    if RestoreRecycleItems(ASources, Err) then
+      RefreshRestoredPlaces
+    else
+    begin
+      if (Err <> '') and Assigned(ASrcPanel) then
+        ASrcPanel.ShowNotice(Err);
+      RefreshAfterBin;
+    end;
     Exit;
   end;
   if IsRecycleBinPath(ADestDir) then
@@ -5841,9 +5917,14 @@ begin
   if (Length(AFiles) > 0) and IsRecycleItemPath(AFiles[0]) then
   begin
     var Err: string;
-    if not RestoreRecycleItems(AFiles, Err) and (Err <> '') and Assigned(Src) then
-      Src.ShowNotice(Err);
-    RefreshAfterBin;
+    if RestoreRecycleItems(AFiles, Err) then
+      RefreshRestoredPlaces
+    else
+    begin
+      if (Err <> '') and Assigned(Src) then
+        Src.ShowNotice(Err);
+      RefreshAfterBin;
+    end;
     Exit;
   end;
   if IsRecycleBinPath(ADest) then
@@ -5955,13 +6036,11 @@ begin
   begin
     if (Err <> '') and Assigned(FActivePanel) then
       FActivePanel.ShowNotice(Err);
+    if Err <> L('bin.noundo') then
+      RefreshAfterBin;
     Exit;
   end;
-  RefreshAfterBin;
-  if Assigned(FLeftPanel) and not IsRecycleBinPath(FLeftPanel.CurrentPath) then
-    FLeftPanel.Refresh;
-  if Assigned(FRightPanel) and not IsRecycleBinPath(FRightPanel.CurrentPath) then
-    FRightPanel.Refresh;
+  RefreshRestoredPlaces;
 end;
 
 procedure TMainForm.RefreshBinIcons;
@@ -5982,6 +6061,15 @@ begin
     FLeftPanel.RefreshRecycleHomeIcon;
   if Assigned(FRightPanel) then
     FRightPanel.RefreshRecycleHomeIcon;
+end;
+
+procedure TMainForm.RefreshRestoredPlaces;
+begin
+  RefreshAfterBin;
+  if Assigned(FLeftPanel) and not IsRecycleBinPath(FLeftPanel.CurrentPath) then
+    FLeftPanel.Refresh;
+  if Assigned(FRightPanel) and not IsRecycleBinPath(FRightPanel.CurrentPath) then
+    FRightPanel.Refresh;
 end;
 
 procedure TMainForm.RefreshAfterBin;
@@ -6092,9 +6180,14 @@ begin
   Ask := Lf('bin.ask.restore', [Length(Paths)]);
   if not BinConfirm(Self, Ask) then
     Exit;
-  if not RestoreRecycleItems(Paths, Err) and (Err <> '') then
-    Panel.ShowNotice(Err);
-  RefreshAfterBin;
+  if RestoreRecycleItems(Paths, Err) then
+    RefreshRestoredPlaces
+  else
+  begin
+    if Err <> '' then
+      Panel.ShowNotice(Err);
+    RefreshAfterBin;
+  end;
 end;
 
 procedure TMainForm.OnBtnRestoreClick(Sender: TObject);

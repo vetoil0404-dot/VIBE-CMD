@@ -85,6 +85,7 @@ type
     FElevateFiles: TList<Integer>;
     FElevateCancelled: Boolean;
     FFatal: Boolean;
+    FLockHalt: Boolean;
     FConflict: TFileOpConflictInfo;
     FConflictChoice: TConflictChoice;
     FConflictEvent: TEvent;
@@ -109,6 +110,9 @@ type
     function CopyOneFile(const ASrc, ADst: string): Boolean;
     procedure CopyOneDir(const ASrc, ADst: string; AMove: Boolean);
     procedure NoteError(const APath, AMsg: string);
+    function RetryAfterLock(const APath: string; ACode: Cardinal): Boolean;
+    procedure DeleteOwned(const APath: string);
+    function DeleteOwnedPath(const APath: string; APermanent: Boolean): Boolean;
     procedure IncDone;
     procedure AddDoneCount(ACount: Integer);
     procedure HoldDelete(const APath: string; AFiles: Integer);
@@ -212,7 +216,7 @@ implementation
 
 uses
   System.IOUtils, System.Math, System.StrUtils, System.DateUtils, uFileModel,
-  uArchiveEngine, uLang
+  uArchiveEngine, uLang, uFileLock
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 var
@@ -1324,6 +1328,77 @@ begin
     ExcludeTrailingPathDelimiter(B));
 end;
 
+function TFileOpEngine.RetryAfterLock(const APath: string; ACode: Cardinal): Boolean;
+begin
+  Result := False;
+  case FileLockOffer(APath, ACode) of
+    flcRetry:
+      Result := True;
+    flcCancel:
+      FLockHalt := True;
+  end;
+end;
+
+procedure TFileOpEngine.DeleteOwned(const APath: string);
+var
+  Code: Cardinal;
+begin
+  {$IFDEF MSWINDOWS}
+  while True do
+  begin
+    ClearReadonly(APath);
+    if DeleteFile(PChar(APath)) then
+      Exit;
+    Code := GetLastError;
+    if RetryAfterLock(APath, Code) then
+      Continue;
+    if FLockHalt then
+      NoteError(APath, L('lock.held'))
+    else
+      NoteError(APath, SysErrorMessage(Code));
+    Exit;
+  end;
+  {$ELSE}
+  try
+    ClearReadonly(APath);
+    TFile.Delete(APath);
+  except
+    on E: Exception do
+      NoteError(APath, E.Message);
+  end;
+  {$ENDIF}
+end;
+
+function TFileOpEngine.DeleteOwnedPath(const APath: string;
+  APermanent: Boolean): Boolean;
+begin
+  while True do
+  begin
+    try
+      DeletePathSync(APath, APermanent);
+      Exit(True);
+    except
+      on E: EAbort do
+        raise;
+      on E: EOSError do
+      begin
+        if RetryAfterLock(APath, E.ErrorCode) then
+          Continue;
+        if FLockHalt then
+          NoteError(APath, L('lock.held'))
+        else
+          NoteError(APath, E.Message);
+        Exit(False);
+      end;
+      on E: Exception do
+      begin
+        NoteError(APath, E.Message);
+        Exit(False);
+      end;
+    end;
+  end;
+end;
+
 function TFileOpEngine.CopyOneFile(const ASrc, ADst: string): Boolean;
 var
   InS, OutS: TStream;
@@ -1337,6 +1412,7 @@ var
   LiveKind: TLiveOpKind;
 {$IFDEF MSWINDOWS}
   HIn, HOut: THandle;
+  Again: Boolean;
 {$ENDIF}
 begin
   Result := False;
@@ -1385,56 +1461,90 @@ begin
 
   try
 {$IFDEF MSWINDOWS}
-    HIn := CreateFile(PChar(ASrc), GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
-      nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
-    if HIn = INVALID_HANDLE_VALUE then
-    begin
-      Err := GetLastError;
-      if IsFatalWinError(Err) then
-        FFatal := True;
-      raise Exception.Create(L('op.noaccess') + ': ' + ExtractFileName(ASrc));
-    end;
-    InS := THandleStream.Create(HIn);
-    try
-      HOut := CreateFile(PChar(Dest), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
-      if HOut = INVALID_HANDLE_VALUE then
-      begin
-        Err := GetLastError;
-        ClearReadonly(Dest);
-        HOut := CreateFile(PChar(Dest), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
-          FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
-      end;
-      if HOut = INVALID_HANDLE_VALUE then
-      begin
-        Err := GetLastError;
-        if IsFatalWinError(Err) then
-          FFatal := True;
-        raise Exception.Create(Lf('op.nocreate', [ExtractFileName(Dest)]));
-      end;
-      OutS := THandleStream.Create(HOut);
+    repeat
+      Again := False;
+      HIn := 0;
+      HOut := 0;
+      InS := nil;
+      OutS := nil;
       try
-        SetLength(Buf, CHUNK);
-        repeat
-          CheckWait;
-          if FSkip then
-            Break;
-          N := InS.Read(Buf[0], Length(Buf));
-          if N <= 0 then
-            Break;
-          OutS.WriteBuffer(Buf[0], N);
-          Inc(Done, N);
-          AddBytes(N);
-          Publish(ASrc, Done, Total);
-        until False;
+        HIn := CreateFile(PChar(ASrc), GENERIC_READ,
+          FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING,
+          FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
+        if HIn = INVALID_HANDLE_VALUE then
+        begin
+          HIn := 0;
+          Err := GetLastError;
+          if RetryAfterLock(ASrc, Err) then
+            Again := True
+          else if FLockHalt then
+          begin
+            NoteError(ASrc, L('lock.held'));
+            Exit(False);
+          end
+          else
+          begin
+            if IsFatalWinError(Err) then
+              FFatal := True;
+            raise Exception.Create(L('op.noaccess') + ': ' + ExtractFileName(ASrc));
+          end;
+        end
+        else
+        begin
+          InS := THandleStream.Create(HIn);
+          HOut := CreateFile(PChar(Dest), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
+          if HOut = INVALID_HANDLE_VALUE then
+          begin
+            ClearReadonly(Dest);
+            HOut := CreateFile(PChar(Dest), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
+              FILE_ATTRIBUTE_NORMAL or FILE_FLAG_SEQUENTIAL_SCAN, 0);
+          end;
+          if HOut = INVALID_HANDLE_VALUE then
+          begin
+            HOut := 0;
+            Err := GetLastError;
+            if RetryAfterLock(Dest, Err) then
+              Again := True
+            else if FLockHalt then
+            begin
+              NoteError(Dest, L('lock.held'));
+              Exit(False);
+            end
+            else
+            begin
+              if IsFatalWinError(Err) then
+                FFatal := True;
+              raise Exception.Create(Lf('op.nocreate', [ExtractFileName(Dest)]));
+            end;
+          end
+          else
+          begin
+            OutS := THandleStream.Create(HOut);
+            SetLength(Buf, CHUNK);
+            repeat
+              CheckWait;
+              if FSkip then
+                Break;
+              N := InS.Read(Buf[0], Length(Buf));
+              if N <= 0 then
+                Break;
+              OutS.WriteBuffer(Buf[0], N);
+              Inc(Done, N);
+              AddBytes(N);
+              Publish(ASrc, Done, Total);
+            until False;
+          end;
+        end;
       finally
         OutS.Free;
-        CloseHandle(HOut);
+        if HOut <> 0 then
+          CloseHandle(HOut);
+        InS.Free;
+        if HIn <> 0 then
+          CloseHandle(HIn);
       end;
-    finally
-      InS.Free;
-      CloseHandle(HIn);
-    end;
+    until not Again;
 {$ELSE}
     InS := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
     try
@@ -1569,24 +1679,26 @@ begin
       CheckWait;
       if FFatal then
         Abort;
+      if FLockHalt then
+        Exit;
       Name := TPath.GetFileName(F);
       if CopyOneFile(F, TPath.Combine(Dest, Name)) then
       begin
         IncDone;
         if AMove then
-        try
-          ClearReadonly(F);
-          TFile.Delete(F);
-        except
-          on E: Exception do
-            NoteError(F, E.Message);
-        end;
+          DeleteOwned(F);
       end;
+      if FLockHalt then
+        Exit;
     end;
     for D in TDirectory.GetDirectories(ASrc) do
     begin
+      if FLockHalt then
+        Exit;
       Child := TPath.Combine(Dest, TPath.GetFileName(D));
       CopyOneDir(D, Child, AMove);
+      if FLockHalt or FFatal then
+        Exit;
     end;
     if AMove then
       TryRemoveEmptyDir(ASrc);
@@ -1662,10 +1774,13 @@ var
   Moved, WasDir, DiskDelete: Boolean;
   N: Integer;
   Sz: Int64;
+  Err: Cardinal;
 begin
   CheckWait;
   if FFatal then
     Abort;
+  if FLockHalt then
+    Exit;
   Name := TPath.GetFileName(ExcludeTrailingPathDelimiter(ASrc));
   Dst := TPath.Combine(ADestDir, Name);
   if (FKind = okCopy) and SameOpPath(ASrc, Dst) then
@@ -1694,7 +1809,8 @@ begin
     try
       CopyPathSync(ASrc, ADestDir);
       if (FKind = okMove) and not FCancel then
-        DeletePathSync(ASrc, True);
+        if not DeleteOwnedPath(ASrc, True) then
+          Exit;
       N := CountFilesQuick(ASrc);
       if N <= 0 then
         N := 1;
@@ -1714,15 +1830,8 @@ begin
   end;
   if (FKind = okDelete) and ArchiveInvolved(ASrc, '') then
   begin
-    try
-      DeletePathSync(ASrc, True);
+    if DeleteOwnedPath(ASrc, True) then
       IncDone;
-    except
-      on E: EAbort do
-        raise;
-      on E: Exception do
-        NoteError(ASrc, E.Message);
-    end;
     Exit;
   end;
 
@@ -1740,7 +1849,8 @@ begin
           Publish(ASrc, 0, 0);
           FSpecialCopy(ASrc, ADestDir);
           if (FKind = okMove) and not FCancel then
-            DeletePathSync(ASrc, True);
+            if not DeleteOwnedPath(ASrc, True) then
+              Exit;
         end
         else if Assigned(FSpecialCopy) and (FKind = okDelete) then
         begin
@@ -1779,7 +1889,24 @@ begin
           except
           end;
           WasDir := TDirectory.Exists(ASrc);
+          {$IFDEF MSWINDOWS}
+          repeat
+            Moved := RenameFile(ASrc, Dst);
+            if Moved then
+              Break;
+            Err := GetLastError;
+            if RetryAfterLock(ASrc, Err) then
+              Continue;
+            if FLockHalt then
+            begin
+              NoteError(ASrc, L('lock.held'));
+              Exit;
+            end;
+            Break;
+          until False;
+          {$ELSE}
           Moved := RenameFile(ASrc, Dst);
+          {$ENDIF}
           if Moved then
           begin
             EmitLive(lokMove, ASrc, Dst, True, WasDir, Sz, 0);
@@ -1802,13 +1929,9 @@ begin
           else if CopyOneFile(ASrc, Dst) then
           begin
             IncDone;
-            try
-              ClearReadonly(ASrc);
-              TFile.Delete(ASrc);
-            except
-              on E: Exception do
-                NoteError(ASrc, E.Message);
-            end;
+            DeleteOwned(ASrc);
+            if FLockHalt then
+              Exit;
           end;
         end;
       end;
@@ -1822,14 +1945,13 @@ begin
           N := CountFilesQuick(ASrc);
           if N <= 0 then
             N := 1;
-          try
-            DeletePathSync(ASrc, FPermanent);
+          if DeleteOwnedPath(ASrc, FPermanent) then
+          begin
             EmitLive(lokDelete, ASrc, '', True, False, -1, 0);
             AddDoneCount(N);
-          except
-            on E: Exception do
-              NoteError(ASrc, E.Message);
           end;
+          if FLockHalt then
+            Exit;
         end;
       end;
     okArchive:
@@ -1921,9 +2043,10 @@ begin
     begin
       IncDone;
       if (FKind = okMove) and not FCancel then
-      try
-        ClearReadonly(AIt.SourcePath);
-        TFile.Delete(AIt.SourcePath);
+      begin
+        DeleteOwned(AIt.SourcePath);
+        if FLockHalt or TFile.Exists(AIt.SourcePath) then
+          Exit;
         Root := '';
         for S in FSources do
         begin
@@ -1947,9 +2070,6 @@ begin
             P := ExcludeTrailingPathDelimiter(ExtractFileDir(P));
           end;
         end;
-      except
-        on E: Exception do
-          NoteError(AIt.SourcePath, E.Message);
       end;
     end;
   finally
@@ -2009,7 +2129,7 @@ begin
       for I := 0 to High(Items) do
       begin
         CheckWait;
-        if FCancel then
+        if FCancel or FLockHalt then
         begin
           IncSkipped;
           NotifyItem(Items[I].SourcePath, oisSkipped);
@@ -2040,6 +2160,8 @@ var
   Ok: Boolean;
   Err: string;
 begin
+  FileLockReset;
+  FLockHalt := False;
   Ok := True;
   Err := '';
   FElevateCancelled := False;
@@ -2119,10 +2241,12 @@ begin
       for I := 0 to High(FSources) do
       begin
         CheckWait;
-        if FFatal then
+        if FFatal or FLockHalt then
           Break;
         try
           ProcessPath(FSources[I], DestDir);
+          if FLockHalt then
+            Break;
           { Корень обработан — снять выделение. Спорное имя ждёт окна в конце. }
           if FKind in [okCopy, okMove] then
           begin
@@ -2146,15 +2270,16 @@ begin
             NoteError(FSources[I], E.Message);
             if FKind in [okCopy, okMove] then
               NotifyItem(FSources[I], oisError);
-            if FFatal then
+            if FFatal or FLockHalt then
               Break;
           end;
         end;
       end;
-      if FDeferConflicts and not FCancel then
+      if FDeferConflicts and not FCancel and not FLockHalt then
         ResolveDeferred;
     end;
-    if (FKind = okDelete) and (FElevate <> nil) and (FElevate.Count > 0) then
+    if (FKind = okDelete) and not FLockHalt and (FElevate <> nil) and
+       (FElevate.Count > 0) then
     begin
       if FCancel then
         Abort

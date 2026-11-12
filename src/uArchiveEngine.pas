@@ -228,12 +228,27 @@ begin
 end;
 
 function ArcNorm(const AInner: string): string;
+var
+  S, P: string;
+  Parts: TArray<string>;
+  Acc: TStringBuilder;
 begin
-  Result := StringReplace(AInner, '\', '/', [rfReplaceAll]);
-  while StartsText('/', Result) do
-    Delete(Result, 1, 1);
-  while EndsText('/', Result) do
-    SetLength(Result, Length(Result) - 1);
+  S := StringReplace(AInner, '\', '/', [rfReplaceAll]);
+  Parts := S.Split(['/']);
+  Acc := TStringBuilder.Create;
+  try
+    for P in Parts do
+    begin
+      if (P = '') or (P = '.') then
+        Continue;
+      if Acc.Length > 0 then
+        Acc.Append('/');
+      Acc.Append(P);
+    end;
+    Result := Acc.ToString;
+  finally
+    Acc.Free;
+  end;
 end;
 
 function ArcRaw(const AInner: string): string;
@@ -846,8 +861,8 @@ end;
 
 function ZipIndexOf(Zip: TZipFile; const AInner: string): Integer;
 var
-  I: Integer;
-  Want, Have: string;
+  I, DirHit: Integer;
+  Want, Have, Raw: string;
 begin
   Want := ArcNorm(AInner);
   Result := Zip.IndexOf(Want);
@@ -856,15 +871,26 @@ begin
   Result := Zip.IndexOf(StringReplace(Want, '/', '\', [rfReplaceAll]));
   if Result >= 0 then
     Exit;
+  DirHit := -1;
+  for I := 0 to Zip.FileCount - 1 do
+  begin
+    Raw := Zip.FileName[I];
+    Have := ArcNorm(Raw);
+    if not SameText(Have, Want) then
+      Continue;
+    if EndsText('/', Raw) or EndsText('\', Raw) then
+    begin
+      if DirHit < 0 then
+        DirHit := I;
+    end
+    else
+      Exit(I);
+  end;
+  if DirHit >= 0 then
+    Exit(DirHit);
   Result := Zip.IndexOf(Want + '/');
   if Result >= 0 then
     Exit;
-  for I := 0 to Zip.FileCount - 1 do
-  begin
-    Have := ArcNorm(Zip.FileName[I]);
-    if SameText(Have, Want) or SameText(Have, Want + '/') then
-      Exit(I);
-  end;
   Result := -1;
 end;
 
@@ -911,11 +937,8 @@ begin
       It.Path := Name;
       It.IsDir := EndsText('/', ArcRaw(Zip.FileName[I])) or
         (TFileAttribute.faDirectory in Zip.FileInfo[I].FileAttributes);
-      if not It.IsDir then
-      begin
-        It.Size := Zip.FileInfo[I].UncompressedSize64;
-        It.PackedSize := Zip.FileInfo[I].CompressedSize64;
-      end;
+      It.Size := Zip.FileInfo[I].UncompressedSize64;
+      It.PackedSize := Zip.FileInfo[I].CompressedSize64;
       It.Modified := ItemModifiedFromZip(Zip, I);
       Inc(N);
       SetLength(Result, N);
@@ -1359,8 +1382,10 @@ end;
 function FindItem(const AItems: TArray<TArcItem>; const AInner: string;
   out AItem: TArcItem): Boolean;
 var
-  Want: string;
+  Want, Have: string;
   I: Integer;
+  SawDir: Boolean;
+  DirItem: TArcItem;
 begin
   Want := ArcNorm(AInner);
   AItem := Default(TArcItem);
@@ -1369,14 +1394,31 @@ begin
     AItem.IsDir := True;
     Exit(True);
   end;
+  SawDir := False;
+  DirItem := Default(TArcItem);
   for I := 0 to High(AItems) do
-    if SameText(AItems[I].Path, Want) then
+  begin
+    Have := ArcNorm(AItems[I].Path);
+    if not SameText(Have, Want) then
+      Continue;
+    if not AItems[I].IsDir then
     begin
       AItem := AItems[I];
       Exit(True);
     end;
+    if not SawDir then
+    begin
+      SawDir := True;
+      DirItem := AItems[I];
+    end;
+  end;
+  if SawDir then
+  begin
+    AItem := DirItem;
+    Exit(True);
+  end;
   for I := 0 to High(AItems) do
-    if StartsText(Want + '/', AItems[I].Path) then
+    if StartsText(Want + '/', ArcNorm(AItems[I].Path)) then
     begin
       AItem.Path := Want;
       AItem.IsDir := True;
@@ -1387,7 +1429,8 @@ end;
 
 function ItemIsArchiveFile(const AItem: TArcItem): Boolean;
 begin
-  Result := (not AItem.IsDir) and IsArchiveFileName(AItem.Path);
+  Result := IsArchiveFileName(AItem.Path) and
+    ((not AItem.IsDir) or (AItem.Size > 0));
 end;
 
 procedure ExtractOneZip(const AZip, AInner, AOutFile: string);
@@ -1413,10 +1456,10 @@ begin
       try
         W := TWatchStream.Create(FS, False, AInner);
         try
-          if Stm.Size > 0 then
-            W.CopyFrom(Stm, 0)
-          else if Zip.FileInfo[Idx].UncompressedSize64 > 0 then
-            W.CopyFrom(Stm, Zip.FileInfo[Idx].UncompressedSize64);
+          if Zip.FileInfo[Idx].UncompressedSize64 > 0 then
+            W.CopyFrom(Stm, Zip.FileInfo[Idx].UncompressedSize64)
+          else
+            W.CopyFrom(Stm, 0);
         finally
           W.Free;
         end;
@@ -1683,30 +1726,60 @@ end;
 function MaterializeInnerArchive(const APhysical: string; AKind: TArchiveKind;
   const AInner: string): string;
 var
-  Key, Tmp, Leaf: string;
+  Key, Tmp, Leaf, Stamp, Stored: string;
   Sz: Int64;
   Mt: TDateTime;
+  Hit: Boolean;
+
+  function StampOf(ASize: Int64; AMTime: TDateTime): string;
+  begin
+    Result := IntToStr(ASize) + '|' + IntToStr(Round(AMTime * 86400));
+  end;
+
 begin
   Key := NestKey(APhysical, AInner);
+  Hit := False;
+  Tmp := '';
   GLock.Enter;
   try
-    if GNest.TryGetValue(Key, Tmp) and TFile.Exists(Tmp) then
+    if GNest.TryGetValue(Key, Tmp) and TFile.Exists(Tmp) and
+       FileStamp(APhysical, Sz, Mt) then
     begin
-      if FileStamp(APhysical, Sz, Mt) then
-        Exit(Tmp);
+      Stamp := StampOf(Sz, Mt);
+      if GNestSrc.TryGetValue(Key, Stored) and (Stored = Stamp) then
+        Hit := True;
+    end;
+    if not Hit and GNest.ContainsKey(Key) then
+    begin
+      if (Tmp <> '') and TFile.Exists(Tmp) then
+      try
+        TFile.Delete(Tmp);
+      except
+      end;
+      GNest.Remove(Key);
+      GNestSrc.Remove(Key);
+      Tmp := '';
     end;
   finally
     GLock.Leave;
   end;
+  if Hit then
+    Exit(Tmp);
   Leaf := ArcLeaf(AInner);
   if Leaf = '' then
     Leaf := 'nested.bin';
   Tmp := UniqueTempFile(Leaf);
   ExtractOne(APhysical, AKind, AInner, Tmp);
+  Stamp := '';
+  if FileStamp(APhysical, Sz, Mt) then
+    Stamp := StampOf(Sz, Mt);
   GLock.Enter;
   try
     GNest.AddOrSetValue(Key, Tmp);
-    GNestSrc.AddOrSetValue(Key, CacheKey(APhysical) + '|');
+    if Stamp <> '' then
+      GNestSrc.AddOrSetValue(Key, Stamp)
+    else
+      GNestSrc.AddOrSetValue(Key, CacheKey(APhysical) + '|');
   finally
     GLock.Leave;
   end;
@@ -1715,10 +1788,11 @@ end;
 
 function ResolvePath(const APath: string): TArcRef;
 var
-  Disk, Rest, Acc, Next, TryPath: string;
+  Disk, Rest, Acc, After, Seg, TryPath: string;
   Items: TArray<TArcItem>;
   It: TArcItem;
   Slash: Integer;
+  FoundArc: Boolean;
 begin
   Result := Default(TArcRef);
   if not SplitArchivePath(APath, Disk, Rest) then
@@ -1729,44 +1803,54 @@ begin
   Result.Inner := ArcNorm(Rest);
   if Result.Kind = akNone then
     Exit;
-  Rest := ArcNorm(Rest);
+  Rest := Result.Inner;
+  { A nested archive may sit behind folders, or behind another archive.
+    Walk every segment of the current archive and materialize each archive file. }
   while Rest <> '' do
   begin
     ArcCheckWait;
     Items := GetItems(Result.Physical, Result.Kind);
-    Slash := Pos('/', Rest);
-    if Slash > 0 then
+    Acc := '';
+    After := Rest;
+    FoundArc := False;
+    while After <> '' do
     begin
-      Next := Copy(Rest, 1, Slash - 1);
-      Acc := Copy(Rest, Slash + 1, MaxInt);
-    end
-    else
-    begin
-      Next := Rest;
-      Acc := '';
+      Slash := Pos('/', After);
+      if Slash > 0 then
+      begin
+        Seg := Copy(After, 1, Slash - 1);
+        After := Copy(After, Slash + 1, MaxInt);
+      end
+      else
+      begin
+        Seg := After;
+        After := '';
+      end;
+      if Seg = '' then
+        Continue;
+      if Acc = '' then
+        TryPath := Seg
+      else
+        TryPath := Acc + '/' + Seg;
+      if FindItem(Items, TryPath, It) and ItemIsArchiveFile(It) then
+      begin
+        Result.Physical := MaterializeInnerArchive(Result.Physical, Result.Kind,
+          TryPath);
+        Result.Kind := DetectArchiveKind(Result.Physical);
+        if Result.Kind = akNone then
+          Result.Kind := DetectArchiveKind(TryPath);
+        Result.Inner := After;
+        Rest := After;
+        FoundArc := True;
+        Break;
+      end;
+      Acc := TryPath;
     end;
-    TryPath := Next;
-    if FindItem(Items, TryPath, It) and ItemIsArchiveFile(It) then
+    if not FoundArc then
     begin
-      Result.Physical := MaterializeInnerArchive(Result.Physical, Result.Kind, TryPath);
-      Result.Kind := DetectArchiveKind(Result.Physical);
-      if Result.Kind = akNone then
-        Result.Kind := DetectArchiveKind(TryPath);
-      Result.Inner := Acc;
-      Rest := Acc;
-      Continue;
-    end;
-    if FindItem(Items, Result.Inner, It) and ItemIsArchiveFile(It) and (Acc = '') then
-    begin
-      Result.Physical := MaterializeInnerArchive(Result.Physical, Result.Kind, Result.Inner);
-      Result.Kind := DetectArchiveKind(Result.Physical);
-      if Result.Kind = akNone then
-        Result.Kind := DetectArchiveKind(Result.Inner);
-      Result.Inner := '';
-      Rest := '';
+      Result.Inner := Rest;
       Break;
     end;
-    Break;
   end;
 end;
 

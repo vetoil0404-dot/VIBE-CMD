@@ -23,6 +23,8 @@ function LCount(N: Integer; const AOne, AFew, AMany: string): string;
 procedure SetLanguage(const ACode: string);
 procedure SetLanguageChanged(AProc: TLangNotify);
 function CurrentLanguage: string;
+{ True, когда словарь прочитан из lang\*.ini. Код языка без файла не считается. }
+function LanguageLoaded: Boolean;
 function LanguageFile(const ACode: string): string;
 function AvailableLanguages: TArray<TLangChoice>;
 { system или код файла из двух-восьми латинских букв. Чужое значение становится system. }
@@ -238,6 +240,11 @@ end;
 function CurrentLanguage: string;
 begin
   Result := FCurrent;
+end;
+
+function LanguageLoaded: Boolean;
+begin
+  Result := (FDict <> nil) and (FDict.Count > 0);
 end;
 
 function L(const AKey: string): string;

@@ -11,7 +11,7 @@ uses
   System.SysUtils, FMX.Graphics;
 
 type
-  TMeshKind = (mkNone, mkStl, mkObj, mkPly, mkGltf, mkGlb, mkBlend);
+  TMeshKind = (mkNone, mkStl, mkObj, mkPly, mkGltf, mkGlb, mkBlend, mk3mf);
 
   TMeshError = (meNone, meEmpty, meBad, meNoView, meBlend, meNotMesh);
 
@@ -34,6 +34,9 @@ type
     Bytes: Int64;
     PicW: Integer;
     PicH: Integer;
+    Objects: Integer;
+    TooBig: Boolean;
+    UnitName: string;
   end;
 
 function IsMeshExt(const AExt: string): Boolean;
@@ -54,7 +57,7 @@ implementation
 uses
   System.Classes, System.Math, System.Diagnostics, System.IOUtils, System.SyncObjs,
   System.StrUtils, System.UITypes, System.JSON, System.NetEncoding, System.ZLib,
-  FMX.Types;
+  FMX.Types, u3mf;
 
 const
   TILE_BYTES = 64 * 1024 * 1024;
@@ -98,6 +101,8 @@ type
     Tris: TArray<TMeshTri>;
     HasVertColor: Boolean;
     Cancelled: Boolean;
+    { Обрив розбору по часу. Такий кадр не кладемо в кеш, інакше зріз лишається назавжди. }
+    Incomplete: Boolean;
     Pic: TBytes;
     PicW, PicH: Integer;
   end;
@@ -186,7 +191,7 @@ begin
   if (E <> '') and (E[1] <> '.') then
     E := '.' + E;
   Result := (E = '.stl') or (E = '.obj') or (E = '.ply') or (E = '.gltf') or
-    (E = '.glb') or (E = '.blend');
+    (E = '.glb') or (E = '.blend') or (E = '.3mf');
 end;
 
 function MeshKindName(AKind: TMeshKind): string;
@@ -198,6 +203,7 @@ begin
     mkGltf: Result := 'glTF';
     mkGlb: Result := 'GLB';
     mkBlend: Result := 'BLEND';
+    mk3mf: Result := '3MF';
   else
     Result := '';
   end;
@@ -212,7 +218,7 @@ end;
 
 procedure ClearInfo(out AInfo: TMeshInfo);
 begin
-  FillChar(AInfo, SizeOf(AInfo), 0);
+  AInfo := Default(TMeshInfo);
 end;
 
 function LimitsOf(ATile: Boolean): TMeshLimits;
@@ -250,6 +256,8 @@ begin
     Result := mkGlb
   else if E = '.blend' then
     Result := mkBlend
+  else if E = '.3mf' then
+    Result := mk3mf
   else
     Result := mkNone;
 end;
@@ -1070,6 +1078,90 @@ begin
   Result := True;
 end;
 
+function ReadAsciiFloat(const B: TBytes; var APos: Integer; ASize: Integer;
+  out V: Double): Boolean;
+var
+  Sign, ExpSign, Exp, Digs, K: Integer;
+  Acc: Double;
+begin
+  Result := False;
+  while (APos < ASize) and (B[APos] <= 32) do
+    Inc(APos);
+  if APos >= ASize then
+    Exit;
+  Sign := 1;
+  if B[APos] = Ord('+') then
+    Inc(APos)
+  else if B[APos] = Ord('-') then
+  begin
+    Sign := -1;
+    Inc(APos);
+  end;
+  Acc := 0;
+  Digs := 0;
+  while (APos < ASize) and (B[APos] >= Ord('0')) and (B[APos] <= Ord('9')) do
+  begin
+    Acc := Acc * 10 + (B[APos] - Ord('0'));
+    Inc(APos);
+    Inc(Digs);
+  end;
+  if (APos < ASize) and (B[APos] = Ord('.')) then
+  begin
+    Inc(APos);
+    K := 0;
+    while (APos < ASize) and (B[APos] >= Ord('0')) and (B[APos] <= Ord('9')) do
+    begin
+      Acc := Acc * 10 + (B[APos] - Ord('0'));
+      Inc(APos);
+      Inc(Digs);
+      Inc(K);
+    end;
+    while K > 0 do
+    begin
+      Acc := Acc * 0.1;
+      Dec(K);
+    end;
+  end;
+  if Digs = 0 then
+    Exit;
+  if (APos < ASize) and ((B[APos] = Ord('e')) or (B[APos] = Ord('E'))) then
+  begin
+    Inc(APos);
+    ExpSign := 1;
+    if (APos < ASize) and (B[APos] = Ord('+')) then
+      Inc(APos)
+    else if (APos < ASize) and (B[APos] = Ord('-')) then
+    begin
+      ExpSign := -1;
+      Inc(APos);
+    end;
+    Exp := 0;
+    if (APos >= ASize) or (B[APos] < Ord('0')) or (B[APos] > Ord('9')) then
+      Exit;
+    while (APos < ASize) and (B[APos] >= Ord('0')) and (B[APos] <= Ord('9')) do
+    begin
+      Exp := Exp * 10 + (B[APos] - Ord('0'));
+      Inc(APos);
+      if Exp > 38 then
+        Exp := 38;
+    end;
+    if ExpSign < 0 then
+    begin
+      for K := 1 to Exp do
+        Acc := Acc * 0.1;
+    end
+    else
+      for K := 1 to Exp do
+        Acc := Acc * 10;
+  end;
+  V := Acc * Sign;
+  if V > 1E20 then
+    V := 1E20
+  else if V < -1E20 then
+    V := -1E20;
+  Result := True;
+end;
+
 function ColByteOf(V: Double; AFloat: Boolean): Byte;
 begin
   if AFloat and (V <= 1) then
@@ -1095,20 +1187,25 @@ type
     Name: string;
     Count: Int64;
     Props: TArray<TProp>;
+    IsVert, IsFace, IsStrip, HasNorm, HasColor: Boolean;
+    IX, IY, IZ, INX, INY, INZ, IR, IG, IB: Integer;
+    Owner: Integer;
+    KeepN: Int64;
+    Origin, Stored: Integer;
   end;
 var
-  Pos, I, P, NProps, Stored, Keep, Step, VC, TC, Fan, Base: Integer;
+  Pos, I, P, NProps, Keep, VC, TC, Fan, LastV, Got, SA, SB, SC, SN, ST: Integer;
   Line, Tok, Name: string;
   Prop: TProp;
-  IX, IY, IZ, INX, INY, INZ, IR, IG, IB, E, StoredV: Integer;
-  VI, N64, KeepV, VStep, FStep: Int64;
-  Timed, Ascii, Take: Boolean;
+  E: Integer;
+  VI, N64, VStep, FStep, FaceN, Part, SStep: Int64;
+  Timed, Ascii, Take, NormOn, VertAny: Boolean;
   Fmt: Integer;
-  Big, SawPly, SawEnd, HasFace, HasColor, HasNorm: Boolean;
+  Big, SawPly, SawEnd, HasFace, HasColor: Boolean;
   Elems: TArray<TElem>;
-  EC, VertEl, FaceEl: Integer;
+  EC: Integer;
   Vals: array[0..31] of Double;
-  Idx: array[0..15] of Integer;
+  Idx: TArray<Integer>;
   X, Y, Z, NX, NY, NZ: Single;
   CR, CG, CB: Byte;
   Col: Cardinal;
@@ -1123,6 +1220,24 @@ var
     Elems[EC].Name := AName;
     Elems[EC].Count := ACount;
     SetLength(Elems[EC].Props, 0);
+    Elems[EC].IsVert := False;
+    Elems[EC].IsFace := False;
+    Elems[EC].IsStrip := False;
+    Elems[EC].HasNorm := False;
+    Elems[EC].HasColor := False;
+    Elems[EC].IX := -1;
+    Elems[EC].IY := -1;
+    Elems[EC].IZ := -1;
+    Elems[EC].INX := -1;
+    Elems[EC].INY := -1;
+    Elems[EC].INZ := -1;
+    Elems[EC].IR := -1;
+    Elems[EC].IG := -1;
+    Elems[EC].IB := -1;
+    Elems[EC].Owner := -1;
+    Elems[EC].KeepN := 0;
+    Elems[EC].Origin := 0;
+    Elems[EC].Stored := 0;
     Result := EC;
     Inc(EC);
   end;
@@ -1140,74 +1255,62 @@ var
     Result := True;
   end;
 
-  function ReadAsciiNum(const ATyName: string; AFloat: Boolean; out V: Double): Boolean;
-  begin
-    Result := NextTok(Line, P, Tok) and ParseF(Tok, X);
-    V := X;
-    if not Result then
-      Exit;
-    if not AFloat then
-      V := Round(X);
-  end;
-
   function ReadPropValue(const AP: TProp; AAscii: Boolean; out V: Double): Boolean;
   begin
     if AAscii then
-      Result := ReadAsciiNum('', AP.FloatVal, V)
+    begin
+      Result := ReadAsciiFloat(B, Pos, ASize, V);
+      if Result and not AP.FloatVal then
+        V := Round(V);
+    end
     else
       Result := ReadPlyNum(B, Pos, ASize, AP.ValTy, Big, V);
   end;
 
   function ReadElemValues(const AE: TElem; AAscii: Boolean; out AListN: Integer;
-    var AIdx: array of Integer): Boolean;
+    var AIdx: TArray<Integer>): Boolean;
   var
-    PI, LI, LN: Integer;
+    PI, LI, LN, StoreN: Integer;
     Skip: Double;
   begin
     Result := False;
     AListN := 0;
-    if AAscii then
-    begin
-      if not ReadLine(B, ASize, Pos, Line) then
-        Exit;
-      P := 1;
-    end;
     for PI := 0 to High(AE.Props) do
     begin
       if AE.Props[PI].List then
       begin
         if AAscii then
         begin
-          if not NextTok(Line, P, Tok) or not TryStrToInt(Tok, LN) then
+          if not ReadAsciiFloat(B, Pos, ASize, Skip) then
             Exit;
+          LN := Round(Skip);
         end
         else if not ReadPlyNum(B, Pos, ASize, AE.Props[PI].CountTy, Big, Skip) then
           Exit
         else
           LN := Round(Skip);
-        if LN < 0 then
+        if (LN < 0) or (LN > 50000000) then
           Exit;
+        StoreN := 0;
         if AE.Props[PI].Slot = slList then
         begin
           AListN := LN;
-          if AListN > 16 then
-            UseN := 16
-          else
-            UseN := AListN;
-        end
-        else
-          UseN := 0;
+          StoreN := LN;
+          if StoreN > 2000000 then
+            StoreN := 2000000;
+          if Length(AIdx) < StoreN then
+            SetLength(AIdx, StoreN);
+        end;
         for LI := 0 to LN - 1 do
         begin
           if AAscii then
           begin
-            if not NextTok(Line, P, Tok) or not ParseF(Tok, X) then
+            if not ReadAsciiFloat(B, Pos, ASize, Num) then
               Exit;
-            Num := X;
           end
           else if not ReadPlyNum(B, Pos, ASize, AE.Props[PI].ValTy, Big, Num) then
             Exit;
-          if (AE.Props[PI].Slot = slList) and (LI < UseN) then
+          if (StoreN > 0) and (LI < StoreN) then
           begin
             if (Num < 0) or (Num > MaxInt) then
               AIdx[LI] := -1
@@ -1251,6 +1354,81 @@ var
     Result := slSkip;
   end;
 
+  function FaceBlock(const AName: string): Boolean;
+  var
+    N: string;
+  begin
+    N := LowerCase(AName);
+    Result := (N = 'face') or (N = 'faces') or (N = 'polygon') or
+      (N = 'polygons') or (N = 'triangle') or (N = 'triangles') or
+      (N = 'tristrip') or (N = 'tristrips') or (N = 'tri_strip') or
+      (N = 'tri_strips');
+  end;
+
+  { Індекс грані: спершу в блок vertex перед цим face, інакше наскрізь по всіх блоках. }
+  function MapVert(AOwner, ARaw: Integer): Integer;
+  var
+    EI: Integer;
+    Src: Int64;
+  begin
+    Result := -1;
+    if ARaw < 0 then
+      Exit;
+    if (AOwner >= 0) and (Int64(ARaw) < Elems[AOwner].Count) then
+    begin
+      if Int64(ARaw) < Elems[AOwner].KeepN then
+        Result := Elems[AOwner].Origin + ARaw;
+      if (Result < Elems[AOwner].Origin) or
+         (Result >= Elems[AOwner].Origin + Elems[AOwner].Stored) then
+        Result := -1;
+      Exit;
+    end;
+    Src := ARaw;
+    for EI := 0 to EC - 1 do
+      if Elems[EI].IsVert then
+      begin
+        if Src < Elems[EI].Count then
+        begin
+          if Src < Elems[EI].KeepN then
+          begin
+            Result := Elems[EI].Origin + Integer(Src);
+            if (Result < Elems[EI].Origin) or
+               (Result >= Elems[EI].Origin + Elems[EI].Stored) then
+              Result := -1;
+          end;
+          Exit;
+        end;
+        Dec(Src, Elems[EI].Count);
+      end;
+  end;
+
+  procedure EmitTri(IA, IB, IC: Integer; ANorm: Boolean);
+  begin
+    if (IA < 0) or (IB < 0) or (IC < 0) or (IA >= VC) or (IB >= VC) or (IC >= VC) then
+      Exit;
+    if TC >= Keep then
+    begin
+      AMesh.Info.Simplified := True;
+      Exit;
+    end;
+    NX := 0;
+    NY := 0;
+    NZ := 0;
+    if ANorm then
+    begin
+      NX := (AMesh.Verts[IA].Nx + AMesh.Verts[IB].Nx + AMesh.Verts[IC].Nx) / 3;
+      NY := (AMesh.Verts[IA].Ny + AMesh.Verts[IB].Ny + AMesh.Verts[IC].Ny) / 3;
+      NZ := (AMesh.Verts[IA].Nz + AMesh.Verts[IB].Nz + AMesh.Verts[IC].Nz) / 3;
+      if (NX * NX + NY * NY + NZ * NZ) < 1E-12 then
+      begin
+        NX := 0;
+        NY := 0;
+        NZ := 0;
+      end;
+    end;
+    PushTri(AMesh.Tris, TC, MakeTri(IA, IB, IC, NX, NY, NZ, 0));
+  end;
+
 begin
   AMesh.Info.Kind := mkPly;
   AMesh.Info.Error := meBad;
@@ -1262,8 +1440,6 @@ begin
   SawPly := False;
   SawEnd := False;
   EC := 0;
-  VertEl := -1;
-  FaceEl := -1;
   SetLength(Elems, 0);
   while ReadLine(B, ASize, Pos, Line) do
   begin
@@ -1298,11 +1474,7 @@ begin
         Exit;
       if not TryStrToInt64(Tok, FullV) or (FullV < 0) then
         Exit;
-      I := AddElem(Name, FullV);
-      if SameText(Name, 'vertex') and (VertEl < 0) then
-        VertEl := I
-      else if SameText(Name, 'face') and (FaceEl < 0) then
-        FaceEl := I;
+      AddElem(Name, FullV);
     end
     else if TokEq(Tok, 'property') then
     begin
@@ -1346,60 +1518,76 @@ begin
       Break;
     end;
   end;
-  if not SawPly or not SawEnd or (Fmt = 0) or (VertEl < 0) then
+  if not SawPly or not SawEnd or (Fmt = 0) or (EC = 0) then
     Exit;
-  IX := -1;
-  IY := -1;
-  IZ := -1;
-  INX := -1;
-  INY := -1;
-  INZ := -1;
-  IR := -1;
-  IG := -1;
-  IB := -1;
-  for I := 0 to High(Elems[VertEl].Props) do
-    case Elems[VertEl].Props[I].Slot of
-      slX: IX := I;
-      slY: IY := I;
-      slZ: IZ := I;
-      slNx: INX := I;
-      slNy: INY := I;
-      slNz: INZ := I;
-      slR: IR := I;
-      slG: IG := I;
-      slB: IB := I;
-    end;
-  if (IX < 0) or (IY < 0) or (IZ < 0) then
-    Exit;
-  if not (Elems[VertEl].Props[IX].ValTy in [pyF32, pyF64]) or
-     not (Elems[VertEl].Props[IY].ValTy in [pyF32, pyF64]) or
-     not (Elems[VertEl].Props[IZ].ValTy in [pyF32, pyF64]) then
-    Exit;
-  HasNorm := (INX >= 0) and (INY >= 0) and (INZ >= 0);
-  HasColor := (IR >= 0) and (IG >= 0) and (IB >= 0);
+  LastV := -1;
+  FullV := 0;
   HasFace := False;
-  if FaceEl >= 0 then
-    for I := 0 to High(Elems[FaceEl].Props) do
-      if Elems[FaceEl].Props[I].Slot = slList then
-        HasFace := True;
-  if Elems[VertEl].Count <= 0 then
+  HasColor := False;
+  VertAny := False;
+  for E := 0 to EC - 1 do
+  begin
+    for I := 0 to High(Elems[E].Props) do
+      case Elems[E].Props[I].Slot of
+        slX: Elems[E].IX := I;
+        slY: Elems[E].IY := I;
+        slZ: Elems[E].IZ := I;
+        slNx: Elems[E].INX := I;
+        slNy: Elems[E].INY := I;
+        slNz: Elems[E].INZ := I;
+        slR: Elems[E].IR := I;
+        slG: Elems[E].IG := I;
+        slB: Elems[E].IB := I;
+        slList: Elems[E].IsFace := True;
+      end;
+    if (not Elems[E].IsFace) and FaceBlock(Elems[E].Name) then
+      for I := 0 to High(Elems[E].Props) do
+        if Elems[E].Props[I].List then
+        begin
+          Elems[E].Props[I].Slot := slList;
+          Elems[E].IsFace := True;
+          Break;
+        end;
+    Elems[E].IsVert := (Elems[E].IX >= 0) and (Elems[E].IY >= 0) and
+      (Elems[E].IZ >= 0) and not Elems[E].IsFace;
+    if Elems[E].IsVert and
+       (not (Elems[E].Props[Elems[E].IX].ValTy in [pyF32, pyF64]) or
+        not (Elems[E].Props[Elems[E].IY].ValTy in [pyF32, pyF64]) or
+        not (Elems[E].Props[Elems[E].IZ].ValTy in [pyF32, pyF64])) then
+      Elems[E].IsVert := False;
+    if Elems[E].IsVert then
+    begin
+      VertAny := True;
+      FullV := FullV + Elems[E].Count;
+      Elems[E].HasNorm := (Elems[E].INX >= 0) and (Elems[E].INY >= 0) and
+        (Elems[E].INZ >= 0);
+      Elems[E].HasColor := (Elems[E].IR >= 0) and (Elems[E].IG >= 0) and
+        (Elems[E].IB >= 0);
+      if Elems[E].HasColor then
+        HasColor := True;
+    end;
+    if Elems[E].IsFace then
+    begin
+      HasFace := True;
+      if System.Pos('strip', LowerCase(Elems[E].Name)) > 0 then
+        Elems[E].IsStrip := True;
+      Elems[E].Owner := LastV;
+    end;
+    if Elems[E].IsVert then
+      LastV := E;
+  end;
+  if not VertAny or (FullV < 0) then
+    Exit;
+  if FullV = 0 then
   begin
     AMesh.Info.Error := meEmpty;
     Exit;
   end;
-  FullV := Elems[VertEl].Count;
   AMesh.Info.Vertices := FullV;
   AMesh.HasVertColor := HasColor;
   Ascii := Fmt = 1;
   Keep := KeepCap(ALim);
   Timed := False;
-  if HasFace and (FullV > ALim.MaxVerts) then
-  begin
-    KeepV := ALim.MaxVerts;
-    AMesh.Info.Simplified := True;
-  end
-  else
-    KeepV := FullV;
   if (not HasFace) and (FullV > ALim.MaxVerts) then
   begin
     VStep := CeilDiv(FullV, ALim.MaxVerts);
@@ -1407,10 +1595,46 @@ begin
   end
   else
     VStep := 1;
+  if HasFace and (FullV > ALim.MaxVerts) then
+  begin
+    AMesh.Info.Simplified := True;
+    Part := ALim.MaxVerts;
+    if Part < 1 then
+      Part := 1;
+    for E := 0 to EC - 1 do
+      if Elems[E].IsVert then
+      begin
+        if Elems[E].Count <= 0 then
+          Elems[E].KeepN := 0
+        else
+        begin
+          Elems[E].KeepN := Elems[E].Count * Part div FullV;
+          if Elems[E].KeepN < 1 then
+            Elems[E].KeepN := 1;
+          if Elems[E].KeepN > Elems[E].Count then
+            Elems[E].KeepN := Elems[E].Count;
+        end;
+      end;
+  end
+  else
+    for E := 0 to EC - 1 do
+      if Elems[E].IsVert then
+        Elems[E].KeepN := Elems[E].Count;
+  FaceN := 0;
+  for E := 0 to EC - 1 do
+    if Elems[E].IsFace then
+      FaceN := FaceN + Elems[E].Count;
+  if HasFace and (FaceN > Keep) then
+  begin
+    FStep := CeilDiv(FaceN, Keep);
+    AMesh.Info.Simplified := True;
+  end
+  else
+    FStep := 1;
   VC := 0;
   TC := 0;
   FullT := 0;
-  StoredV := 0;
+  Serial := 0;
   for E := 0 to EC - 1 do
   begin
     if Length(Elems[E].Props) = 0 then
@@ -1418,14 +1642,12 @@ begin
     N64 := Elems[E].Count;
     if N64 > ASize then
       N64 := ASize;
-    if (E = FaceEl) and HasFace and (N64 > Keep) then
-    begin
-      FStep := CeilDiv(N64, Keep);
-      AMesh.Info.Simplified := True;
-    end
-    else
-      FStep := 1;
-    Serial := 0;
+    Got := 0;
+    if Elems[E].IsVert then
+      Elems[E].Origin := VC;
+    NormOn := False;
+    if Elems[E].Owner >= 0 then
+      NormOn := Elems[Elems[E].Owner].HasNorm;
     for VI := 0 to N64 - 1 do
     begin
       if (VI and 4095) = 0 then
@@ -1438,6 +1660,7 @@ begin
         if AClock.ElapsedMilliseconds >= ALim.MaxMs then
         begin
           AMesh.Info.Simplified := True;
+          AMesh.Incomplete := True;
           Timed := True;
           Break;
         end;
@@ -1447,22 +1670,22 @@ begin
         AMesh.Info.Error := meBad;
         Exit;
       end;
-      if E = VertEl then
+      if Elems[E].IsVert then
       begin
         if HasFace then
-          Take := VI < KeepV
+          Take := VI < Elems[E].KeepN
         else
           Take := (VStep <= 1) or ((VI mod VStep) = 0);
         if Take then
         begin
-          X := Vals[IX];
-          Y := Vals[IY];
-          Z := Vals[IZ];
-          if HasNorm then
+          X := Vals[Elems[E].IX];
+          Y := Vals[Elems[E].IY];
+          Z := Vals[Elems[E].IZ];
+          if Elems[E].HasNorm then
           begin
-            NX := Vals[INX];
-            NY := Vals[INY];
-            NZ := Vals[INZ];
+            NX := Vals[Elems[E].INX];
+            NY := Vals[Elems[E].INY];
+            NZ := Vals[Elems[E].INZ];
           end
           else
           begin
@@ -1470,66 +1693,95 @@ begin
             NY := 0;
             NZ := 0;
           end;
-          if HasColor then
+          if Elems[E].HasColor then
           begin
-            CR := ColByteOf(Vals[IR], Elems[VertEl].Props[IR].FloatVal);
-            CG := ColByteOf(Vals[IG], Elems[VertEl].Props[IG].FloatVal);
-            CB := ColByteOf(Vals[IB], Elems[VertEl].Props[IB].FloatVal);
+            CR := ColByteOf(Vals[Elems[E].IR], Elems[E].Props[Elems[E].IR].FloatVal);
+            CG := ColByteOf(Vals[Elems[E].IG], Elems[E].Props[Elems[E].IG].FloatVal);
+            CB := ColByteOf(Vals[Elems[E].IB], Elems[E].Props[Elems[E].IB].FloatVal);
             Col := $01000000 or (Cardinal(CR) shl 16) or (Cardinal(CG) shl 8) or CB;
           end
           else
             Col := 0;
           PushVert(AMesh.Verts, VC, MakeVert(X, Y, Z, NX, NY, NZ, Col));
+          Inc(Got);
         end;
       end
-      else if (E = FaceEl) and HasFace then
+      else if Elems[E].IsFace then
       begin
         UseN := ListN;
-        if UseN > 16 then
-          UseN := 16;
-        if (UseN >= 3) and ((FStep <= 1) or ((Serial mod FStep) = 0)) then
+        if UseN > Length(Idx) then
         begin
-          for Fan := 1 to UseN - 2 do
+          UseN := Length(Idx);
+          if ListN > UseN then
+            AMesh.Info.Simplified := True;
+        end;
+        if UseN >= 3 then
+        begin
+          if (FStep > 1) and ((Serial mod FStep) <> 0) then
+            Inc(FullT, UseN - 2)
+          else if Elems[E].IsStrip then
           begin
-            if (Idx[0] < 0) or (Idx[Fan] < 0) or (Idx[Fan + 1] < 0) or
-               (Idx[0] >= StoredV) or (Idx[Fan] >= StoredV) or
-               (Idx[Fan + 1] >= StoredV) then
-              Continue;
-            Inc(FullT);
-            if TC >= Keep then
+            SA := 0;
+            SB := 0;
+            SN := 0;
+            ST := 0;
+            SStep := 1;
+            if Int64(UseN) - 2 > Keep then
             begin
+              SStep := CeilDiv(Int64(UseN) - 2, Keep);
               AMesh.Info.Simplified := True;
-              Continue;
             end;
-            NX := 0;
-            NY := 0;
-            NZ := 0;
-            if HasNorm then
+            for K := 0 to UseN - 1 do
             begin
-              NX := (AMesh.Verts[Idx[0]].Nx + AMesh.Verts[Idx[Fan]].Nx +
-                AMesh.Verts[Idx[Fan + 1]].Nx) / 3;
-              NY := (AMesh.Verts[Idx[0]].Ny + AMesh.Verts[Idx[Fan]].Ny +
-                AMesh.Verts[Idx[Fan + 1]].Ny) / 3;
-              NZ := (AMesh.Verts[Idx[0]].Nz + AMesh.Verts[Idx[Fan]].Nz +
-                AMesh.Verts[Idx[Fan + 1]].Nz) / 3;
-              if (NX * NX + NY * NY + NZ * NZ) < 1E-12 then
+              if Idx[K] < 0 then
               begin
-                NX := 0;
-                NY := 0;
-                NZ := 0;
+                SN := 0;
+                Continue;
+              end;
+              if SN = 0 then
+              begin
+                SA := MapVert(Elems[E].Owner, Idx[K]);
+                SN := 1;
+              end
+              else if SN = 1 then
+              begin
+                SB := MapVert(Elems[E].Owner, Idx[K]);
+                SN := 2;
+              end
+              else
+              begin
+                SC := MapVert(Elems[E].Owner, Idx[K]);
+                Inc(FullT);
+                if (SStep <= 1) or ((ST mod SStep) = 0) then
+                begin
+                  if (SN and 1) = 0 then
+                    EmitTri(SA, SB, SC, NormOn)
+                  else
+                    EmitTri(SB, SA, SC, NormOn);
+                end;
+                SA := SB;
+                SB := SC;
+                Inc(SN);
+                Inc(ST);
               end;
             end;
-            PushTri(AMesh.Tris, TC, MakeTri(Idx[0], Idx[Fan], Idx[Fan + 1],
-              NX, NY, NZ, 0));
+          end
+          else
+          begin
+            SA := MapVert(Elems[E].Owner, Idx[0]);
+            for Fan := 1 to UseN - 2 do
+            begin
+              Inc(FullT);
+              EmitTri(SA, MapVert(Elems[E].Owner, Idx[Fan]),
+                MapVert(Elems[E].Owner, Idx[Fan + 1]), NormOn);
+            end;
           end;
-        end
-        else if UseN >= 3 then
-          Inc(FullT, UseN - 2);
+        end;
         Inc(Serial);
       end;
     end;
-    if E = VertEl then
-      StoredV := VC;
+    if Elems[E].IsVert then
+      Elems[E].Stored := Got;
     if Timed then
       Break;
   end;
@@ -1725,19 +1977,24 @@ type
     N: Integer;
     Ok: Boolean;
   end;
+  THit = record
+    Mesh: Integer;
+    Xform: TMat4;
+  end;
 var
   Root: TJSONObject;
   Parsed: TJSONValue;
   Scenes, Nodes, Meshes, Accessors, Views, Buffers, Materials, Roots: TJSONArray;
   Foreign, BadAcc, Found, Stop: Boolean;
   Bin: TBytes;
-  BinN, JsonAt, JsonN, I, K, MeshIx, Keep, Step, VC, TC: Integer;
+  BinN, JsonAt, JsonN, I, K, HitN, Keep, Step, VC, TC: Integer;
   SceneIx, CLen, CType, Cursor: Integer;
   Xform: TMat4;
   FullV, FullT, Serial: Int64;
   Dir: string;
   Bufs: TArray<TBuf>;
-  Seen: TArray<Boolean>;
+  Hits: TArray<THit>;
+  Seen, ChildOf: TArray<Boolean>;
 
   function TakeObject(V: TJSONValue): TJSONObject;
   begin
@@ -2110,9 +2367,7 @@ var
       if Prim = nil then
         Continue;
       Attr := JObj(Prim.GetValue('attributes'));
-      if (Attr = nil) or (Attr.GetValue('JOINTS_0') <> nil) then
-        Continue;
-      if Attr.GetValue('POSITION') <> nil then
+      if (Attr <> nil) and (Attr.GetValue('POSITION') <> nil) then
         Exit(True);
     end;
   end;
@@ -2129,6 +2384,19 @@ var
     end;
   end;
 
+  procedure AddHit(AMesh: Integer; const AWorld: TMat4);
+  begin
+    if (Meshes = nil) or (AMesh < 0) or (AMesh >= Meshes.Count) or
+       not MeshDrawable(AMesh) then
+      Exit;
+    if HitN >= Length(Hits) then
+      SetLength(Hits, HitN + 16);
+    Hits[HitN].Mesh := AMesh;
+    Hits[HitN].Xform := AWorld;
+    Inc(HitN);
+  end;
+
+  { Кожен вузол сцени зі своєю сіткою. Перший меш більше не замінює решту. }
   procedure Walk(NodeIx: Integer; const Parent: TMat4);
   var
     Node: TJSONObject;
@@ -2136,7 +2404,7 @@ var
     Kids: TJSONArray;
     CI, MeshN, Child: Integer;
   begin
-    if Found or Stop or (NodeIx < 0) or (Nodes = nil) or (NodeIx >= Nodes.Count) then
+    if Stop or (NodeIx < 0) or (Nodes = nil) or (NodeIx >= Nodes.Count) then
       Exit;
     if (NodeIx <= High(Seen)) and Seen[NodeIx] then
       Exit;
@@ -2147,14 +2415,8 @@ var
       Exit;
     Local := NodeMat(Node);
     World := MatMul(Parent, Local);
-    if (Node.GetValue('skin') = nil) and JInt(Node.GetValue('mesh'), MeshN) and
-       MeshDrawable(MeshN) then
-    begin
-      Found := True;
-      MeshIx := MeshN;
-      Xform := World;
-      Exit;
-    end;
+    if (Node.GetValue('skin') = nil) and JInt(Node.GetValue('mesh'), MeshN) then
+      AddHit(MeshN, World);
     Kids := JArr(Node.GetValue('children'));
     if Kids = nil then
       Exit;
@@ -2236,8 +2498,7 @@ var
     Attr := JObj(Prim.GetValue('attributes'));
     if Attr = nil then
       Exit;
-    if Attr.GetValue('JOINTS_0') <> nil then
-      Exit;
+    { JOINTS_0 у Blender часто висит на неподвижной сетке. Берём вершины как есть. }
     Mode := 4;
     JInt(Prim.GetValue('mode'), Mode);
     if (Mode <> 4) and (Mode <> 5) and (Mode <> 6) then
@@ -2300,6 +2561,7 @@ var
           if AClock.ElapsedMilliseconds >= ALim.MaxMs then
           begin
             AMesh.Info.Simplified := True;
+            AMesh.Incomplete := True;
             Stop := True;
             Exit;
           end;
@@ -2327,6 +2589,7 @@ var
           if AClock.ElapsedMilliseconds >= ALim.MaxMs then
           begin
             AMesh.Info.Simplified := True;
+            AMesh.Incomplete := True;
             Stop := True;
             Exit;
           end;
@@ -2359,15 +2622,15 @@ var
     end;
   end;
 
-  procedure ReadMesh(AStore: Boolean);
+  procedure ReadMesh(AIx: Integer; AStore: Boolean);
   var
     Mesh, Prim: TJSONObject;
     Prims: TJSONArray;
     P: Integer;
   begin
-    if (Meshes = nil) or (MeshIx < 0) or (MeshIx >= Meshes.Count) then
+    if (Meshes = nil) or (AIx < 0) or (AIx >= Meshes.Count) then
       Exit;
-    Mesh := JObj(Meshes.Items[MeshIx]);
+    Mesh := JObj(Meshes.Items[AIx]);
     if Mesh = nil then
       Exit;
     Prims := JArr(Mesh.GetValue('primitives'));
@@ -2382,15 +2645,42 @@ var
     end;
   end;
 
+  procedure AddLooseNodes;
+  var
+    NI, CI, Child: Integer;
+    Node: TJSONObject;
+    Kids: TJSONArray;
+  begin
+    if (Nodes = nil) or (Nodes.Count = 0) then
+      Exit;
+    SetLength(Seen, Nodes.Count);
+    SetLength(ChildOf, Nodes.Count);
+    for NI := 0 to Nodes.Count - 1 do
+    begin
+      Node := JObj(Nodes.Items[NI]);
+      if Node = nil then
+        Continue;
+      Kids := JArr(Node.GetValue('children'));
+      if Kids = nil then
+        Continue;
+      for CI := 0 to Kids.Count - 1 do
+        if JInt(Kids.Items[CI], Child) and (Child >= 0) and (Child < Nodes.Count) then
+          ChildOf[Child] := True;
+    end;
+    for NI := 0 to Nodes.Count - 1 do
+      if not ChildOf[NI] then
+        Walk(NI, MatIdent);
+  end;
+
 begin
   AMesh.Info.Kind := AKind;
   AMesh.Info.Error := meBad;
   Root := nil;
   Foreign := False;
   BadAcc := False;
-  Found := False;
   Stop := False;
-  MeshIx := -1;
+  HitN := 0;
+  SetLength(Hits, 0);
   Xform := MatIdent;
   FullV := 0;
   FullT := 0;
@@ -2471,19 +2761,15 @@ begin
         if Roots <> nil then
           for I := 0 to Roots.Count - 1 do
             if JInt(Roots.Items[I], K) then
-            begin
               Walk(K, MatIdent);
-              if Found then
-                Break;
-            end;
       end;
     end
-    else if (Meshes <> nil) and (Meshes.Count > 0) and MeshDrawable(0) then
-    begin
-      Found := True;
-      MeshIx := 0;
-      Xform := MatIdent;
-    end;
+    else if (Nodes <> nil) and (Nodes.Count > 0) then
+      AddLooseNodes;
+    if (HitN = 0) and (Meshes <> nil) then
+      for I := 0 to Meshes.Count - 1 do
+        AddHit(I, MatIdent);
+    Found := (HitN > 0);
     if not Found then
     begin
       if Foreign then
@@ -2492,10 +2778,22 @@ begin
         AMesh.Info.Error := meEmpty;
       Exit;
     end;
-    ReadMesh(False);
+    for I := 0 to HitN - 1 do
+    begin
+      Xform := Hits[I].Xform;
+      ReadMesh(Hits[I].Mesh, False);
+    end;
     if AMesh.Cancelled then
       Exit;
     Keep := KeepCap(ALim);
+    { Растр не встигає мільйон трикутників підряд. Крок по всій сцені лишає і хвіст файлу. }
+    if ALim.MaxMs <= TILE_MS then
+    begin
+      if Keep > 180000 then
+        Keep := 180000;
+    end
+    else if Keep > 320000 then
+      Keep := 320000;
     Step := 1;
     if FullT > Keep then
     begin
@@ -2507,7 +2805,13 @@ begin
     Serial := 0;
     VC := 0;
     TC := 0;
-    ReadMesh(True);
+    for I := 0 to HitN - 1 do
+    begin
+      if Stop or AMesh.Cancelled then
+        Break;
+      Xform := Hits[I].Xform;
+      ReadMesh(Hits[I].Mesh, True);
+    end;
     if AMesh.Cancelled then
       Exit;
     SetLength(AMesh.Verts, VC);
@@ -2733,13 +3037,16 @@ var
   I: Integer;
   Y, NY: Single;
 begin
-  { Blender і CAD пишуть STL із Z вгору. OBJ і glTF тут із Y вгору.
+  { Blender і CAD пишуть STL, PLY і 3MF із Z вгору. OBJ і glTF тут із Y вгору.
     (x, y, z) -> (x, z, -y): це поворот, обхід граней не змінюється. }
   for I := 0 to High(AMesh.Verts) do
   begin
     Y := AMesh.Verts[I].Y;
     AMesh.Verts[I].Y := AMesh.Verts[I].Z;
     AMesh.Verts[I].Z := -Y;
+    NY := AMesh.Verts[I].Ny;
+    AMesh.Verts[I].Ny := AMesh.Verts[I].Nz;
+    AMesh.Verts[I].Nz := -NY;
   end;
   for I := 0 to High(AMesh.Tris) do
   begin
@@ -2771,27 +3078,34 @@ begin
   else
     AMesh.Info.Error := meBad;
   end;
-  if (AKind = mkStl) and (AMesh.Info.Error = meNone) and not AMesh.Cancelled then
+  if ((AKind = mkStl) or (AKind = mkPly)) and (AMesh.Info.Error = meNone) and
+     not AMesh.Cancelled then
     StlToYUp(AMesh);
 end;
 
 procedure BuildCamera(const ACam: TMeshCamera; out ARight, AUp, AEye: TVec3);
 var
-  Az, El, Cx, Cy, Cz: Single;
-  Forward, WorldUp: TVec3;
+  Az, El, Sa, Ca, Se, Ce: Single;
 begin
+  { Поворотний столик. Right — дотична по азимуту, вона лишається одиничною
+    і на полюсі. Підміна світової осі Y на Z біля ±90° перевертала кадр
+    стрибком і глушила поворот у вигляді зверху і знизу. }
   Az := ACam.Azimuth * Pi / 180;
-  El := ACam.Elevation * Pi / 180;
-  Cx := Cos(El) * Sin(Az);
-  Cy := Sin(El);
-  Cz := Cos(El) * Cos(Az);
-  AEye := VNorm(V3(Cx, Cy, Cz));
-  Forward := V3(-AEye.X, -AEye.Y, -AEye.Z);
-  WorldUp := V3(0, 1, 0);
-  if Abs(VDot(Forward, WorldUp)) > 0.98 then
-    WorldUp := V3(0, 0, 1);
-  ARight := VNorm(VCross(Forward, WorldUp));
-  AUp := VNorm(VCross(AEye, ARight));
+  El := ACam.Elevation;
+  if El > 90 then
+    El := 90
+  else if El < -90 then
+    El := -90;
+  El := El * Pi / 180;
+  Sa := Sin(Az);
+  Ca := Cos(Az);
+  Se := Sin(El);
+  Ce := Cos(El);
+  if Ce < 0 then
+    Ce := 0;
+  AEye := VNorm(V3(Ce * Sa, Se, Ce * Ca));
+  ARight := V3(Ca, 0, -Sa);
+  AUp := VNorm(V3(-Se * Sa, Ce, -Se * Ca));
 end;
 
 function ShadeOf(const ANorm: TVec3; const ALight: TVec3): Single;
@@ -2852,8 +3166,8 @@ var
   CR, CG, CB: Byte;
   Data: TBitmapData;
   Row: PCardinal;
-  Edges: Boolean;
-  TriN: Integer;
+  Edges, StopDraw: Boolean;
+  TriN, DrawStep, Phase, DrawBudget, Tick: Integer;
 
   procedure Plot(AX, AY: Integer; AZ: Single; ACol: Cardinal);
   var
@@ -2980,15 +3294,43 @@ begin
   end;
   TriN := Length(AMesh.Tris);
   Edges := (TriN > 0) and (TriN < 400);
-  for I := 0 to TriN - 1 do
+  { Перший прохід кроком по всьому списку. Обрив по часу тоді не зрізає другий об'єкт. }
+  DrawBudget := Integer(AMaxMs) * 32;
+  if DrawBudget < 40000 then
+    DrawBudget := 40000;
+  if Int64(W) * H < 200000 then
+    DrawBudget := (DrawBudget * 3) div 2
+  else if Int64(W) * H > 900000 then
+    DrawBudget := DrawBudget div 2;
+  if DrawBudget > 140000 then
+    DrawBudget := 140000;
+  DrawStep := 1;
+  if TriN > DrawBudget then
+    DrawStep := (TriN + DrawBudget - 1) div DrawBudget;
+  if DrawStep < 1 then
+    DrawStep := 1;
+  Phase := 0;
+  StopDraw := False;
+  while (Phase < DrawStep) and not StopDraw do
   begin
-    if (I and 2047) = 0 then
+    I := Phase - DrawStep;
+    Tick := 0;
+    while True do
     begin
-      if Assigned(ACancel) and ACancel() then
-        Exit;
-      if AClock.ElapsedMilliseconds >= AMaxMs then
+      Inc(I, DrawStep);
+      if I >= TriN then
         Break;
-    end;
+      if (Tick and 2047) = 0 then
+      begin
+        if Assigned(ACancel) and ACancel() then
+          Exit;
+        if AClock.ElapsedMilliseconds >= AMaxMs then
+        begin
+          StopDraw := True;
+          Break;
+        end;
+      end;
+      Inc(Tick);
     if (AMesh.Tris[I].A < 0) or (AMesh.Tris[I].B < 0) or (AMesh.Tris[I].C < 0) or
        (AMesh.Tris[I].A > High(AMesh.Verts)) or
        (AMesh.Tris[I].B > High(AMesh.Verts)) or
@@ -3081,6 +3423,8 @@ begin
         Plot(X, Y, Z, Col);
       end;
     end;
+    end;
+    Inc(Phase);
   end;
   if (TriN = 0) and (Length(AMesh.Verts) > 0) and
      not (Assigned(ACancel) and ACancel()) then
@@ -3241,6 +3585,229 @@ begin
   end;
 end;
 
+function DecodePngPic(const APng: TBytes; out APic: TBytes; out AW, AH: Integer): Boolean;
+var
+  Src: TBitmap;
+  MS: TBytesStream;
+  Data: TBitmapData;
+  SW, SH, X, Y, SX, SY, Dest: Integer;
+  C: TAlphaColor;
+  Rec: TAlphaColorRec;
+begin
+  Result := False;
+  AW := 0;
+  AH := 0;
+  SetLength(APic, 0);
+  if Length(APng) < 8 then
+    Exit;
+  if not (((APng[0] = $89) and (APng[1] = Ord('P')) and (APng[2] = Ord('N')) and
+       (APng[3] = Ord('G'))) or
+     ((APng[0] = $FF) and (APng[1] = $D8) and (APng[2] = $FF))) then
+    Exit;
+  MS := TBytesStream.Create(APng);
+  Src := TBitmap.Create;
+  try
+    try
+      MS.Position := 0;
+      Src.LoadFromStream(MS);
+    except
+      Exit;
+    end;
+    if (Src.Width < 1) or (Src.Height < 1) then
+      Exit;
+    SW := Src.Width;
+    SH := Src.Height;
+    AW := SW;
+    AH := SH;
+    if AW > 1024 then
+    begin
+      AH := Max(1, Round(AH * (1024 / AW)));
+      AW := 1024;
+    end;
+    if AH > 1024 then
+    begin
+      AW := Max(1, Round(AW * (1024 / AH)));
+      AH := 1024;
+    end;
+    if not Src.Map(TMapAccess.Read, Data) then
+      Exit;
+    try
+      SetLength(APic, AW * AH * 4);
+      for Y := 0 to AH - 1 do
+      begin
+        if AH = SH then
+          SY := Y
+        else
+        begin
+          SY := (Y * SH) div AH;
+          if SY >= SH then
+            SY := SH - 1;
+        end;
+        for X := 0 to AW - 1 do
+        begin
+          if AW = SW then
+            SX := X
+          else
+          begin
+            SX := (X * SW) div AW;
+            if SX >= SW then
+              SX := SW - 1;
+          end;
+          C := Data.GetPixel(SX, SY);
+          Rec := TAlphaColorRec(C);
+          { RasterPicture читає буфер знизу вгору. }
+          Dest := ((AH - 1 - Y) * AW + X) * 4;
+          APic[Dest] := Rec.R;
+          APic[Dest + 1] := Rec.G;
+          APic[Dest + 2] := Rec.B;
+          APic[Dest + 3] := Rec.A;
+        end;
+      end;
+    finally
+      Src.Unmap(Data);
+    end;
+    Result := True;
+  finally
+    Src.Free;
+    MS.Free;
+  end;
+end;
+
+function Build3mf(const APath: string; ATile: Boolean; const ALim: TMeshLimits;
+  const ACancel: TMeshCancel; out AInfo: TMeshInfo): TMeshData;
+var
+  Size: Int64;
+  Age: TDateTime;
+  Model: T3mfModel;
+  I: Integer;
+  UsePic: Boolean;
+
+  procedure TakeThumb;
+  begin
+    UsePic := Model.HasThumb and
+      DecodePngPic(Model.Thumb, Result.Pic, Result.PicW, Result.PicH);
+    if not UsePic then
+      Exit;
+    AInfo.Picture := True;
+    AInfo.PicW := Result.PicW;
+    AInfo.PicH := Result.PicH;
+    AInfo.Error := meNone;
+  end;
+
+begin
+  ClearInfo(AInfo);
+  Result.Info := AInfo;
+  Result.Cancelled := False;
+  Result.Incomplete := False;
+  Result.HasVertColor := False;
+  Result.PicW := 0;
+  Result.PicH := 0;
+  SetLength(Result.Pic, 0);
+  SetLength(Result.Verts, 0);
+  SetLength(Result.Tris, 0);
+  AInfo.Kind := mk3mf;
+  Size := 0;
+  Age := 0;
+  UsePic := False;
+  if (APath <> '') and TFile.Exists(APath) then
+  try
+    Size := TFile.GetSize(APath);
+    Age := TFile.GetLastWriteTime(APath);
+  except
+    Size := 0;
+    Age := 0;
+  end;
+  AInfo.Bytes := Size;
+  if CacheHit(APath, Age, Size, ALim, Result) then
+  begin
+    AInfo := Result.Info;
+    AInfo.Bytes := Size;
+    AInfo.Kind := mk3mf;
+    Exit;
+  end;
+  if ATile then
+  begin
+    Model := Read3mf(APath, False, ALim.MaxTris, ALim.MaxVerts, ALim.MaxMs,
+      function: Boolean
+      begin
+        Result := Assigned(ACancel) and ACancel();
+      end);
+    if (Model.Status = st3Ok) and Model.HasThumb then
+      TakeThumb;
+    if (Model.Status = st3Ok) and not UsePic then
+      Model := Read3mf(APath, True, ALim.MaxTris, ALim.MaxVerts, ALim.MaxMs,
+        function: Boolean
+        begin
+          Result := Assigned(ACancel) and ACancel();
+        end);
+  end
+  else
+    { Частина production може бути близько 200 МБ. Ліміт плитки тут обрізав би
+      розбір і лишав порожню сцену. Скасування при зміні файлу лишається. }
+    Model := Read3mf(APath, True, ALim.MaxTris, ALim.MaxVerts, 0,
+      function: Boolean
+      begin
+        Result := Assigned(ACancel) and ACancel();
+      end);
+  if Model.Cancelled or (Assigned(ACancel) and ACancel()) then
+  begin
+    Result.Cancelled := True;
+    AInfo.Error := meNone;
+    AInfo.Kind := mk3mf;
+    Result.Info := AInfo;
+    Exit;
+  end;
+  AInfo.UnitName := Model.UnitName;
+  AInfo.Objects := Model.Objects;
+  AInfo.Simplified := Model.Simplified;
+  Result.Incomplete := Model.Incomplete;
+  if Model.Status = st3TooBig then
+  begin
+    AInfo.TooBig := True;
+    AInfo.Error := meNone;
+    if AInfo.UnitName = '' then
+      AInfo.UnitName := 'millimeter';
+    TakeThumb;
+  end
+  else if UsePic then
+    AInfo.Error := meNone
+  else if (Model.Status = st3NotZip) or (Model.Status = st3NoModel) or
+          (Model.Status = st3Bad) then
+    AInfo.Error := meBad
+  else if Model.Status = st3Empty then
+  begin
+    AInfo.Error := meEmpty;
+    if AInfo.UnitName = '' then
+      AInfo.UnitName := 'millimeter';
+  end
+  else if Model.Status = st3Ok then
+  begin
+    SetLength(Result.Verts, Length(Model.Verts));
+    for I := 0 to High(Model.Verts) do
+      Result.Verts[I] := MakeVert(Model.Verts[I].X, Model.Verts[I].Y, Model.Verts[I].Z,
+        0, 0, 0, 0);
+    SetLength(Result.Tris, Length(Model.Tris));
+    for I := 0 to High(Model.Tris) do
+      Result.Tris[I] := MakeTri(Model.Tris[I].A, Model.Tris[I].B, Model.Tris[I].C,
+        0, 0, 0, Model.Tris[I].Col);
+    AInfo.Vertices := Length(Result.Verts);
+    AInfo.Triangles := Length(Result.Tris);
+    AInfo.Error := meNone;
+    if AInfo.UnitName = '' then
+      AInfo.UnitName := 'millimeter';
+    Result.Info := AInfo;
+    StlToYUp(Result);
+    NormalizeMesh(Result);
+  end
+  else
+    AInfo.Error := meBad;
+  AInfo.Kind := mk3mf;
+  AInfo.Bytes := Size;
+  Result.Info := AInfo;
+  if (AInfo.Error = meNone) and not Result.Cancelled and not Result.Incomplete then
+    CachePut(APath, Age, Size, ALim, Result);
+end;
+
 function BuildMesh(const APath: string; ATile: Boolean; const ACancel: TMeshCancel;
   out AInfo: TMeshInfo): TMeshData;
 var
@@ -3255,6 +3822,7 @@ begin
   ClearInfo(AInfo);
   Result.Info := AInfo;
   Result.Cancelled := False;
+  Result.Incomplete := False;
   Result.HasVertColor := False;
   Result.PicW := 0;
   Result.PicH := 0;
@@ -3265,6 +3833,13 @@ begin
   begin
     AInfo.Error := meBad;
     Result.Info := AInfo;
+    Exit;
+  end;
+  { 3MF — zip. Цілий архів не читаємо: інакше плитка відсіє файл більший за 64 МБ
+    ще до маленького thumbnail.png. }
+  if Kind = mk3mf then
+  begin
+    Result := Build3mf(APath, ATile, Lim, ACancel, AInfo);
     Exit;
   end;
   if not LoadBytes(APath, Lim.MaxBytes, Bytes, Size, Age, Err) then
@@ -3307,7 +3882,8 @@ begin
   end;
   if Result.Info.Error = meNone then
     NormalizeMesh(Result);
-  CachePut(APath, Age, Size, Lim, Result);
+  if not Result.Incomplete then
+    CachePut(APath, Age, Size, Lim, Result);
   AInfo := Result.Info;
 end;
 
@@ -3418,7 +3994,6 @@ begin
   else if Cam.Scale > 6 then
     Cam.Scale := 6;
   Lim := LimitsOf(ATile);
-  Clock := TStopwatch.StartNew;
   Mesh := BuildMesh(APath, ATile, ACancel, AInfo);
   if Mesh.Cancelled then
     Exit;
@@ -3431,6 +4006,8 @@ begin
       AInfo.Error := meBlend;
     Exit;
   end;
+  if AInfo.TooBig then
+    Exit;
   if (Length(Mesh.Tris) = 0) and (Length(Mesh.Verts) = 0) then
   begin
     if AInfo.Error = meNone then
@@ -3439,6 +4016,8 @@ begin
   end;
   if Assigned(ACancel) and ACancel() then
     Exit;
+  { Разбор и рисунок не делят один таймер: иначе первый кадр — обрубок, а поворот уже из кэша. }
+  Clock := TStopwatch.StartNew;
   RasterMesh(Mesh, AW, AH, Cam, ACancel, Clock, Lim.MaxMs, Result);
   if Result = nil then
   begin

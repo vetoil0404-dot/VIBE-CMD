@@ -28,6 +28,7 @@ uses
   uLangBind in 'uLangBind.pas',
   uFileOps in 'uFileOps.pas',
   uFileOpEngine in 'uFileOpEngine.pas',
+  uFileLock in 'uFileLock.pas',
   uFileOpProgressForm in 'uFileOpProgressForm.pas',
   uConflictDialog in 'uConflictDialog.pas',
   uFilePreview in 'uFilePreview.pas',
@@ -49,6 +50,7 @@ uses
   uPsdPreview in 'uPsdPreview.pas',
   uVecPreview in 'uVecPreview.pas',
   uDxfPreview in 'uDxfPreview.pas',
+  u3mf in 'u3mf.pas',
   uMeshPreview in 'uMeshPreview.pas',
   uHdrPreview in 'uHdrPreview.pas',
   uMpvPlayer in 'uMpvPlayer.pas',
@@ -56,15 +58,18 @@ uses
   uFolderSize in 'uFolderSize.pas',
   uPeInfo in 'uPeInfo.pas',
   uNetworkVfs in 'uNetworkVfs.pas',
-  uNetworkPanel in 'uNetworkPanel.pas';
+  uNetworkPanel in 'uNetworkPanel.pas',
+  uUpdate in 'uUpdate.pas';
 
 {$R *.res}
 
 begin
-  GlobalUseSkia := True;
   NoteAppStart;
   if TryActivateRunningInstance then
     Halt(0);
+  if not PrepareSkiaLibrary then
+    Halt(1);
+  GlobalUseSkia := True;
   ClearTcCloneTemp;
 {$IFDEF DEBUG}
   ReportMemoryLeaksOnShutdown := True;

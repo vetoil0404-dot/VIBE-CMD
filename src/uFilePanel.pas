@@ -83,6 +83,8 @@ type
     RefreshPending: Boolean;
     PendingSelect: string;
     PendingKeepSel: Boolean;
+    { Очередь чтения не должна подменять «не хранить выделение» на True. }
+    QueuedKeep: Boolean;
     PendingHoldScroll: Boolean;
     Offline: Boolean;
     WaitShared: Boolean;
@@ -433,6 +435,7 @@ type
     procedure BtnQuickViewClick(Sender: TObject);
     procedure PreviewCloseClick(Sender: TObject);
     procedure SyncPreviewList;
+    procedure ApplyPreviewChrome;
     procedure PreviewDiskChanged(Sender: TObject);
     procedure NotifyCursorChange;
     procedure BtnBackClick(Sender: TObject);
@@ -2106,6 +2109,15 @@ begin
         (not IsPreviewActive) and (I = FActiveTabIndex);
 end;
 
+procedure TFilePanel.ApplyPreviewChrome;
+begin
+  { Только пока колонка открыта. Соседнюю панель и детей хрому не трогаем:
+    диски и крошки остаются как их выставили свои настройки. }
+  if not Assigned(FChromeStack) or not IsPreviewActive then
+    Exit;
+  FChromeStack.Visible := not (Assigned(FSettings) and FSettings.PreviewFill);
+end;
+
 procedure TFilePanel.ShowPreview(const APath: string);
 begin
   if FPreview = nil then
@@ -2113,6 +2125,7 @@ begin
   FPreview.Visible := True;
   FPreview.BringToFront;
   SyncPreviewList;
+  ApplyPreviewChrome;
   FPreview.LoadFile(APath);
 end;
 
@@ -2122,6 +2135,8 @@ begin
     Exit;
   FPreview.ClearPreview;
   FPreview.Visible := False;
+  if Assigned(FChromeStack) then
+    FChromeStack.Visible := True;
   SyncPreviewList;
 end;
 
@@ -4397,10 +4412,12 @@ procedure TFilePanel.ScrollBoxResize(Sender: TObject);
 begin
   FColLayoutW := -1;
   RebuildContent;
-  { Ресайз от перестройки списка не должен тянуть курсор в кадр.
-    Окно пользователь меняет сам — тогда вид тоже оставляем где был. }
+  { Обновление каталога держит свой скролл. Смена размера окна — нет:
+    файл под курсором остаётся в кадре, как при зуме. }
   if FLockScroll then
-    RestoreScrollPosition;
+    RestoreScrollPosition
+  else
+    KeepFocusVisible;
   FThumbDirty := True;
   FThumbMoveTick := TThread.GetTickCount64;
   if Assigned(FThumbTimer) and not FDestroying then
@@ -6048,6 +6065,7 @@ begin
   Tab.RefreshPending := False;
   Tab.PendingSelect := '';
   Tab.PendingKeepSel := False;
+  Tab.QueuedKeep := False;
   Tab.Offline := False;
   Tab.Partial := False;
   Tab.AutoRetryUsed := False;
@@ -6861,6 +6879,10 @@ begin
     Tab := FTabs[I];
     if Assigned(Tab.Entries) then
       Tab.Entries.Clear;
+    { Номера группового выделения после смены списка помечали бы другие строки. }
+    if Assigned(Tab.SelectedIndices) then
+      Tab.SelectedIndices.Clear;
+    Tab.PendingKeepSel := False;
     Tab.Loaded := False;
     Tab.LoadSeen := 0;
     Tab.LoadSeenWatch := 0;
@@ -7068,9 +7090,10 @@ begin
     Tab := FTabs[I];
     if Tab.LoadQueued then
     begin
+      var KeepQ := Tab.QueuedKeep;
       Tab.LoadQueued := False;
       FTabs[I] := Tab;
-      StartDirLoadAt(I, Tab.Path, '', True);
+      StartDirLoadAt(I, Tab.Path, '', KeepQ);
       if ActiveLoadCount >= 3 then
         Exit;
     end;
@@ -7961,6 +7984,12 @@ begin
       if ASelectPath <> '' then
         Tab.PendingSelect := ASelectPath;
       Tab.PendingKeepSel := Tab.PendingKeepSel or AKeepSelection;
+      if IsRecycleBinPath(Path) and not AKeepSelection then
+      begin
+        Tab.PendingKeepSel := False;
+        if Assigned(Tab.SelectedIndices) then
+          Tab.SelectedIndices.Clear;
+      end;
       FTabs[ATabIndex] := Tab;
       Exit;
     end;
@@ -7973,6 +8002,10 @@ begin
     FKeepLiveNext := False;
     Tab.Loading := Remote or IsRecycleBinPath(Path);
     Tab.LoadQueued := True;
+    Tab.QueuedKeep := AKeepSelection;
+    if IsRecycleBinPath(Path) and not AKeepSelection and
+       Assigned(Tab.SelectedIndices) then
+      Tab.SelectedIndices.Clear;
     Tab.LoadError := '';
     Tab.Offline := False;
     FTabs[ATabIndex] := Tab;
@@ -8012,6 +8045,8 @@ begin
       Tab.Entries.Clear;
     Tab.Loaded := False;
     Tab.LoadSeen := 0;
+    if not KeepSel and Assigned(Tab.SelectedIndices) then
+      Tab.SelectedIndices.Clear;
     FTabs[ATabIndex] := Tab;
     if ATabIndex = FActiveTabIndex then
     begin
@@ -8085,6 +8120,13 @@ begin
               SortEntries(Cur.Entries, Cur.SortField, Cur.SortAsc);
           end;
           FTabs[TabIdx] := Cur;
+          if IsRecycleBinPath(Path) and not KeepSel then
+          begin
+            Cur := FTabs[TabIdx];
+            if Assigned(Cur.SelectedIndices) then
+              Cur.SelectedIndices.Clear;
+            FTabs[TabIdx] := Cur;
+          end;
           if (Remote or IsRecycleBinPath(Path)) and (TabIdx = FActiveTabIndex) then
           begin
             if IsRecycleBinPath(Path) and Assigned(Cur.Entries) then
@@ -11184,6 +11226,8 @@ begin
 
   if DriveHomeIsOpen and (NetChanged or DriveChanged) then
     RebuildDriveHomeList;
+
+  ApplyPreviewChrome;
 end;
 
 procedure TFilePanel.ApplyLanguage;
@@ -11483,6 +11527,9 @@ begin
       Visual := VisualFromActual(I);
       if Assigned(FSelectionManager) then
         FSelectionManager.CurrentIndex := Visual;
+      { Сначала в кадр, потом поле имени: сдвиг прокрутки закрывает переименование. }
+      KeepFocusVisible;
+      InvalidateView;
       BeginInlineRename(Visual);
       Break;
     end;
@@ -12427,6 +12474,9 @@ begin
       UpdateStatusText;
       RebuildContent;
     end;
+    { Сортировка по имени уводит переименованный файл из кадра. }
+    if AInfo.Kind = lokRename then
+      KeepFocusVisible;
     InvalidateView;
     if Assigned(FThumbTimer) and not FDestroying then
       FThumbTimer.Enabled := True;
