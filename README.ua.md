@@ -12,7 +12,9 @@
 
 **Публічна бета** — поточна збірка: 
 
-[**VibeCmdBeta.zip**](https://github.com/vetoil0404-dot/VIBE-CMD/raw/refs/heads/main/VibeCmdBeta.zip)
+[**VibeCmd-x86.zip**](https://github.com/vetoil0404-dot/VIBE-CMD/raw/refs/heads/main/VibeCmd-x86.zip)
+
+[**VibeCmd-x64.zip**](https://github.com/vetoil0404-dot/VIBE-CMD/raw/refs/heads/main/VibeCmd-x64.zip)
 
 Розпакуйте будь-де і запустіть `VibeCmd.exe`. Інсталятора немає. Налаштування лежать поруч із програмою у файлі `VibeSetting.ini`.
 
