@@ -100,6 +100,7 @@ type
     FForcedChoice: TConflictChoice;
     FDeferred: TList<TConflictItem>;
     FDeferredRoots: TStringList;
+    FArchiveBatched: Boolean;
     procedure NotifyItem(const APath: string; AStatus: TOpItemStatus);
     procedure SetPhase(APhase: TFileOpPhase; const AStatus: string);
     procedure Publish(const AFile: string; AFileDone, AFileTotal: Int64);
@@ -133,6 +134,7 @@ type
     function CoversDeferred(const APath: string): Boolean;
     procedure ApplyOneDeferred(const AIt: TConflictItem; AAct: TConflictAction);
     procedure ResolveDeferred;
+    procedure DeleteArchiveBatch;
     procedure Run;
   public
     OnConflict: TFileOpConflictProc;
@@ -216,7 +218,7 @@ implementation
 
 uses
   System.IOUtils, System.Math, System.StrUtils, System.DateUtils, uFileModel,
-  uArchiveEngine, uLang, uFileLock
+  uArchiveEngine, uLang, uFileLock, uAppSettings
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 var
@@ -964,18 +966,35 @@ end;
 
 procedure TFileOpEngine.DeleteDiskRoot(const ASrc: string);
 var
-  N: Integer;
+  N, I: Integer;
   Code: Cardinal;
   Err: string;
   Step: TDiskDeleteStep;
+  Fails: TArray<TDeleteFail>;
 begin
   N := CountFilesQuick(ASrc);
   if N <= 0 then
     N := 1;
   Code := 0;
   Err := '';
-  if TrySilentDiskDelete(ASrc, FPermanent, Code) then
+  SetLength(Fails, 0);
+  if TrySilentDiskDelete(ASrc, FPermanent, Code) or not DeleteTargetRemains(ASrc) then
     Step := ddsGone
+  else if (GetFileOpMode <> fomExplorer) and IsSharingDeleteCode(Code) then
+  begin
+    if DeleteSharingTree(ASrc, FPermanent, Fails) then
+      Step := ddsGone
+    else
+    begin
+      { Скасування цього файла. Решта пакета йде далі. }
+      if Length(Fails) = 0 then
+        NoteError(ASrc, DiskDeleteFailText(Code, FPermanent))
+      else
+        for I := 0 to High(Fails) do
+          NoteError(Fails[I].Path, Fails[I].Error);
+      Exit;
+    end;
+  end
   else
     Step := AfterSilentDiskDelete(ASrc, FPermanent, Code, Err);
   case Step of
@@ -999,7 +1018,7 @@ procedure TFileOpEngine.FlushElevate;
 var
   I, N: Integer;
   Paths: TArray<string>;
-  Cancelled: Boolean;
+  Cancelled, Noted: Boolean;
   Err: string;
 begin
   if (FElevate = nil) or (FElevate.Count = 0) then
@@ -1028,9 +1047,28 @@ begin
     end;
     if Err = '' then
       Err := L('op.noaccess');
+    { Перший шлях, що лишився, — помилка вікна. Решта тієї ж операції пропускається. }
+    Noted := False;
     for I := 0 to High(Paths) do
       if DeleteTargetRemains(Paths[I]) then
-        NoteError(Paths[I], Err);
+      begin
+        if not Noted then
+        begin
+          NoteError(Paths[I], Err);
+          Noted := True;
+        end
+        else
+        begin
+          IncSkipped;
+          FLock.Enter;
+          try
+            FSnap.Status := Err;
+          finally
+            FLock.Leave;
+          end;
+          ProbeLivePath(Paths[I]);
+        end;
+      end;
     Exit;
   end;
   for I := 0 to High(Paths) do
@@ -1350,13 +1388,21 @@ begin
     if DeleteFile(PChar(APath)) then
       Exit;
     Code := GetLastError;
-    if RetryAfterLock(APath, Code) then
-      Continue;
-    if FLockHalt then
-      NoteError(APath, L('lock.held'))
+    case FileLockOffer(APath, Code) of
+      flcRetry:
+        Continue;
+      flcCancel:
+        begin
+          { Видалення: цей файл в помилки, список не рвемо. }
+          if FKind <> okDelete then
+            FLockHalt := True;
+          NoteError(APath, L('lock.held'));
+          Exit;
+        end;
     else
       NoteError(APath, SysErrorMessage(Code));
-    Exit;
+      Exit;
+    end;
   end;
   {$ELSE}
   try
@@ -1382,6 +1428,14 @@ begin
         raise;
       on E: EOSError do
       begin
+        { DeletePathCore уже показав діалог на 32/33. Другий раз не питаємо. }
+        if IsSharingDeleteCode(E.ErrorCode) and (GetFileOpMode <> fomExplorer) then
+        begin
+          if FKind <> okDelete then
+            FLockHalt := True;
+          NoteError(APath, E.Message);
+          Exit(False);
+        end;
         if RetryAfterLock(APath, E.ErrorCode) then
           Continue;
         if FLockHalt then
@@ -1770,11 +1824,46 @@ end;
 
 procedure TFileOpEngine.ProcessPath(const ASrc, ADestDir: string);
 var
-  Name, Dst: string;
-  Moved, WasDir, DiskDelete: Boolean;
-  N: Integer;
+  Name, Dst, DiskOut: string;
+  Moved, WasDir, DiskDelete, SrcRemoved, Held: Boolean;
+  N, HeldBefore: Integer;
   Sz: Int64;
   Err: Cardinal;
+
+  procedure PublishArchiveDisk(AKind: TLiveOpKind);
+  var
+    IsDir, IsFile: Boolean;
+    LiveSize: Int64;
+    LiveTime: TDateTime;
+  begin
+    if DiskOut = '' then
+      Exit;
+    IsDir := TDirectory.Exists(DiskOut);
+    IsFile := TFile.Exists(DiskOut) and not IsDir;
+    if not IsDir and not IsFile then
+      Exit;
+    if IsDir then
+    begin
+      LiveSize := 0;
+      try
+        LiveTime := TDirectory.GetLastWriteTime(DiskOut);
+      except
+        LiveTime := 0;
+      end;
+    end
+    else
+    begin
+      try
+        LiveSize := TFile.GetSize(DiskOut);
+        LiveTime := TFile.GetLastWriteTime(DiskOut);
+      except
+        LiveSize := -1;
+        LiveTime := 0;
+      end;
+    end;
+    EmitLive(AKind, ASrc, DiskOut, True, IsDir, LiveSize, LiveTime);
+  end;
+
 begin
   CheckWait;
   if FFatal then
@@ -1807,10 +1896,25 @@ begin
   if (FKind in [okCopy, okMove]) and ArchiveInvolved(ASrc, ADestDir) then
   begin
     try
-      CopyPathSync(ASrc, ADestDir);
-      if (FKind = okMove) and not FCancel then
+      if FDeferred <> nil then
+        HeldBefore := FDeferred.Count
+      else
+        HeldBefore := 0;
+      DiskOut := CopyPathSync(ASrc, ADestDir);
+      Held := (FDeferred <> nil) and (FDeferred.Count > HeldBefore);
+      { Тихий режим відклав ім'я. Файл ще не на диску: пише ApplyOneDeferred. }
+      if Held and (DiskOut = '') then
+        Exit;
+      SrcRemoved := False;
+      if (FKind = okMove) and not FCancel and not Held then
+      begin
         if not DeleteOwnedPath(ASrc, True) then
+        begin
+          PublishArchiveDisk(lokCopy);
           Exit;
+        end;
+        SrcRemoved := True;
+      end;
       N := CountFilesQuick(ASrc);
       if N <= 0 then
         N := 1;
@@ -1820,6 +1924,10 @@ begin
       finally
         FLock.Leave;
       end;
+      if SrcRemoved then
+        PublishArchiveDisk(lokMove)
+      else
+        PublishArchiveDisk(lokCopy);
     except
       on E: EAbort do
         raise;
@@ -1830,8 +1938,13 @@ begin
   end;
   if (FKind = okDelete) and ArchiveInvolved(ASrc, '') then
   begin
+    if FArchiveBatched then
+      Exit;
     if DeleteOwnedPath(ASrc, True) then
+    begin
+      EmitLive(lokDelete, ASrc, '', True, False, -1, 0);
       IncDone;
+    end;
     Exit;
   end;
 
@@ -2011,10 +2124,89 @@ begin
   end;
 end;
 
+function IsArchiveFileToDisk(const ASrc, ADest: string): Boolean;
+var
+  Z, Inner: string;
+begin
+  Result := SplitArchivePath(ASrc, Z, Inner) and (Inner <> '') and
+    (ExtractFilePath(ADest) <> '') and
+    not ArchiveInvolved('', ExtractFilePath(ADest));
+end;
+
 procedure TFileOpEngine.ApplyOneDeferred(const AIt: TConflictItem;
   AAct: TConflictAction);
 var
-  Dest, P, Root, S: string;
+  Dest, P, Root, S, Z, Inner: string;
+
+  function NextArchiveName(const APath: string): string;
+  var
+    Dir, Name, Ext: string;
+    I: Integer;
+  begin
+    Result := '';
+    Dir := ExtractFilePath(APath);
+    if Dir = '' then
+      Exit;
+    Name := ChangeFileExt(ExtractFileName(APath), '');
+    Ext := ExtractFileExt(APath);
+    I := 2;
+    repeat
+      Result := TPath.Combine(Dir, Format('%s (%d)%s', [Name, I, Ext]));
+      Inc(I);
+    until not ArchivePathExists(Result);
+  end;
+
+  procedure EmitArchiveWrite(AKind: TLiveOpKind);
+  var
+    LiveSize: Int64;
+    LiveTime: TDateTime;
+    IsDir: Boolean;
+  begin
+    if Dest = '' then
+      Exit;
+    IsDir := TDirectory.Exists(AIt.SourcePath) and not TFile.Exists(AIt.SourcePath);
+    if IsDir then
+    begin
+      LiveSize := 0;
+      try
+        LiveTime := TDirectory.GetLastWriteTime(AIt.SourcePath);
+      except
+        LiveTime := 0;
+      end;
+    end
+    else
+    begin
+      LiveSize := -1;
+      LiveTime := 0;
+      if TFile.Exists(AIt.SourcePath) then
+      try
+        LiveSize := TFile.GetSize(AIt.SourcePath);
+        LiveTime := TFile.GetLastWriteTime(AIt.SourcePath);
+      except
+        LiveSize := -1;
+        LiveTime := 0;
+      end;
+    end;
+    EmitLive(AKind, AIt.SourcePath, Dest, True, IsDir, LiveSize, LiveTime);
+  end;
+
+  procedure EmitDiskFile(AKind: TLiveOpKind);
+  var
+    LiveSize: Int64;
+    LiveTime: TDateTime;
+  begin
+    if (Dest = '') or not TFile.Exists(Dest) or TDirectory.Exists(Dest) then
+      Exit;
+    try
+      LiveSize := TFile.GetSize(Dest);
+      LiveTime := TFile.GetLastWriteTime(Dest);
+    except
+      LiveSize := -1;
+      LiveTime := 0;
+    end;
+    EmitLive(AKind, AIt.SourcePath, Dest, True, False, LiveSize, LiveTime);
+  end;
+
 begin
   CheckWait;
   if AAct = caSkip then
@@ -2024,6 +2216,49 @@ begin
     Exit;
   end;
   Dest := AIt.DestPath;
+  { Ім'я всередині архіву. CopyOneFile створив би порожній каталог на диску. }
+  if SplitArchivePath(Dest, Z, Inner) and (Z <> '') and (Inner <> '') then
+  begin
+    FForceChoice := True;
+    FForcedChoice := ccOverwrite;
+    try
+      try
+        if AAct = caAutoName then
+        begin
+          Dest := NextArchiveName(Dest);
+          if Dest = '' then
+            raise Exception.Create(Lf('ops.noname',
+              [TPath.GetFileName(AIt.SourcePath)]));
+        end;
+        WriteChosenArchivePath(AIt.SourcePath, Dest);
+      except
+        on E: EAbort do
+          raise;
+        on E: Exception do
+        begin
+          NoteError(AIt.SourcePath, E.Message);
+          NotifyItem(AIt.SourcePath, oisError);
+          Exit;
+        end;
+      end;
+      if (FKind = okMove) and not FCancel then
+      begin
+        if not DeleteOwnedPath(AIt.SourcePath, True) then
+        begin
+          EmitArchiveWrite(lokCopy);
+          Exit;
+        end;
+        EmitArchiveWrite(lokMove);
+      end
+      else
+        EmitArchiveWrite(lokCopy);
+      IncDone;
+      NotifyItem(AIt.SourcePath, oisOk);
+    finally
+      FForceChoice := False;
+    end;
+    Exit;
+  end;
   if AAct = caAutoName then
   begin
     Dest := UniqueName(AIt.DestPath);
@@ -2033,6 +2268,38 @@ begin
       NotifyItem(AIt.SourcePath, oisError);
       Exit;
     end;
+  end;
+  { Відкладений файл з архіву. CopyOneFile відкрив би zip\ім'я як диск. }
+  if IsArchiveFileToDisk(AIt.SourcePath, Dest) then
+  begin
+    try
+      ClearReadonly(Dest);
+      if not ExtractArchiveItemToFile(AIt.SourcePath, Dest) then
+        raise Exception.Create(Lf('arch.extract', [TPath.GetFileName(Dest)]));
+    except
+      on E: EAbort do
+        raise;
+      on E: Exception do
+      begin
+        NoteError(AIt.SourcePath, E.Message);
+        NotifyItem(AIt.SourcePath, oisError);
+        Exit;
+      end;
+    end;
+    if (FKind = okMove) and not FCancel then
+    begin
+      if not DeleteOwnedPath(AIt.SourcePath, True) then
+      begin
+        EmitDiskFile(lokCopy);
+        Exit;
+      end;
+      EmitDiskFile(lokMove);
+    end
+    else
+      EmitDiskFile(lokCopy);
+    IncDone;
+    NotifyItem(AIt.SourcePath, oisOk);
+    Exit;
   end;
   FForceChoice := True;
   FForcedChoice := ccOverwrite;
@@ -2152,6 +2419,55 @@ begin
   FDeferred.Clear;
 end;
 
+procedure TFileOpEngine.DeleteArchiveBatch;
+var
+  Paths: TArray<string>;
+  Done: TDictionary<string, Boolean>;
+  I, N: Integer;
+begin
+  N := 0;
+  SetLength(Paths, Length(FSources));
+  for I := 0 to High(FSources) do
+    if ArchiveInvolved(FSources[I], '') then
+    begin
+      Paths[N] := FSources[I];
+      Inc(N);
+    end;
+  SetLength(Paths, N);
+  if N = 0 then
+    Exit;
+  FArchiveBatched := True;
+  Done := TDictionary<string, Boolean>.Create;
+  try
+    try
+      DeleteArchiveEntries(Paths,
+        procedure(ADone: TArray<string>)
+        var
+          S: string;
+        begin
+          for S in ADone do
+          begin
+            if (S = '') or Done.ContainsKey(S) then
+              Continue;
+            Done.Add(S, True);
+            Publish(S, 0, 0);
+            EmitLive(lokDelete, S, '', True, False, -1, 0);
+            IncDone;
+          end;
+        end);
+    except
+      on E: EAbort do
+        raise;
+      on E: Exception do
+        for I := 0 to High(Paths) do
+          if not Done.ContainsKey(Paths[I]) then
+            NoteError(Paths[I], E.Message);
+    end;
+  finally
+    Done.Free;
+  end;
+end;
+
 procedure TFileOpEngine.Run;
 var
   I, Files: Integer;
@@ -2162,6 +2478,7 @@ var
 begin
   FileLockReset;
   FLockHalt := False;
+  FArchiveBatched := False;
   Ok := True;
   Err := '';
   FElevateCancelled := False;
@@ -2183,7 +2500,7 @@ begin
     begin
       C := DecideConflictKnown(ASrc, ADst, ASrcSize, ADstSize, ASrcTime, ADstTime);
       case C of
-        ccSkip:
+        ccSkip, ccDefer:
           Result := acSkip;
         ccAutoRename:
           Result := acRename;
@@ -2238,6 +2555,8 @@ begin
     end
     else
     begin
+      if FKind = okDelete then
+        DeleteArchiveBatch;
       for I := 0 to High(FSources) do
       begin
         CheckWait;

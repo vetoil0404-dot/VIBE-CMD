@@ -126,9 +126,13 @@ type
     FErrSent: Boolean;
     FProbeGate: TEvent;
     FDiscard: Boolean;
+    FNeedCom: Boolean;
     procedure SendError(const AMsg: string);
     procedure EmitSlice(AList: TFileEntryList; AFrom: Integer; ADone: Boolean);
     procedure NoteProgress(ACount: Integer);
+    { COM корзини відпускається до фінального callback. Інакше друга панель
+      читає каталог, поки апартамент ще живий, і отримує порожній список. }
+    procedure ReleaseShell;
     { Мережа: спочатку каталоги, їх видно одразу. Файли — другим проходом. }
     function CollectRemote(AEntries: TFileEntryList; var ALastChunk: Integer;
       var ALastEmit: Cardinal): DWORD;
@@ -137,6 +141,8 @@ type
   public
     { Поток создан, но чтение этой папки уже ведёт другой. Не трогать шару. }
     Discard: Boolean;
+    { Перше читання після RestoreTabs: панель чекає кінця потоку, не OnDone. }
+    StartupGate: Boolean;
     destructor Destroy; override;
     constructor Create(const APath: string; AOnDone: TProc<TFileEntryList>;
       AOnError: TProc<string>; AShowHidden: Boolean = False;
@@ -674,11 +680,32 @@ begin
   end;
 end;
 
+{ 0 — як раніше. 1 — цей захід ще може показати одне вікно оболонки.
+  2 — відмова в цьому заході вже була, далі hwnd = 0. }
+threadvar
+  GShellUiOnce: Integer;
+
 function ShellUiHwnd: HWND;
 begin
+  if GShellUiOnce >= 2 then
+    Exit(0);
   Result := GetForegroundWindow;
   if Result = 0 then
     Result := GetActiveWindow;
+end;
+
+procedure NoteShellAccessUi(AWnd: HWND; AHr: HRESULT);
+var
+  U: Cardinal;
+begin
+  if (GShellUiOnce <> 1) or (AWnd = 0) or Succeeded(AHr) then
+    Exit;
+  U := Cardinal(AHr);
+  { 5 і $80070005 — відмова. 1314 — немає прав. 1223 і $800704C7 — кнопка скасування. }
+  if (U = ERROR_ACCESS_DENIED) or (U = ERROR_PRIVILEGE_NOT_HELD) or
+     (U = ERROR_CANCELLED) or (U = $80070005) or (U = $80070522) or
+     (U = $800704C7) then
+    GShellUiOnce := 2;
 end;
 
 function ShellItemName(const AItem: IShellItem; ASig: DWORD): string;
@@ -843,6 +870,8 @@ var
   Attr: DWORD;
   Desk: IShellFolder;
   Eaten: ULONG;
+  OwnerWnd: HWND;
+  ParseHr: HRESULT;
 begin
   AItem := nil;
   Result := False;
@@ -881,8 +910,10 @@ begin
       Pidl := nil;
       Eaten := 0;
       Attr := 0;
-      if Succeeded(Desk.ParseDisplayName(ShellUiHwnd, nil, PChar(C), Eaten, Pidl, Attr)) and
-         (Pidl <> nil) then
+      OwnerWnd := ShellUiHwnd;
+      ParseHr := Desk.ParseDisplayName(OwnerWnd, nil, PChar(C), Eaten, Pidl, Attr);
+      NoteShellAccessUi(OwnerWnd, ParseHr);
+      if Succeeded(ParseHr) and (Pidl <> nil) then
       try
         if Succeeded(SHCreateItemFromIDList(Pidl, IID_IShellItem, AItem)) and
            Assigned(AItem) then
@@ -2671,13 +2702,16 @@ function TryEnumShell(const AFolder: IShellFolder; AFlags: DWORD;
   out AEnum: IEnumIDList): Boolean;
 var
   OwnerWnd: HWND;
+  Hr: HRESULT;
 begin
   AEnum := nil;
   Result := False;
   if AFolder = nil then
     Exit;
   OwnerWnd := ShellUiHwnd;
-  Result := Succeeded(AFolder.EnumObjects(OwnerWnd, AFlags, AEnum)) and Assigned(AEnum);
+  Hr := AFolder.EnumObjects(OwnerWnd, AFlags, AEnum);
+  NoteShellAccessUi(OwnerWnd, Hr);
+  Result := Succeeded(Hr) and Assigned(AEnum);
   if not Result then
     Result := Succeeded(AFolder.EnumObjects(0, AFlags, AEnum)) and Assigned(AEnum);
 end;
@@ -3871,7 +3905,20 @@ begin
   FErrSent := False;
   FProbeGate := nil;
   FDiscard := False;
+  FNeedCom := False;
   Discard := False;
+  StartupGate := False;
+end;
+
+procedure TDirLoadThread.ReleaseShell;
+begin
+  {$IFDEF MSWINDOWS}
+  if FNeedCom then
+  begin
+    CoUninitialize;
+    FNeedCom := False;
+  end;
+  {$ENDIF}
 end;
 
 destructor TDirLoadThread.Destroy;
@@ -3987,6 +4034,26 @@ var
     ALastEmit := TThread.GetTickCount;
   end;
 
+  { Пачка під час FindNext. Інакше плоска шара тримає всі файли до кінця
+    обходу, список порожній, і за 8 с сторож знімає читання. }
+  procedure DrainHeld(AForce: Boolean);
+  var
+    I: Integer;
+  begin
+    if (Held = nil) or (Held.Count = 0) then
+      Exit;
+    if (not AForce) and (Held.Count < 300) and
+       (TThread.GetTickCount - ALastEmit < 1000) then
+      Exit;
+    for I := 0 to Held.Count - 1 do
+      AEntries.Add(Held[I]);
+    Held.Clear;
+    if AForce then
+      FlushNow
+    else
+      Flush(300, 1000);
+  end;
+
   function Walk(ADirsOnly: Boolean; AKeepFiles: Boolean; out ASawFile: Boolean): DWORD;
   var
     H: THandle;
@@ -4024,7 +4091,10 @@ var
         begin
           ASawFile := True;
           if AKeepFiles and (Held <> nil) then
+          begin
             Held.Add(ToEntry(Data));
+            DrainHeld(False);
+          end;
         end;
       until not Winapi.Windows.FindNextFile(H, Data);
     finally
@@ -4035,59 +4105,48 @@ var
 var
   Code: DWORD;
   SawFile: Boolean;
-  I: Integer;
-  FileFrom: Integer;
 begin
   Result := 0;
+  ALastEmit := TThread.GetTickCount;
   Mask := TPath.Combine(FPath, '*');
   Held := TFileEntryList.Create;
   try
     Code := Walk(True, True, SawFile);
     if Terminated then
+    begin
+      DrainHeld(True);
       Exit;
+    end;
     if (Code <> 0) and (Code <> ERROR_FILE_NOT_FOUND) and (Code <> ERROR_NO_MORE_FILES) then
     begin
+      DrainHeld(True);
       if AEntries.Count = 0 then
         Result := Code;
       Exit;
     end;
+    DrainHeld(True);
     FlushNow;
     if Terminated then
       Exit;
     if SawFile then
     begin
-      { Фільтр каталогів сервер проігнорував: файли вже прочитані, папки віддані. }
-      FileFrom := AEntries.Count;
-      for I := 0 to Held.Count - 1 do
-      begin
-        if Terminated then
-          Exit;
-        AEntries.Add(Held[I]);
-        if (AEntries.Count - FileFrom >= 300) or
-           (TThread.GetTickCount - ALastEmit >= 1000) then
-          Flush(300, 1000);
-      end;
+      { Фільтр каталогів сервер проігнорував: файли вже йдуть пачками. }
       Exit;
     end;
     Code := Walk(False, True, SawFile);
     if Terminated then
+    begin
+      DrainHeld(True);
       Exit;
+    end;
     if (Code <> 0) and (Code <> ERROR_FILE_NOT_FOUND) and (Code <> ERROR_NO_MORE_FILES) then
     begin
+      DrainHeld(True);
       if AEntries.Count = 0 then
         Result := Code;
       Exit;
     end;
-    FileFrom := AEntries.Count;
-    for I := 0 to Held.Count - 1 do
-    begin
-      if Terminated then
-        Exit;
-      AEntries.Add(Held[I]);
-      if (AEntries.Count - FileFrom >= 300) or
-         (TThread.GetTickCount - ALastEmit >= 1000) then
-        Flush(300, 1000);
-    end;
+    DrainHeld(True);
   finally
     Held.Free;
   end;
@@ -4146,6 +4205,22 @@ begin
     Result := L('model.server.down');
 end;
 
+{$IFDEF MSWINDOWS}
+function LocalPathDenied(const APath: string): Boolean;
+var
+  Attr, Err: DWORD;
+begin
+  Result := False;
+  if not IsWin32FsPath(APath) then
+    Exit;
+  Attr := GetFileAttributes(PChar(ExcludeTrailingPathDelimiter(APath)));
+  if Attr <> INVALID_FILE_ATTRIBUTES then
+    Exit;
+  Err := GetLastError;
+  Result := (Err = ERROR_ACCESS_DENIED) or (Err = ERROR_PRIVILEGE_NOT_HELD);
+end;
+{$ENDIF}
+
 procedure TDirLoadThread.Execute;
 var
   SearchRec: System.SysUtils.TSearchRec;
@@ -4153,18 +4228,20 @@ var
   FullPath: string;
   ListToPass: TFileEntryList;
   Arc, Inner: string;
-  NeedCom: Boolean;
   Remote: Boolean;
   RC, LastChunk, ErrCode: Integer;
   ProbeErr: DWORD;
   LastEmit: Cardinal;
   Batch: TProc;
+  Denied: Boolean;
 begin
   Remote := IsRemotePath(FPath);
+  Denied := False;
+  GShellUiOnce := 1;
 {$IFDEF MSWINDOWS}
-  NeedCom := (not Remote) and Succeeded(CoInitializeEx(nil, COINIT_APARTMENTTHREADED));
+  FNeedCom := (not Remote) and Succeeded(CoInitializeEx(nil, COINIT_APARTMENTTHREADED));
 {$ELSE}
-  NeedCom := False;
+  FNeedCom := False;
 {$ENDIF}
   Entries := TFileEntryList.Create;
   LastChunk := 0;
@@ -4265,6 +4342,14 @@ begin
             System.SysUtils.FindClose(SearchRec);
           Abort;
         end;
+        Denied := (RC <> 0) and
+          ((Cardinal(RC) = ERROR_ACCESS_DENIED) or
+           (Cardinal(RC) = ERROR_PRIVILEGE_NOT_HELD) or
+           (ErrCode = ERROR_ACCESS_DENIED) or
+           (ErrCode = ERROR_PRIVILEGE_NOT_HELD));
+        { FindFirst уже відмовив: shell-перелік і спостерігач вікно не піднімають. }
+        if Denied then
+          GShellUiOnce := 2;
         if RC <> 0 then
         begin
           if Entries.Count = 0 then
@@ -4293,15 +4378,36 @@ begin
         end;
         if (not Remote) and (Entries.Count = 0) then
           TryListShellFolder(FPath, Entries, FShowHidden);
+        if (not Remote) and Denied and (Entries.Count = 0) and not Terminated then
+        begin
+          SendError(L('op.noaccess'));
+          Exit;
+        end;
       end
-      else if not TryListShellFolder(FPath, Entries, FShowHidden, Batch) then
+      else
       begin
-        if not IsVirtualShellPath(FPath) then
-          raise Exception.Create(Lf('model.open.path', [FPath]));
+        {$IFDEF MSWINDOWS}
+        if (not Remote) and LocalPathDenied(FPath) then
+          GShellUiOnce := 2;
+        {$ENDIF}
+        if not TryListShellFolder(FPath, Entries, FShowHidden, Batch) then
+        begin
+          {$IFDEF MSWINDOWS}
+          if (not Remote) and LocalPathDenied(FPath) then
+          begin
+            SendError(L('op.noaccess'));
+            Exit;
+          end;
+          {$ENDIF}
+          if not IsVirtualShellPath(FPath) then
+            raise Exception.Create(Lf('model.open.path', [FPath]));
+        end;
       end;
 
       if Terminated then
       begin
+        if IsRecycleBinPath(FPath) then
+          ReleaseShell;
         if IsRecycleBinPath(FPath) and Assigned(FOnChunk) then
         begin
           EmitSlice(Entries, LastChunk, True);
@@ -4324,6 +4430,9 @@ begin
 
       if IsRecycleBinPath(FPath) and Assigned(FOnChunk) then
       begin
+        { OnDone(nil) лише закриває потік. Список уже в останньому chunk.
+          Друга панель стартує після виходу потоку, не з цього callback. }
+        ReleaseShell;
         EmitSlice(Entries, LastChunk, True);
         NoteProgress(Entries.Count);
         FreeAndNil(Entries);
@@ -4371,6 +4480,8 @@ begin
       on E: EAbort do
       begin
         FreeAndNil(Entries);
+        if IsRecycleBinPath(FPath) then
+          ReleaseShell;
         if not FErrSent then
           Queue(
             procedure
@@ -4380,15 +4491,20 @@ begin
             end);
       end;
       on E: Exception do
+      begin
+        if IsRecycleBinPath(FPath) then
+          ReleaseShell;
         SendError(E.Message);
+      end;
     end;
   finally
     ReleasePathRead(FPath, Self);
     if Assigned(FProbeGate) then
       FProbeGate.SetEvent;
     Entries.Free;
+    GShellUiOnce := 0;
 {$IFDEF MSWINDOWS}
-    if NeedCom then
+    if FNeedCom then
       CoUninitialize;
 {$ENDIF}
   end;

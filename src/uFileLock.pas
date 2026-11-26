@@ -64,7 +64,6 @@ type
     FRows: TArray<TRectangle>;
     FSel: Integer;
     FAsk: Boolean;
-    FRetryPrimary: Boolean;
     FChoice: TFileLockChoice;
     FDone: Boolean;
     FRoot: TRectangle;
@@ -72,6 +71,7 @@ type
     FScroll: TVertScrollBox;
     FList: TLayout;
     FBtnEnd, FBtnRetry, FBtnCancel: TFluentButton;
+    FKeyBtn: TFluentButton;
     procedure BuildUI;
     procedure ApplyNativeChrome;
     procedure Reload;
@@ -84,12 +84,19 @@ type
     procedure Finish(AChoice: TFileLockChoice);
     function Selected: Integer;
     procedure SyncEndButton;
+    procedure ArmClick(Sender: TObject);
+    procedure SetKeyBtn(AButton: TFluentButton);
+    procedure ApplyKeyAccent;
+    procedure CollectKeyRow(out ARow: TArray<TFluentButton>);
+    procedure MoveKeyFocus(ADelta: Integer);
+    procedure PressKeyBtn;
   protected
     procedure CreateHandle; override;
     procedure DoShow; override;
     procedure DoClose(var CloseAction: TCloseAction); override;
     procedure Resize; override;
   public
+    procedure KeyDown(var Key: Word; var KeyChar: Char; Shift: TShiftState); override;
     constructor Create(AOwner: TComponent; const APath: string); reintroduce;
     property Finished: Boolean read FDone;
     property Choice: TFileLockChoice read FChoice;
@@ -342,6 +349,8 @@ end;
 constructor TFileLockForm.Create(AOwner: TComponent; const APath: string);
 begin
   inherited CreateNew(AOwner);
+  { Діалог видалення Vibe теж StayOnTop. Без цього вікно лишається під ним. }
+  FormStyle := TFormStyle.StayOnTop;
   FPath := APath;
   FSel := -1;
   FChoice := flcCancel;
@@ -378,11 +387,22 @@ begin
 end;
 
 procedure TFileLockForm.DoShow;
+var
+  Wnd: HWND;
 begin
   inherited;
   ApplyNativeChrome;
   LayoutButtons;
+  if not FluentButtonLive(FKeyBtn) then
+    SetKeyBtn(FBtnCancel)
+  else
+    ApplyKeyAccent;
+  Wnd := FormToHWND(Self);
+  if Wnd <> 0 then
+    SetWindowPos(Wnd, HWND_TOPMOST, 0, 0, 0, 0,
+      SWP_NOMOVE or SWP_NOSIZE or SWP_SHOWWINDOW);
   BringToFront;
+  Activate;
 end;
 
 procedure TFileLockForm.DoClose(var CloseAction: TCloseAction);
@@ -440,19 +460,10 @@ begin
     FBtnEnd.SetCaption(L('lock.kill.yes'))
   else
     FBtnEnd.SetCaption(L('lock.end'));
-  if FRetryPrimary then
-  begin
-    FBtnRetry.Kind := fbkAccent;
-    FBtnEnd.Kind := fbkStandard;
-  end
+  if not FluentButtonLive(FKeyBtn) then
+    SetKeyBtn(FBtnCancel)
   else
-  begin
-    FBtnRetry.Kind := fbkStandard;
-    FBtnEnd.Kind := fbkStandard;
-  end;
-  FBtnRetry.ApplyTheme(FColors);
-  FBtnEnd.ApplyTheme(FColors);
-  FBtnCancel.ApplyTheme(FColors);
+    ApplyKeyAccent;
 end;
 
 procedure TFileLockForm.ApplyRowColors;
@@ -539,6 +550,8 @@ begin
     Row.Stroke.Kind := TBrushKind.None;
     Row.Fill.Color := FColors.CardBackground;
     Row.HitTest := True;
+    Row.CanFocus := False;
+    Row.TabStop := False;
     Row.Tag := I;
     Row.OnClick := RowClick;
     Icon := TImage.Create(Self);
@@ -618,7 +631,7 @@ begin
   FAsk := False;
   if EndProcess(FItems[At].Pid) then
   begin
-    FRetryPrimary := True;
+    FKeyBtn := FBtnRetry;
     FStatus.Text := '';
     FStatus.Tag := 0;
     Sleep(200);
@@ -682,10 +695,14 @@ begin
   FScroll.Parent := FRoot;
   FScroll.Align := TAlignLayout.Client;
   FScroll.Margins.Rect := TRectF.Create(0, 8, 0, 8);
+  FScroll.CanFocus := False;
+  FScroll.TabStop := False;
   FList := TLayout.Create(Self);
   FList.Parent := FScroll;
   FList.Align := TAlignLayout.Top;
   FList.Height := 48;
+  FList.CanFocus := False;
+  FList.TabStop := False;
 
   Foot := TLayout.Create(Self);
   Foot.Parent := FRoot;
@@ -693,15 +710,197 @@ begin
   Foot.Height := 40;
   FBtnEnd := CreateFluentButton(Self, Foot, '', L('lock.end'), fbkStandard, 168, EndClick);
   FBtnRetry := CreateFluentButton(Self, Foot, '', L('lock.retry'), fbkStandard, 120, RetryClick);
-  FBtnCancel := CreateFluentButton(Self, Foot, '', L('lock.cancel'), fbkSubtle, 110, CancelClick);
+  FBtnCancel := CreateFluentButton(Self, Foot, '', L('lock.cancel'), fbkStandard, 110, CancelClick);
   FBtnEnd.Align := TAlignLayout.None;
   FBtnRetry.Align := TAlignLayout.None;
   FBtnCancel.Align := TAlignLayout.None;
+  FBtnEnd.CanFocus := False;
+  FBtnRetry.CanFocus := False;
+  FBtnCancel.CanFocus := False;
+  FBtnEnd.TabStop := False;
+  FBtnRetry.TabStop := False;
+  FBtnCancel.TabStop := False;
+  FBtnEnd.OnArm := ArmClick;
+  FBtnRetry.OnArm := ArmClick;
+  FBtnCancel.OnArm := ArmClick;
+end;
+
+procedure TFileLockForm.ArmClick(Sender: TObject);
+begin
+  if (Sender is TFluentButton) and FluentButtonLive(TFluentButton(Sender)) then
+    SetKeyBtn(TFluentButton(Sender));
+end;
+
+procedure TFileLockForm.ApplyKeyAccent;
+begin
+  if Assigned(FBtnEnd) then
+  begin
+    if FBtnEnd = FKeyBtn then
+      FBtnEnd.Kind := fbkAccent
+    else
+      FBtnEnd.Kind := fbkStandard;
+    FBtnEnd.ApplyTheme(FColors);
+  end;
+  if Assigned(FBtnRetry) then
+  begin
+    if FBtnRetry = FKeyBtn then
+      FBtnRetry.Kind := fbkAccent
+    else
+      FBtnRetry.Kind := fbkStandard;
+    FBtnRetry.ApplyTheme(FColors);
+  end;
+  if Assigned(FBtnCancel) then
+  begin
+    if FBtnCancel = FKeyBtn then
+      FBtnCancel.Kind := fbkAccent
+    else
+      FBtnCancel.Kind := fbkStandard;
+    FBtnCancel.ApplyTheme(FColors);
+  end;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(True);
+end;
+
+procedure TFileLockForm.SetKeyBtn(AButton: TFluentButton);
+begin
+  if not FluentButtonLive(AButton) then
+    AButton := nil;
+  if FKeyBtn = AButton then
+  begin
+    ApplyKeyAccent;
+    Exit;
+  end;
+  if Assigned(FKeyBtn) then
+    FKeyBtn.SetKeyFocus(False);
+  FKeyBtn := AButton;
+  ApplyKeyAccent;
+end;
+
+procedure TFileLockForm.CollectKeyRow(out ARow: TArray<TFluentButton>);
+  procedure AddLive(AButton: TFluentButton);
+  var
+    N: Integer;
+  begin
+    if not FluentButtonLive(AButton) then
+      Exit;
+    N := Length(ARow);
+    SetLength(ARow, N + 1);
+    ARow[N] := AButton;
+  end;
+begin
+  SetLength(ARow, 0);
+  AddLive(FBtnEnd);
+  AddLive(FBtnRetry);
+  AddLive(FBtnCancel);
+end;
+
+procedure TFileLockForm.MoveKeyFocus(ADelta: Integer);
+var
+  Row: TArray<TFluentButton>;
+  I, At, N: Integer;
+  Found: Boolean;
+begin
+  CollectKeyRow(Row);
+  N := Length(Row);
+  if N = 0 then
+    Exit;
+  Found := False;
+  At := 0;
+  if Assigned(FKeyBtn) then
+    for I := 0 to High(Row) do
+      if Row[I] = FKeyBtn then
+      begin
+        At := I;
+        Found := True;
+        Break;
+      end;
+  if not Found then
+  begin
+    SetKeyBtn(FBtnCancel);
+    Exit;
+  end;
+  At := (At + ADelta) mod N;
+  if At < 0 then
+    Inc(At, N);
+  SetKeyBtn(Row[At]);
+end;
+
+procedure TFileLockForm.PressKeyBtn;
+begin
+  if not FluentButtonLive(FKeyBtn) then
+    SetKeyBtn(FBtnCancel);
+  if Assigned(FKeyBtn) and FluentButtonLive(FKeyBtn) then
+    FKeyBtn.Invoke;
+end;
+
+procedure TFileLockForm.KeyDown(var Key: Word; var KeyChar: Char;
+  Shift: TShiftState);
+var
+  Plain: Boolean;
+begin
+  Plain := not (ssAlt in Shift) and not (ssCtrl in Shift);
+  if Plain and ((Key = vkUp) or (Key = vkDown)) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Plain and ((Key = vkLeft) or (Key = vkRight)) then
+  begin
+    if Key = vkLeft then
+      MoveKeyFocus(-1)
+    else
+      MoveKeyFocus(1);
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
+  if Key = vkEscape then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    Finish(flcCancel);
+    Exit;
+  end;
+  { FMX з’їдає Space: Key стає 0, лишається KeyChar. }
+  if Plain and ((Key = vkReturn) or (Key = vkSpace) or (KeyChar = ' ')) then
+  begin
+    Key := 0;
+    KeyChar := #0;
+    PressKeyBtn;
+    Exit;
+  end;
+  inherited;
 end;
 
 procedure ShowFileLock(const APath: string; var AChoice: TFileLockChoice);
 var
   Dlg: TFileLockForm;
+
+  { Діалог прогресу теж topmost і може знову вилізти зверху. Чужі вікна не чіпаємо. }
+  procedure KeepAbove;
+  var
+    Wnd, Top: HWND;
+    OurPid, TopPid: DWORD;
+  begin
+    if (Dlg = nil) or not Dlg.Visible then
+      Exit;
+    Wnd := FormToHWND(Dlg);
+    if Wnd = 0 then
+      Exit;
+    Top := GetTopWindow(GetDesktopWindow);
+    if (Top = 0) or (Top = Wnd) then
+      Exit;
+    OurPid := 0;
+    TopPid := 0;
+    GetWindowThreadProcessId(Wnd, OurPid);
+    GetWindowThreadProcessId(Top, TopPid);
+    if (TopPid = 0) or (TopPid <> OurPid) then
+      Exit;
+    SetWindowPos(Wnd, HWND_TOPMOST, 0, 0, 0, 0,
+      SWP_NOMOVE or SWP_NOSIZE or SWP_NOACTIVATE or SWP_SHOWWINDOW);
+  end;
+
 begin
   AChoice := flcCancel;
   if (Application = nil) or (Application.MainForm = nil) or
@@ -716,6 +915,7 @@ begin
     while not Dlg.Finished do
     begin
       Application.ProcessMessages;
+      KeepAbove;
       if (Application = nil) or Application.Terminated then
       begin
         AChoice := flcCancel;

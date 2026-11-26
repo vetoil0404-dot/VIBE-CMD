@@ -230,7 +230,7 @@ var
   Info: PVSFixedFileInfo;
   Len: UINT;
 begin
-  Result := '1.0.0';
+  Result := '1.0.1';
   Sz := GetFileVersionInfoSize(PChar(ParamStr(0)), Dummy);
   if Sz = 0 then
     Exit;
@@ -389,8 +389,6 @@ var
   K, N: Integer;
 begin
   S := Trim(AMask);
-  if S = '' then
-    S := DEFAULT_UPDATE_MASK;
   SetLength(Result, 0);
   while S <> '' do
   begin
@@ -1093,7 +1091,11 @@ begin
   end;
   TInterlocked.Exchange(GManualWait, 0);
   Repo := Trim(GSettings.UpdateRepo);
-  Mask := Trim(GSettings.UpdateMask);
+  { x64 бачить лише *x64*.zip, x86 — лише *x86*.zip. Чужий архів не беремо. }
+  if SizeOf(Pointer) = 8 then
+    Mask := '*x64*.zip'
+  else
+    Mask := '*x86*.zip';
   Skip := GSettings.UpdateSkip;
   Pre := GSettings.UpdatePrerelease;
   if Repo = '' then

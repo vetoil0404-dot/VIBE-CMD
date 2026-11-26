@@ -1,7 +1,8 @@
 ﻿unit uAppSettings;
 
 {
-  Хранение и загрузка пользовательских настроек в VibeSetting.ini рядом с exe.
+  Хранение и загрузка пользовательских настроек в VibeSetting.ini
+  в папке данных пользователя (GetHomePath\VibeCmd), рядом с DockIcons.
   /ini= подменяет этот файл до создания настроек. Чужой запуск ini не меняет.
   Поддерживаются вкладки обеих панелей, вид/зум/сортировка каждой вкладки
   и геометрия окна. Старый формат (один Path на панель) читается как одна вкладка.
@@ -16,7 +17,6 @@ uses
 const
   { Публичный репозиторий. Пустой ключ в ini сюда не подменяется. }
   DEFAULT_UPDATE_REPO = 'vetoil0404-dot/VIBE-CMD';
-  DEFAULT_UPDATE_MASK = '*Setup*.exe;*.zip';
 
 type
   TAppTheme = (atSystem, atLight, atDark);
@@ -112,10 +112,10 @@ type
     MouseSelectMode: TMouseSelectMode;
     AutoStart: Boolean;
     SingleInstance: Boolean;
-    { GitHub owner/repo, маска файла релиза, автопроверка, канал test,
-      пропущенные tag_name через «|», дата последней проверки yyyy-mm-dd. }
+    { GitHub owner/repo, автопроверка, канал test,
+      пропущенные tag_name через «|», дата последней проверки yyyy-mm-dd.
+      Маска файла релиза от разрядности exe, в ini её нет. }
     UpdateRepo: string;
-    UpdateMask: string;
     UpdateAuto: Boolean;
     UpdatePrerelease: Boolean;
     UpdateSkip: string;
@@ -159,7 +159,9 @@ type
   end;
 
 function SingleInstanceWanted: Boolean;
-{ Пусто — VibeSetting.ini рядом с exe. /ini= задаёт путь до загрузки сессии. }
+{ GetHomePath\VibeCmd. VibeSetting.ini и DockIcons лежат в этой папке. }
+function VibeDataDir: string;
+{ Пусто — ini в папке данных. /ini= задаёт путь до загрузки сессии. }
 procedure SetSettingsIniOverride(const APath: string);
 function ActiveSettingsIni: string;
 function ReadFontPhrase: string;
@@ -177,7 +179,10 @@ implementation
 
 {$IFDEF MSWINDOWS}
 uses
-  Winapi.Windows;
+  Winapi.Windows, System.IOUtils;
+{$ELSE}
+uses
+  System.IOUtils;
 {$ENDIF}
 
 procedure UpdateIni(const AFile: string; const AEdit: TProc<TCustomIniFile>); forward;
@@ -198,10 +203,7 @@ begin
     GSettingsSaveLock := TCriticalSection.Create;
   FPrefsLock := TCriticalSection.Create;
   FPrefsEvent := TEvent.Create(nil, True, True, '');
-  if GSettingsIniOverride <> '' then
-    FFileName := GSettingsIniOverride
-  else
-    FFileName := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
+  FFileName := ActiveSettingsIni;
 
   Theme := atSystem;
   WindowMaterial := wmNormal;
@@ -243,7 +245,6 @@ begin
   AutoStart := False;
   SingleInstance := True;
   UpdateRepo := DEFAULT_UPDATE_REPO;
-  UpdateMask := DEFAULT_UPDATE_MASK;
   UpdateAuto := True;
   UpdatePrerelease := False;
   UpdateSkip := '';
@@ -500,15 +501,9 @@ begin
   DockAlign := daCenter;
   FIniSource := '';
   Source := FFileName;
+  { /ini= не ищет файл в папке exe. Нет файла — остаются значения по умолчанию. }
   if not FileExists(Source) then
-  begin
-    { /ini= не подменяет соседний VibeSetting.ini и TCClone.ini. }
-    if GSettingsIniOverride <> '' then
-      Exit;
-    Source := ExtractFilePath(ParamStr(0)) + 'TCClone.ini';
-    if not FileExists(Source) then
-      Exit;
-  end;
+    Exit;
 
   FIniSource := Source;
   Ini := TIniFile.Create(Source);
@@ -591,10 +586,7 @@ begin
       UpdateRepo := Trim(Ini.ReadString('Update', 'Repo', ''))
     else
       UpdateRepo := DEFAULT_UPDATE_REPO;
-    if Ini.ValueExists('Update', 'Mask') then
-      UpdateMask := Trim(Ini.ReadString('Update', 'Mask', ''))
-    else
-      UpdateMask := DEFAULT_UPDATE_MASK;
+    { Update/Mask от старых сборок не читаем: файл выбирает разрядность exe. }
     UpdateAuto := StrToBoolDef(Ini.ReadString('Update', 'Auto', '1'), True);
     UpdatePrerelease := SameText(Ini.ReadString('Update', 'Channel', 'stable'), 'test');
     UpdateSkip := Ini.ReadString('Update', 'Skip', '');
@@ -754,21 +746,53 @@ begin
   GSettingsIniOverride := APath;
 end;
 
+function VibeDataDir: string;
+begin
+  Result := TPath.Combine(TPath.GetHomePath, 'VibeCmd');
+end;
+
+procedure EnsureUserSettingsIni;
+var
+  Dir, Dest, Src: string;
+  Attr: Integer;
+begin
+  if GSettingsIniOverride <> '' then
+    Exit;
+  Dir := VibeDataDir;
+  if not TPath.IsPathRooted(Dir) then
+    Exit;
+  Dest := TPath.Combine(Dir, 'VibeSetting.ini');
+  if FileExists(Dest) then
+    Exit;
+  ForceDirectories(Dir);
+  Src := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
+  if not FileExists(Src) then
+    Exit;
+  if SameText(ExpandFileName(Src), ExpandFileName(Dest)) then
+    Exit;
+  if FileExists(Dest) then
+    Exit;
+  try
+    TFile.Copy(Src, Dest, False);
+    { Копія з Program Files інколи лишається тільки для читання. }
+    Attr := FileGetAttr(Dest);
+    if (Attr >= 0) and ((Attr and faReadOnly) <> 0) then
+      FileSetAttr(Dest, Attr and not faReadOnly);
+  except
+  end;
+end;
+
 function ActiveSettingsIni: string;
 begin
   if GSettingsIniOverride <> '' then
     Exit(GSettingsIniOverride);
-  Result := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
+  EnsureUserSettingsIni;
+  Result := TPath.Combine(VibeDataDir, 'VibeSetting.ini');
 end;
 
 function BehaviorIniPath: string;
 begin
-  if GSettingsIniOverride <> '' then
-    Exit(GSettingsIniOverride);
-  Result := ExtractFilePath(ParamStr(0)) + 'VibeSetting.ini';
-  if not FileExists(Result) and
-     FileExists(ExtractFilePath(ParamStr(0)) + 'TCClone.ini') then
-    Result := ExtractFilePath(ParamStr(0)) + 'TCClone.ini';
+  Result := ActiveSettingsIni;
 end;
 
 function FontIniPath: string;
@@ -896,7 +920,6 @@ type
     AutoStart: Boolean;
     SingleInstance: Boolean;
     UpdateRepo: string;
-    UpdateMask: string;
     UpdateAuto: Boolean;
     UpdatePrerelease: Boolean;
     UpdateSkip: string;
@@ -984,7 +1007,6 @@ begin
   Result.AutoStart := S.AutoStart;
   Result.SingleInstance := S.SingleInstance;
   Result.UpdateRepo := S.UpdateRepo;
-  Result.UpdateMask := S.UpdateMask;
   Result.UpdateAuto := S.UpdateAuto;
   Result.UpdatePrerelease := S.UpdatePrerelease;
   Result.UpdateSkip := S.UpdateSkip;
@@ -1038,7 +1060,6 @@ begin
       Ini.WriteString('Behavior', 'AutoStart', IniBoolStr(Snap.AutoStart));
       Ini.WriteString('Behavior', 'SingleInstance', IniBoolStr(Snap.SingleInstance));
       Ini.WriteString('Update', 'Repo', Snap.UpdateRepo);
-      Ini.WriteString('Update', 'Mask', Snap.UpdateMask);
       Ini.WriteString('Update', 'Auto', IniBoolStr(Snap.UpdateAuto));
       if Snap.UpdatePrerelease then
         Ini.WriteString('Update', 'Channel', 'test')

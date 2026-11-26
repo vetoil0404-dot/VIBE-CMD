@@ -973,11 +973,21 @@ const
   NERR_SUCCESS = 0;
 
 type
+{$IFDEF WIN64}
+  { Після shi1_type 4 байти вирівнювання. Крок = SizeOf = 24. }
+  TShareInfo1 = record
+    NetName: PWideChar;
+    ShareType: DWORD;
+    Remark: PWideChar;
+  end;
+{$ELSE}
+  { Win32: packed збігається з SHARE_INFO_1, крок 12. }
   TShareInfo1 = packed record
     NetName: PWideChar;
     ShareType: DWORD;
     Remark: PWideChar;
   end;
+{$ENDIF}
   PShareInfo1 = ^TShareInfo1;
 
 function NetShareEnum(ServerName: PWideChar; Level: DWORD; var Buf: Pointer;
@@ -987,6 +997,18 @@ function NetApiBufferFree(Buffer: Pointer): DWORD; stdcall;
   external 'netapi32.dll' name 'NetApiBufferFree';
 
 type
+{$IFDEF WIN64}
+  { Після PlatformId і після ServerType по 4 байти. Крок = SizeOf = 40. }
+  TServerInfo101 = record
+    PlatformId: DWORD;
+    Name: PWideChar;
+    VerMajor: DWORD;
+    VerMinor: DWORD;
+    ServerType: DWORD;
+    Comment: PWideChar;
+  end;
+{$ELSE}
+  { Win32: packed збігається з SERVER_INFO_101, крок 24. }
   TServerInfo101 = packed record
     PlatformId: DWORD;
     Name: PWideChar;
@@ -995,7 +1017,32 @@ type
     ServerType: DWORD;
     Comment: PWideChar;
   end;
+{$ENDIF}
   PServerInfo101 = ^TServerInfo101;
+
+{$IFDEF WIN64}
+  {$IF SizeOf(TShareInfo1) <> 24}
+    {$MESSAGE FATAL 'TShareInfo1 on Win64 must be 24 bytes'}
+  {$IFEND}
+  {$IF SizeOf(TServerInfo101) <> 40}
+    {$MESSAGE FATAL 'TServerInfo101 on Win64 must be 40 bytes'}
+  {$IFEND}
+{$ELSE}
+  {$IF SizeOf(TShareInfo1) <> 12}
+    {$MESSAGE FATAL 'TShareInfo1 on Win32 must be 12 bytes'}
+  {$IFEND}
+  {$IF SizeOf(TServerInfo101) <> 24}
+    {$MESSAGE FATAL 'TServerInfo101 on Win32 must be 24 bytes'}
+  {$IFEND}
+{$ENDIF}
+
+function NetApiText(P: PWideChar): string;
+begin
+  Result := '';
+  if (P = nil) or (NativeUInt(P) = NativeUInt(-1)) then
+    Exit;
+  Result := Trim(string(P));
+end;
 
 function NetServerGetInfo(ServerName: PWideChar; Level: DWORD; var Buf: Pointer): DWORD; stdcall;
   external 'netapi32.dll' name 'NetServerGetInfo';
@@ -1402,12 +1449,8 @@ begin
     Exit;
   try
     Info := PServerInfo101(Buf);
-    Nm := '';
-    Comment := '';
-    if Info.Name <> nil then
-      Nm := Trim(string(Info.Name));
-    if Info.Comment <> nil then
-      Comment := Trim(string(Info.Comment));
+    Nm := NetApiText(Info.Name);
+    Comment := NetApiText(Info.Comment);
     if (Nm <> '') and not SameText(Nm, AIp) then
       Result := Nm
     else if (Comment <> '') and not SameText(Comment, AIp) then
@@ -1618,17 +1661,17 @@ begin
       Break;
     end;
     Got := True;
+    if Buf = nil then
+      Break;
     Info := PShareInfo1(Buf);
     for I := 0 to Integer(Read) - 1 do
     begin
       if AJob.Stopped then
         Break;
-      if Info.NetName <> nil then
+      ShareName := NetApiText(Info.NetName);
+      if ShareName <> '' then
       begin
-        ShareName := Trim(Info.NetName);
-        Remark := '';
-        if Info.Remark <> nil then
-          Remark := Trim(Info.Remark);
+        Remark := NetApiText(Info.Remark);
         Kind := Info.ShareType and not STYPE_SPECIAL;
         if Kind = STYPE_PRINTQ then
           Res := RESOURCETYPE_PRINT
@@ -1636,9 +1679,8 @@ begin
           Res := RESOURCETYPE_DISK
         else
           Res := 0;
-        if ShareName <> '' then
-          AddHostItem(AJob, ShareName, Server + '\' + ShareName, Remark, Res,
-            Info.ShareType, True, False);
+        AddHostItem(AJob, ShareName, Server + '\' + ShareName, Remark, Res,
+          Info.ShareType, True, False);
       end;
       Inc(Info);
     end;

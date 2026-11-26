@@ -42,7 +42,8 @@ function IsPdfThumbExt(const APath: string): Boolean;
 procedure FillBitmapFromBgra(ABitmap: FMX.Graphics.TBitmap; const APixels: TBytes;
   AWidth, AHeight: Integer);
 function RenderPdfThumbRaw(const APath: string; AMaxW, AMaxH: Integer;
-  out APixels: TBytes; out AWidth, AHeight: Integer): Boolean;
+  out APixels: TBytes; out AWidth, AHeight: Integer;
+  ATrustContent: Boolean = False): Boolean;
 function RenderPdfThumb(const APath: string; AWidth, AHeight: Integer;
   ABitmap: FMX.Graphics.TBitmap): Boolean;
 { Первая страница в пунктах PDF, округлённых до целых. }
@@ -672,7 +673,8 @@ begin
 end;
 
 function RenderPdfThumbRaw(const APath: string; AMaxW, AMaxH: Integer;
-  out APixels: TBytes; out AWidth, AHeight: Integer): Boolean;
+  out APixels: TBytes; out AWidth, AHeight: Integer;
+  ATrustContent: Boolean): Boolean;
 var
   Doc: TPdfiumDoc;
 begin
@@ -680,7 +682,7 @@ begin
   SetLength(APixels, 0);
   AWidth := 0;
   AHeight := 0;
-  if not IsPdfThumbExt(APath) then
+  if (not ATrustContent) and (not IsPdfThumbExt(APath)) then
     Exit;
   if not TPdfiumDoc.Available then
     Exit;
@@ -706,7 +708,7 @@ begin
   Result := False;
   if (ABitmap = nil) or (AWidth < 8) or (AHeight < 8) then
     Exit;
-  if not RenderPdfThumbRaw(APath, AWidth, AHeight, Pix, W, H) then
+  if not RenderPdfThumbRaw(APath, AWidth, AHeight, Pix, W, H, False) then
     Exit;
   FillBitmapFromBgra(ABitmap, Pix, W, H);
   Result := (ABitmap.Width > 0) and (ABitmap.Height > 0);

@@ -115,6 +115,7 @@ type
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure PopupNear(ATarget: TControl; AOpenOnRight: Boolean);
     procedure PopupAtCursor;
+    procedure PopupAtScreen(const AScreen: TPointF);
   end;
 
 implementation
@@ -939,6 +940,17 @@ begin
   Placement := TPlacement.Mouse;
   HorizontalOffset := 4;
   VerticalOffset := 4;
+  IsOpen := True;
+end;
+
+procedure TFluentPopupMenu.PopupAtScreen(const AScreen: TPointF);
+begin
+  PlacementTarget := nil;
+  Placement := TPlacement.Absolute;
+  { Пустой прямоугольник: форма встаёт левым верхним углом в эту точку. }
+  PlacementRectangle.Rect := TRectF.Create(AScreen.X, AScreen.Y, AScreen.X, AScreen.Y);
+  HorizontalOffset := 0;
+  VerticalOffset := 0;
   IsOpen := True;
 end;
 

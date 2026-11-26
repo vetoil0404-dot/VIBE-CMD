@@ -58,7 +58,8 @@ type
 implementation
 
 uses
-  System.IOUtils, System.StrUtils, System.DateUtils, uFileOps, uFileLock
+  System.IOUtils, System.StrUtils, System.DateUtils, uFileOps, uFileLock,
+  uArchiveEngine
   {$IFDEF MSWINDOWS}, Winapi.Windows{$ENDIF};
 
 function IsBadNameChar(C: Char): Boolean;
@@ -420,7 +421,8 @@ begin
         Continue;
       Dest := TPath.Combine(ExtractFilePath(FItems[I].OldPath), FItems[I].NewName);
       if (not SameText(Dest, FItems[I].OldPath)) and
-         (TFile.Exists(Dest) or TDirectory.Exists(Dest)) then
+         (TFile.Exists(Dest) or TDirectory.Exists(Dest) or
+          ArchivePathExists(Dest)) then
       begin
         if not Seen.ContainsKey(LowerCase(ExcludeTrailingPathDelimiter(
              ExtractFilePath(FItems[I].OldPath)) + '\' + FItems[I].OldName)) then
@@ -456,10 +458,11 @@ end;
 
 function TMultiRenameEngine.ApplyRenames: Integer;
 var
-  I: Integer;
-  Folder, TempName, Dummy, FinalPath: string;
+  I, ArcN, ArcI: Integer;
+  Z, Inner, Folder, TempName, Dummy, FinalPath: string;
   Temped: TArray<Boolean>;
-  Orig: TArray<string>;
+  Orig, ArcOld, ArcNew, ArcOut: TArray<string>;
+  ArcAt: TArray<Integer>;
   Info: TLiveOpInfo;
 begin
   Result := 0;
@@ -467,13 +470,25 @@ begin
   RebuildPreview;
   SetLength(Temped, Length(FItems));
   SetLength(Orig, Length(FItems));
+  SetLength(ArcOld, Length(FItems));
+  SetLength(ArcNew, Length(FItems));
+  SetLength(ArcAt, Length(FItems));
   for I := 0 to High(FItems) do
     Orig[I] := FItems[I].OldPath;
+  ArcN := 0;
   for I := 0 to High(FItems) do
   begin
     Temped[I] := False;
     if FItems[I].Collision or SameStr(FItems[I].NewName, FItems[I].OldName) then
       Continue;
+    if SplitArchivePath(FItems[I].OldPath, Z, Inner) and (Inner <> '') then
+    begin
+      ArcOld[ArcN] := FItems[I].OldPath;
+      ArcNew[ArcN] := FItems[I].NewName;
+      ArcAt[ArcN] := I;
+      Inc(ArcN);
+      Continue;
+    end;
     Folder := ExtractFilePath(FItems[I].OldPath);
     TempName := Format('.__vibe_%d_%d.tmp', [I, Random(MaxInt)]);
     if not RenamePath(FItems[I].OldPath, TempName, Dummy) then
@@ -485,6 +500,41 @@ begin
     end;
     FItems[I].OldPath := Dummy;
     Temped[I] := True;
+  end;
+  if (ArcN > 0) and not FileLockHalted then
+  begin
+    SetLength(ArcOld, ArcN);
+    SetLength(ArcNew, ArcN);
+    SetLength(ArcAt, ArcN);
+    try
+      RenameArchiveEntries(ArcOld, ArcNew, ArcOut);
+    except
+      on EAbort do
+        raise;
+      on Exception do
+        SetLength(ArcOut, 0);
+    end;
+    for ArcI := 0 to ArcN - 1 do
+    begin
+      I := ArcAt[ArcI];
+      if (ArcI > High(ArcOut)) or (ArcOut[ArcI] = '') then
+      begin
+        FItems[I].Skipped := True;
+        Continue;
+      end;
+      RetargetRenamedPath(Orig[I], ArcOut[ArcI]);
+      FItems[I].OldPath := ArcOut[ArcI];
+      FItems[I].OldName := FItems[I].NewName;
+      Info := Default(TLiveOpInfo);
+      Info.Kind := lokRename;
+      Info.Source := Orig[I];
+      Info.Dest := ArcOut[ArcI];
+      Info.Ok := True;
+      Info.IsDir := FItems[I].IsDirectory;
+      Info.Size := -1;
+      PublishLiveOp(Info);
+      Inc(Result);
+    end;
   end;
   for I := 0 to High(FItems) do
   begin
@@ -532,6 +582,7 @@ begin
       Continue;
     if not MoveFile(PChar(FItems[I].OldPath), PChar(Orig[I])) then
       Continue;
+    RetargetRenamedPath(FItems[I].OldPath, Orig[I]);
     Info := Default(TLiveOpInfo);
     Info.Kind := lokRename;
     Info.Source := FItems[I].OldPath;

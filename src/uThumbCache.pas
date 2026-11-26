@@ -17,9 +17,14 @@ function TryLoadSvgDom(const APath: string; out ADom: ISkSVGDOM): Boolean;
 function ReadSvgText(const APath: string): string;
 function ReadSvgSourceBytes(const APath: string; AMax: Integer): TBytes;
 function RenderSvgThumbRaw(const APath: string; AWidth, AHeight: Integer;
-  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+  out APixels: TBytes; out AOutW, AOutH: Integer;
+  ATrustContent: Boolean = False): Boolean;
 function IsThumbCandidate(const APath: string; AIsDir: Boolean = False;
   const ANameHint: string = ''): Boolean;
+{ TIF більший за 1 ГБ: свій декодер не запускати. Кадр лише з IFD1 або SubIFD. }
+function TiffOverDecoderLimit(const APath: string): Boolean;
+function TryTiffEmbeddedPixels(const APath: string; AMaxEdge: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 function LooksLikeLottieFile(const APath: string): Boolean;
 function ReadLottieJsonBytes(const APath: string; AMax: Integer;
   AAllowPartial: Boolean = False): TBytes;
@@ -33,6 +38,11 @@ type
   TThumbStamp = record
     Age: TDateTime;
     Bytes: Int64;
+  end;
+
+  THtmlBlankNote = record
+    Stamp: TThumbStamp;
+    Count: Integer;
   end;
 
   TCachedThumb = record
@@ -58,17 +68,34 @@ type
   private
     FCache: TDictionary<string, TCachedThumb>;
     FNoThumb: TDictionary<string, TThumbStamp>;
+    FHtmlBlank: TDictionary<string, THtmlBlankNote>;
+    FSniffMiss: TDictionary<string, THtmlBlankNote>;
+    { Великий TIF без кадру: перший промах не в FNoThumb. }
+    FHugeMiss: TDictionary<string, THtmlBlankNote>;
     FPending: TDictionary<string, Boolean>;
     FWait: TQueue<TThumbJob>;
+    { HTML окремо: один теплий WebView2 і не тримає загальні воркери. }
+    FHtmlWait: TQueue<TThumbJob>;
     FLock: TCriticalSection;
     FShuttingDown: Boolean;
     FBusy: Integer;
+    FHtmlBusy: Integer;
     FQueued: Integer;
     FEnabled: Boolean;
     FWorkersEnabled: Boolean;
     FMaxItems: Integer;
     FGeneration: Integer;
+    { Кнопка «Оновити»: пізній декод не повертає кадр і FNoThumb у скинуту папку. }
+    FThumbEpoch: Integer;
+    FEpochAt: Integer;
+    FEpochFolder: array[0..15] of string;
+    FEpochValue: array[0..15] of Integer;
     FOrder: TStringList;
+    { Старий шлях кадру, який вже перейменували. Пізній декод кладе результат на новий.
+      Якщо розширення змінилось, аліаса немає: старий кадр на новий тип не пишеться. }
+    FAlias: TDictionary<string, string>;
+    { Розширення до проміжного імені перейменування. Кінцеве інше розширення кадр не успадковує. }
+    FCarryExt: TDictionary<string, string>;
     FSlots: TDictionary<TObject, TThumbFocusSlot>;
     FSlotOrder: TList<TObject>;
     procedure TouchLocked(const APath: string);
@@ -77,8 +104,17 @@ type
     function ReadStamp(const APath: string; out AStamp: TThumbStamp): Boolean;
     function SameStamp(const A, B: TThumbStamp): Boolean;
     procedure RemoveCachedLocked(const APath: string);
+    procedure NoteHtmlBlankLocked(const APath: string; const AStamp: TThumbStamp);
+    procedure NoteSniffMissLocked(const APath: string; const AStamp: TThumbStamp);
+    procedure NoteHugeTiffMissLocked(const APath: string; const AStamp: TThumbStamp);
+    procedure DropQueuedLocked(const APath: string);
+    function FolderResetSince(const APath: string; AStarted: Integer): Boolean;
+    procedure DiscardRenamedLocked(const AOldPath, AOldWant: string);
+    procedure EnqueueJobLocked(const AJob: TThumbJob);
+    function ResolveAliasLocked(const APath: string): string;
     procedure PumpJobs;
-    procedure StartJob(const AJob: TThumbJob);
+    procedure PumpHtml;
+    procedure StartJob(const AJob: TThumbJob; AHtmlLane: Boolean);
     procedure RememberSlot(AOwner: TObject; const APaths, ANameHints: TArray<string>;
       ASize: Integer);
     procedure RebuildFromSlots(AFirst: TObject);
@@ -99,6 +135,9 @@ type
     function Generation: Integer;
     procedure Invalidate(const APath: string);
     procedure InvalidateFolder(const AFolder: string);
+    { Кадр зі старого шляху на новий, якщо тип той самий.
+      Інше розширення кадр не успадковує: плитка малює новий тип. }
+    procedure Retarget(const AOldPath, ANewPath: string);
     procedure Shutdown;
     function Quiescent: Boolean;
     procedure Clear;
@@ -119,6 +158,14 @@ implementation
 uses
   System.Zip, uVecPreview, uDxfPreview, uHtmlThumb, uArchiveEngine, uImageSniff,
   uMeshPreview, uHdrPreview;
+
+const
+  ThumbSniffMaxBytes = Int64(50) * 1024 * 1024;
+  ThumbSniffHeadBytes = 8192;
+  ThumbSniffHeadMs = 200;
+
+type
+  TSniffRender = (srNone, srFrame, srSoft, srSlow);
 
 function IsSvgThumbExt(const APath: string): Boolean;
 var
@@ -272,6 +319,59 @@ begin
 end;
 {$ENDIF}
 
+function ThumbExtBlocksSniff(const AExt: string): Boolean;
+begin
+  Result := IsArchiveExt(AExt) or IsMeshExt(AExt) or
+    MatchText(AExt, [
+      '.exe', '.dll', '.ocx', '.scr', '.sys', '.lnk', '.url', '.ico',
+      '.tgs', '.lottie',
+      '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.m4v', '.mpg',
+      '.mpeg', '.3gp', '.mts',
+      '.mp3', '.wav', '.flac', '.wma', '.aac', '.ogg', '.m4a', '.opus',
+      '.mid', '.midi', '.weba',
+      '.ttf', '.otf', '.ttc', '.woff', '.woff2', '.fon', '.eot',
+      '.xls', '.xlsb', '.xlt', '.xltx', '.xltm', '.doc', '.ppt', '.pptm',
+      '.ppsx']);
+end;
+
+function ThumbSniffPathBlocked(const APath: string): Boolean;
+begin
+  Result := IsRecycleBinPath(APath) or IsRecycleItemPath(APath) or
+    IsPortableDevicePath(APath) or IsDeviceNamespacePath(APath) or
+    IsVirtualShellPath(APath) or IsThisPCPath(APath);
+end;
+
+function ThumbExtHasNativePreview(const AExt: string): Boolean;
+begin
+  Result := IsRasterThumbExt(AExt) or IsHdrExt(AExt) or IsMetaThumbExt(AExt) or
+    IsCdrThumbExt(AExt) or IsPdfThumbExt(AExt) or IsSvgThumbExt(AExt) or
+    IsPsdThumbExt(AExt) or IsSpreadsheetThumbExt(AExt) or
+    IsDocumentThumbExt(AExt) or IsHtmlPageThumbExt(AExt) or
+    IsListedTextExt(AExt) or
+    (AExt = '.cur') or (AExt = '.dxf');
+end;
+
+{ Невідоме розширення без shell-кадру: нюхати. Відоме — лише якщо свій декодер уже впав.
+  Великий невідомий файл не нюхати: лишити іконку і не йти в shell. }
+function ThumbShouldSniff(const APath, AExt: string; ANativeTried: Boolean;
+  ABytes: Int64; var ASkipShell: Boolean): Boolean;
+begin
+  ASkipShell := False;
+  Result := False;
+  if ThumbExtBlocksSniff(AExt) or ThumbSniffPathBlocked(APath) then
+    Exit;
+  if ThumbExtHasNativePreview(AExt) then
+    Exit(ANativeTried);
+  {$IFDEF MSWINDOWS}
+  if ExtHasShellThumbnail(AExt) then
+    Exit(False);
+  {$ENDIF}
+  ASkipShell := True;
+  if ABytes > ThumbSniffMaxBytes then
+    Exit(False);
+  Result := True;
+end;
+
 function IsThumbCandidate(const APath: string; AIsDir: Boolean;
   const ANameHint: string): Boolean;
 var
@@ -309,7 +409,11 @@ begin
   end;
   Ext := ThumbExtOf(APath, ANameHint);
   if Ext = '' then
-    Exit;
+  begin
+    if ThumbSniffPathBlocked(APath) then
+      Exit;
+    Exit(True);
+  end;
   if IsArchiveExt(Ext) then
     Exit(True);
   { exe/lnk/ico — jumbo из IconCache, не полный decode и не shell-thumb. }
@@ -344,6 +448,9 @@ begin
   {$IFDEF MSWINDOWS}
   Result := ExtHasShellThumbnail(Ext);
   {$ENDIF}
+  if Result or ThumbExtBlocksSniff(Ext) or ThumbSniffPathBlocked(APath) then
+    Exit;
+  Result := True;
 end;
 
 function CopyHeadAscii(const ABytes: TBytes; AMax: Integer): string;
@@ -1136,7 +1243,8 @@ begin
 end;
 
 function RenderSvgThumbRaw(const APath: string; AWidth, AHeight: Integer;
-  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+  out APixels: TBytes; out AOutW, AOutH: Integer;
+  ATrustContent: Boolean): Boolean;
 var
   Dom: ISkSVGDOM;
   Surf: ISkSurface;
@@ -1151,7 +1259,7 @@ begin
   AOutH := 0;
   if (AWidth < 8) or (AHeight < 8) or (APath = '') then
     Exit;
-  if not IsSvgThumbExt(APath) then
+  if (not ATrustContent) and (not IsSvgThumbExt(APath)) then
     Exit;
   try
     if not TryLoadSvgDom(APath, Dom) then
@@ -1197,8 +1305,1087 @@ begin
   end;
 end;
 
-function RenderRasterThumbRaw(const APath: string; AWidth, AHeight: Integer;
+const
+  HugeTiffBytes = Int64(1024) * 1024 * 1024;
+  TiffEmbedMax = 8 * 1024 * 1024;
+  TiffEmbedEdge = 4096;
+
+type
+  TTiffEnt = record
+    Tag: Word;
+    Typ: Word;
+    Count: UInt64;
+    Val: TBytes;
+    Off: Int64;
+    InlineV: Boolean;
+  end;
+
+  TMiniEnt = record
+    Tag: Word;
+    Typ: Word;
+    Count: Cardinal;
+    Kind: Integer;
+    InlineB: array[0..3] of Byte;
+    Meta: TBytes;
+    Img: TArray<TBytes>;
+    ImgAt: TArray<Int64>;
+  end;
+
+  TTiffReader = class
+  public
+    FS: TFileStream;
+    LE: Boolean;
+    Big: Boolean;
+    destructor Destroy; override;
+    function Open(const APath: string): Boolean;
+    function Slice(AOff, ALen: Int64; out ABytes: TBytes): Boolean;
+    function UAt(const ABytes: TBytes; AAt, ALen: Integer): UInt64;
+    function ReadNum(AOff: Int64; ALen: Integer): UInt64;
+    function TypeSize(ATyp: Word): Integer;
+    function ReadHeader(out AIfd0: Int64): Boolean;
+    function ReadIFD(AOff: Int64; out AEnts: TArray<TTiffEnt>; out ANext: Int64): Boolean;
+    function FindTag(const AEnts: TArray<TTiffEnt>; ATag: Word; out AEnt: TTiffEnt): Boolean;
+    function ValueBytes(const AEnt: TTiffEnt; out ABytes: TBytes): Boolean;
+    function EntInts(const AEnt: TTiffEnt; out AVals: TArray<UInt64>): Boolean;
+    function EntU(const AEnt: TTiffEnt): UInt64;
+    function JpegBytes(const AEnts: TArray<TTiffEnt>): TBytes;
+    function RawPixels(const AEnts: TArray<TTiffEnt>; out APixels: TBytes;
+      out AW, AH: Integer): Boolean;
+    function BuildMini(const AEnts: TArray<TTiffEnt>): TBytes;
+  end;
+
+destructor TTiffReader.Destroy;
+begin
+  FS.Free;
+  inherited;
+end;
+
+function TTiffReader.Open(const APath: string): Boolean;
+begin
+  Result := False;
+  FS := nil;
+  if APath = '' then
+    Exit;
+  try
+    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  except
+    FS := nil;
+    Exit;
+  end;
+  Result := FS.Size >= 8;
+end;
+
+function TTiffReader.Slice(AOff, ALen: Int64; out ABytes: TBytes): Boolean;
+begin
+  Result := False;
+  SetLength(ABytes, 0);
+  if (FS = nil) or (AOff < 0) or (ALen < 0) or (ALen > TiffEmbedMax) then
+    Exit;
+  if AOff > FS.Size then
+    Exit;
+  if ALen > FS.Size - AOff then
+    Exit;
+  if ALen = 0 then
+    Exit(True);
+  try
+    FS.Position := AOff;
+    SetLength(ABytes, ALen);
+    FS.ReadBuffer(ABytes[0], ALen);
+    Result := True;
+  except
+    SetLength(ABytes, 0);
+    Result := False;
+  end;
+end;
+
+function TTiffReader.UAt(const ABytes: TBytes; AAt, ALen: Integer): UInt64;
+var
+  I: Integer;
+begin
+  Result := 0;
+  if (AAt < 0) or (ALen < 1) or (AAt + ALen > Length(ABytes)) then
+    Exit;
+  if LE then
+  begin
+    for I := ALen - 1 downto 0 do
+      Result := (Result shl 8) or ABytes[AAt + I];
+  end
+  else
+    for I := 0 to ALen - 1 do
+      Result := (Result shl 8) or ABytes[AAt + I];
+end;
+
+function TTiffReader.ReadNum(AOff: Int64; ALen: Integer): UInt64;
+var
+  B: TBytes;
+begin
+  Result := 0;
+  if Slice(AOff, ALen, B) then
+    Result := UAt(B, 0, ALen);
+end;
+
+function TTiffReader.TypeSize(ATyp: Word): Integer;
+begin
+  case ATyp of
+    1, 2, 6, 7: Result := 1;
+    3, 8: Result := 2;
+    4, 9, 11, 13: Result := 4;
+    5, 10, 12, 16, 17, 18: Result := 8;
+  else
+    Result := 0;
+  end;
+end;
+
+function TTiffReader.ReadHeader(out AIfd0: Int64): Boolean;
+var
+  B: TBytes;
+  Ver: UInt64;
+begin
+  Result := False;
+  AIfd0 := 0;
+  LE := True;
+  Big := False;
+  if not Slice(0, 8, B) then
+    Exit;
+  if (B[0] = Ord('I')) and (B[1] = Ord('I')) then
+    LE := True
+  else if (B[0] = Ord('M')) and (B[1] = Ord('M')) then
+    LE := False
+  else
+    Exit;
+  Ver := UAt(B, 2, 2);
+  if Ver = 42 then
+  begin
+    Big := False;
+    AIfd0 := Int64(UAt(B, 4, 4));
+  end
+  else if Ver = 43 then
+  begin
+    Big := True;
+    if not Slice(0, 16, B) then
+      Exit;
+    if UAt(B, 4, 2) <> 8 then
+      Exit;
+    AIfd0 := Int64(UAt(B, 8, 8));
+  end
+  else
+    Exit;
+  Result := AIfd0 >= 8;
+end;
+
+function TTiffReader.ReadIFD(AOff: Int64; out AEnts: TArray<TTiffEnt>;
+  out ANext: Int64): Boolean;
+var
+  Cnt: UInt64;
+  EntSize, InlineMax, Head, NextN, I, N, Base, Sz: Integer;
+  Blob, Val: TBytes;
+  E: TTiffEnt;
+  BytesLen: UInt64;
+begin
+  Result := False;
+  SetLength(AEnts, 0);
+  ANext := 0;
+  if AOff < 8 then
+    Exit;
+  if Big then
+  begin
+    Cnt := ReadNum(AOff, 8);
+    Head := 8;
+    EntSize := 20;
+    InlineMax := 8;
+    NextN := 8;
+  end
+  else
+  begin
+    Cnt := ReadNum(AOff, 2);
+    Head := 2;
+    EntSize := 12;
+    InlineMax := 4;
+    NextN := 4;
+  end;
+  if (Cnt < 1) or (Cnt > 512) then
+    Exit;
+  N := Integer(Cnt);
+  if not Slice(AOff, Head + Int64(N) * EntSize + NextN, Blob) then
+    Exit;
+  SetLength(AEnts, N);
+  for I := 0 to N - 1 do
+  begin
+    Base := Head + I * EntSize;
+    E.Tag := Word(UAt(Blob, Base, 2));
+    E.Typ := Word(UAt(Blob, Base + 2, 2));
+    if Big then
+    begin
+      E.Count := UAt(Blob, Base + 4, 8);
+      SetLength(Val, 8);
+      Move(Blob[Base + 12], Val[0], 8);
+    end
+    else
+    begin
+      E.Count := UAt(Blob, Base + 4, 4);
+      SetLength(Val, 4);
+      Move(Blob[Base + 8], Val[0], 4);
+    end;
+    E.Val := Val;
+    Sz := TypeSize(E.Typ);
+    E.InlineV := False;
+    E.Off := 0;
+    if (Sz > 0) and (E.Count > 0) and
+       (E.Count <= (UInt64(TiffEmbedMax) div UInt64(Sz))) then
+    begin
+      BytesLen := E.Count * UInt64(Sz);
+      E.InlineV := BytesLen <= UInt64(InlineMax);
+      if not E.InlineV then
+        E.Off := Int64(UAt(Val, 0, Length(Val)));
+    end;
+    AEnts[I] := E;
+  end;
+  ANext := Int64(UAt(Blob, Head + N * EntSize, NextN));
+  Result := True;
+end;
+
+function TTiffReader.FindTag(const AEnts: TArray<TTiffEnt>; ATag: Word;
+  out AEnt: TTiffEnt): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  AEnt := Default(TTiffEnt);
+  for I := 0 to High(AEnts) do
+    if AEnts[I].Tag = ATag then
+    begin
+      AEnt := AEnts[I];
+      Exit(True);
+    end;
+end;
+
+function TTiffReader.ValueBytes(const AEnt: TTiffEnt; out ABytes: TBytes): Boolean;
+var
+  Sz: Integer;
+  N: Int64;
+begin
+  Result := False;
+  SetLength(ABytes, 0);
+  Sz := TypeSize(AEnt.Typ);
+  if (Sz <= 0) or (AEnt.Count < 1) then
+    Exit;
+  if AEnt.Count > (UInt64(TiffEmbedMax) div UInt64(Sz)) then
+    Exit;
+  N := Int64(AEnt.Count) * Sz;
+  if AEnt.InlineV then
+  begin
+    if N > Length(AEnt.Val) then
+      Exit;
+    SetLength(ABytes, N);
+    if N > 0 then
+      Move(AEnt.Val[0], ABytes[0], N);
+    Exit(True);
+  end;
+  Result := Slice(AEnt.Off, N, ABytes);
+end;
+
+function TTiffReader.EntInts(const AEnt: TTiffEnt; out AVals: TArray<UInt64>): Boolean;
+var
+  Sz, I, N: Integer;
+  Raw: TBytes;
+begin
+  Result := False;
+  SetLength(AVals, 0);
+  Sz := TypeSize(AEnt.Typ);
+  if (Sz <= 0) or (AEnt.Count < 1) or (AEnt.Count > 8192) then
+    Exit;
+  N := Integer(AEnt.Count);
+  if not ValueBytes(AEnt, Raw) then
+    Exit;
+  if Length(Raw) < N * Sz then
+    Exit;
+  SetLength(AVals, N);
+  for I := 0 to N - 1 do
+    AVals[I] := UAt(Raw, I * Sz, Sz);
+  Result := True;
+end;
+
+function TTiffReader.EntU(const AEnt: TTiffEnt): UInt64;
+var
+  V: TArray<UInt64>;
+begin
+  if EntInts(AEnt, V) and (Length(V) > 0) then
+    Result := V[0]
+  else
+    Result := 0;
+end;
+
+function TTiffReader.JpegBytes(const AEnts: TArray<TTiffEnt>): TBytes;
+var
+  A, B, Offs, Cnts, Comp: TTiffEnt;
+  Off, Len, Total: UInt64;
+  VOff, VCnt: TArray<UInt64>;
+  I, Dest: Integer;
+  Part, All: TBytes;
+begin
+  SetLength(Result, 0);
+  if FindTag(AEnts, 513, A) and FindTag(AEnts, 514, B) then
+  begin
+    Off := EntU(A);
+    Len := EntU(B);
+    if (Len >= 32) and (Len <= UInt64(TiffEmbedMax)) and
+       Slice(Int64(Off), Int64(Len), Result) and (Length(Result) >= 2) and
+       (Result[0] = $FF) and (Result[1] = $D8) then
+      Exit;
+    SetLength(Result, 0);
+  end;
+  if not FindTag(AEnts, 259, Comp) then
+    Exit;
+  if (EntU(Comp) <> 6) and (EntU(Comp) <> 7) then
+    Exit;
+  if not FindTag(AEnts, 273, Offs) or not FindTag(AEnts, 279, Cnts) then
+    Exit;
+  if not EntInts(Offs, VOff) or not EntInts(Cnts, VCnt) then
+    Exit;
+  if (Length(VOff) = 0) or (Length(VOff) <> Length(VCnt)) then
+    Exit;
+  Total := 0;
+  for I := 0 to High(VCnt) do
+  begin
+    if (VCnt[I] > UInt64(TiffEmbedMax)) or
+       (Total > UInt64(TiffEmbedMax) - VCnt[I]) then
+      Exit;
+    Total := Total + VCnt[I];
+  end;
+  if Total < 32 then
+    Exit;
+  SetLength(All, Total);
+  Dest := 0;
+  for I := 0 to High(VOff) do
+  begin
+    if not Slice(Int64(VOff[I]), Int64(VCnt[I]), Part) then
+    begin
+      SetLength(Result, 0);
+      Exit;
+    end;
+    if Length(Part) > 0 then
+      Move(Part[0], All[Dest], Length(Part));
+    Inc(Dest, Length(Part));
+  end;
+  if (Length(All) >= 2) and (All[0] = $FF) and (All[1] = $D8) then
+    Result := All;
+end;
+
+function TTiffReader.RawPixels(const AEnts: TArray<TTiffEnt>; out APixels: TBytes;
+  out AW, AH: Integer): Boolean;
+var
+  Ent, Offs, Cnts: TTiffEnt;
+  W, H, Spp, Photo, Rps, Row, Need, Y, X, P, DI, RY, Rows, I: Integer;
+  Comp, Planar: UInt64;
+  Bps, VOff, VCnt: TArray<UInt64>;
+  Strips: TArray<TBytes>;
+  Total: UInt64;
+  G, RR, GG, BB: Byte;
+  Ok: Boolean;
+begin
+  Result := False;
+  SetLength(APixels, 0);
+  AW := 0;
+  AH := 0;
+  if FindTag(AEnts, 254, Ent) and ((EntU(Ent) and 4) <> 0) then
+    Exit;
+  if not FindTag(AEnts, 256, Ent) then
+    Exit;
+  W := Integer(EntU(Ent));
+  if not FindTag(AEnts, 257, Ent) then
+    Exit;
+  H := Integer(EntU(Ent));
+  if (W < 1) or (H < 1) or (W > TiffEmbedEdge) or (H > TiffEmbedEdge) then
+    Exit;
+  Comp := 1;
+  if FindTag(AEnts, 259, Ent) then
+    Comp := EntU(Ent);
+  if Comp <> 1 then
+    Exit;
+  Planar := 1;
+  if FindTag(AEnts, 284, Ent) then
+    Planar := EntU(Ent);
+  if Planar <> 1 then
+    Exit;
+  Spp := 1;
+  if FindTag(AEnts, 277, Ent) then
+    Spp := Integer(EntU(Ent));
+  if (Spp <> 1) and (Spp <> 3) and (Spp <> 4) then
+    Exit;
+  if not FindTag(AEnts, 258, Ent) or not EntInts(Ent, Bps) or (Length(Bps) < 1) then
+    Exit;
+  if (Length(Bps) <> 1) and (Length(Bps) <> Spp) then
+    Exit;
+  for I := 0 to High(Bps) do
+    if Bps[I] <> 8 then
+      Exit;
+  if Spp = 1 then
+    Photo := 1
+  else
+    Photo := -1;
+  if FindTag(AEnts, 262, Ent) then
+    Photo := Integer(EntU(Ent))
+  else if Spp <> 1 then
+    Exit;
+  if (Photo <> 0) and (Photo <> 1) and (Photo <> 2) then
+    Exit;
+  if ((Photo = 0) or (Photo = 1)) and (Spp <> 1) then
+    Exit;
+  if (Photo = 2) and (Spp < 3) then
+    Exit;
+  Row := W * Spp;
+  if (Row < 1) or (Int64(Row) * H > TiffEmbedMax) then
+    Exit;
+  if not FindTag(AEnts, 273, Offs) or not FindTag(AEnts, 279, Cnts) then
+    Exit;
+  if not EntInts(Offs, VOff) or not EntInts(Cnts, VCnt) then
+    Exit;
+  if (Length(VOff) < 1) or (Length(VOff) <> Length(VCnt)) then
+    Exit;
+  Total := 0;
+  for I := 0 to High(VCnt) do
+  begin
+    if (VCnt[I] < 1) or (VCnt[I] > UInt64(TiffEmbedMax)) or
+       (Total > UInt64(TiffEmbedMax) - VCnt[I]) then
+      Exit;
+    Total := Total + VCnt[I];
+  end;
+  Rps := H;
+  if FindTag(AEnts, 278, Ent) then
+  begin
+    Rps := Integer(EntU(Ent));
+    if Rps < 1 then
+      Exit;
+  end;
+  SetLength(Strips, Length(VOff));
+  for I := 0 to High(VOff) do
+    if not Slice(Int64(VOff[I]), Int64(VCnt[I]), Strips[I]) then
+      Exit;
+  SetLength(APixels, Int64(W) * H * 4);
+  Ok := True;
+  Y := 0;
+  for I := 0 to High(Strips) do
+  begin
+    if Y >= H then
+      Break;
+    Rows := Rps;
+    if Y + Rows > H then
+      Rows := H - Y;
+    Need := Rows * Row;
+    if (Need < 1) or (Length(Strips[I]) < Need) then
+    begin
+      Ok := False;
+      Break;
+    end;
+    DI := 0;
+    for RY := 0 to Rows - 1 do
+    begin
+      P := (Y + RY) * W * 4;
+      for X := 0 to W - 1 do
+      begin
+        if Spp = 1 then
+        begin
+          G := Strips[I][DI];
+          if Photo = 0 then
+            G := Byte(255 - G);
+          APixels[P] := G;
+          APixels[P + 1] := G;
+          APixels[P + 2] := G;
+          APixels[P + 3] := 255;
+          Inc(DI);
+        end
+        else
+        begin
+          RR := Strips[I][DI];
+          GG := Strips[I][DI + 1];
+          BB := Strips[I][DI + 2];
+          APixels[P] := BB;
+          APixels[P + 1] := GG;
+          APixels[P + 2] := RR;
+          if Spp = 4 then
+            APixels[P + 3] := Strips[I][DI + 3]
+          else
+            APixels[P + 3] := 255;
+          Inc(DI, Spp);
+        end;
+        Inc(P, 4);
+      end;
+    end;
+    Inc(Y, Rows);
+  end;
+  if (not Ok) or (Y < H) then
+  begin
+    SetLength(APixels, 0);
+    Exit;
+  end;
+  AW := W;
+  AH := H;
+  Result := True;
+end;
+
+function TTiffReader.BuildMini(const AEnts: TArray<TTiffEnt>): TBytes;
+const
+  MetaCap = 1024 * 1024;
+var
+  Items: TArray<TMiniEnt>;
+  Ent: TTiffEnt;
+  Vals, VOff, VCnt: TArray<UInt64>;
+  Parts: TArray<TBytes>;
+  Jpeg, Dir, Pay, Arr: TBytes;
+  I, J, N, EntAt, At: Integer;
+  Fit32, HasImage: Boolean;
+  FileAt: Int64;
+  Offs: TArray<Int64>;
+
+  procedure Put16(var B: TBytes; AAt: Integer; V: Word);
+  begin
+    if LE then
+    begin
+      B[AAt] := Byte(V and $FF);
+      B[AAt + 1] := Byte((V shr 8) and $FF);
+    end
+    else
+    begin
+      B[AAt] := Byte((V shr 8) and $FF);
+      B[AAt + 1] := Byte(V and $FF);
+    end;
+  end;
+
+  procedure Put32(var B: TBytes; AAt: Integer; V: Cardinal);
+  begin
+    if LE then
+    begin
+      B[AAt] := Byte(V and $FF);
+      B[AAt + 1] := Byte((V shr 8) and $FF);
+      B[AAt + 2] := Byte((V shr 16) and $FF);
+      B[AAt + 3] := Byte((V shr 24) and $FF);
+    end
+    else
+    begin
+      B[AAt] := Byte((V shr 24) and $FF);
+      B[AAt + 1] := Byte((V shr 16) and $FF);
+      B[AAt + 2] := Byte((V shr 8) and $FF);
+      B[AAt + 3] := Byte(V and $FF);
+    end;
+  end;
+
+  procedure Put32At(var B: TBytes; AAt: Integer; V: Cardinal);
+  begin
+    if AAt + 3 >= Length(B) then
+      Exit;
+    Put32(B, AAt, V);
+  end;
+
+  function LoadPieces(const AOffs, ACnts: TArray<UInt64>;
+    out AParts: TArray<TBytes>): Boolean;
+  var
+    K: Integer;
+    Total: UInt64;
+  begin
+    Result := False;
+    SetLength(AParts, 0);
+    if (Length(AOffs) < 1) or (Length(AOffs) <> Length(ACnts)) then
+      Exit;
+    Total := 0;
+    for K := 0 to High(ACnts) do
+    begin
+      if (ACnts[K] < 1) or (ACnts[K] > UInt64(TiffEmbedMax)) or
+         (Total > UInt64(TiffEmbedMax) - ACnts[K]) then
+        Exit;
+      Total := Total + ACnts[K];
+    end;
+    SetLength(AParts, Length(AOffs));
+    for K := 0 to High(AOffs) do
+      if not Slice(Int64(AOffs[K]), Int64(ACnts[K]), AParts[K]) then
+      begin
+        SetLength(AParts, 0);
+        Exit;
+      end;
+    Result := True;
+  end;
+
+  procedure Push(const AItem: TMiniEnt);
+  begin
+    SetLength(Items, Length(Items) + 1);
+    Items[High(Items)] := AItem;
+  end;
+
+  function MakeLongArray(ATag: Word; const AVals: TArray<UInt64>): TMiniEnt;
+  var
+    K: Integer;
+    Raw: TBytes;
+  begin
+    Result := Default(TMiniEnt);
+    Result.Tag := ATag;
+    Result.Typ := 4;
+    Result.Count := Length(AVals);
+    if Length(AVals) = 1 then
+    begin
+      Result.Kind := 0;
+      FillChar(Result.InlineB, SizeOf(Result.InlineB), 0);
+      if LE then
+      begin
+        Result.InlineB[0] := Byte(AVals[0] and $FF);
+        Result.InlineB[1] := Byte((AVals[0] shr 8) and $FF);
+        Result.InlineB[2] := Byte((AVals[0] shr 16) and $FF);
+        Result.InlineB[3] := Byte((AVals[0] shr 24) and $FF);
+      end
+      else
+      begin
+        Result.InlineB[0] := Byte((AVals[0] shr 24) and $FF);
+        Result.InlineB[1] := Byte((AVals[0] shr 16) and $FF);
+        Result.InlineB[2] := Byte((AVals[0] shr 8) and $FF);
+        Result.InlineB[3] := Byte(AVals[0] and $FF);
+      end;
+    end
+    else
+    begin
+      Result.Kind := 1;
+      SetLength(Raw, Length(AVals) * 4);
+      for K := 0 to High(AVals) do
+        Put32(Raw, K * 4, Cardinal(AVals[K]));
+      Result.Meta := Raw;
+    end;
+  end;
+
+  function AppendPay(const Src: TBytes): Int64;
+  var
+    Nsrc: Integer;
+  begin
+    Result := Int64(14 + Length(Items) * 12 + Length(Pay));
+    Nsrc := Length(Src);
+    if Nsrc < 1 then
+      Exit;
+    At := Length(Pay);
+    SetLength(Pay, At + Nsrc);
+    Move(Src[0], Pay[At], Nsrc);
+    if (Length(Pay) and 1) <> 0 then
+    begin
+      At := Length(Pay);
+      SetLength(Pay, At + 1);
+      Pay[At] := 0;
+    end;
+  end;
+
+  function AttachPair(AOffTag, ACntTag: Word): Boolean;
+  var
+    OE, CE: TTiffEnt;
+    M: TMiniEnt;
+  begin
+    Result := True;
+    if not FindTag(AEnts, AOffTag, OE) then
+      Exit;
+    Result := False;
+    if not FindTag(AEnts, ACntTag, CE) then
+      Exit;
+    if not EntInts(OE, VOff) or not EntInts(CE, VCnt) then
+      Exit;
+    if not LoadPieces(VOff, VCnt, Parts) then
+      Exit;
+    M := Default(TMiniEnt);
+    M.Tag := AOffTag;
+    M.Typ := 4;
+    M.Count := Length(Parts);
+    M.Kind := 2;
+    M.Img := Parts;
+    Push(M);
+    Push(MakeLongArray(ACntTag, VCnt));
+    HasImage := True;
+    Result := True;
+  end;
+
+begin
+  SetLength(Result, 0);
+  SetLength(Items, 0);
+  HasImage := False;
+  for I := 0 to High(AEnts) do
+  begin
+    if (AEnts[I].Tag = 330) or (AEnts[I].Tag = 34665) or
+       (AEnts[I].Tag = 34853) or (AEnts[I].Tag = 40965) or
+       (AEnts[I].Tag = 273) or (AEnts[I].Tag = 279) or
+       (AEnts[I].Tag = 324) or (AEnts[I].Tag = 325) or
+       (AEnts[I].Tag = 513) or (AEnts[I].Tag = 514) then
+      Continue;
+    if (AEnts[I].Typ = 16) or (AEnts[I].Typ = 17) then
+    begin
+      if (AEnts[I].Count >= 1) and (AEnts[I].Count <= 1024) and
+         EntInts(AEnts[I], Vals) then
+      begin
+        Fit32 := True;
+        for J := 0 to High(Vals) do
+          if Vals[J] > $FFFFFFFF then
+            Fit32 := False;
+        if Fit32 and (Length(Vals) > 0) then
+          Push(MakeLongArray(AEnts[I].Tag, Vals));
+      end;
+      Continue;
+    end;
+    if (TypeSize(AEnts[I].Typ) < 1) or (AEnts[I].Count < 1) then
+      Continue;
+    if AEnts[I].Count > (UInt64(MetaCap) div UInt64(TypeSize(AEnts[I].Typ))) then
+      Continue;
+    N := Integer(AEnts[I].Count) * TypeSize(AEnts[I].Typ);
+    if (N < 1) or (N > MetaCap) then
+      Continue;
+    if not ValueBytes(AEnts[I], Jpeg) then
+      Continue;
+    if Length(Jpeg) <> N then
+      Continue;
+    SetLength(Items, Length(Items) + 1);
+    Items[High(Items)] := Default(TMiniEnt);
+    Items[High(Items)].Tag := AEnts[I].Tag;
+    Items[High(Items)].Typ := AEnts[I].Typ;
+    Items[High(Items)].Count := Cardinal(AEnts[I].Count);
+    if N <= 4 then
+    begin
+      Items[High(Items)].Kind := 0;
+      FillChar(Items[High(Items)].InlineB, SizeOf(Items[High(Items)].InlineB), 0);
+      Move(Jpeg[0], Items[High(Items)].InlineB[0], N);
+    end
+    else
+    begin
+      Items[High(Items)].Kind := 1;
+      Items[High(Items)].Meta := Jpeg;
+    end;
+  end;
+  if FindTag(AEnts, 273, Ent) and not AttachPair(273, 279) then
+    Exit;
+  if FindTag(AEnts, 324, Ent) and not AttachPair(324, 325) then
+    Exit;
+  if FindTag(AEnts, 513, Ent) and FindTag(AEnts, 514, Ent) then
+  begin
+    if EntU(Ent) > 0 then
+    begin
+      if FindTag(AEnts, 514, Ent) then
+      begin
+        FileAt := 0;
+        if FindTag(AEnts, 513, Ent) then
+          FileAt := Int64(EntU(Ent));
+        if FindTag(AEnts, 514, Ent) and
+           (EntU(Ent) >= 32) and (EntU(Ent) <= UInt64(TiffEmbedMax)) and
+           Slice(FileAt, Int64(EntU(Ent)), Jpeg) and (Length(Jpeg) >= 2) then
+        begin
+          SetLength(Parts, 1);
+          Parts[0] := Jpeg;
+          SetLength(Items, Length(Items) + 1);
+          Items[High(Items)] := Default(TMiniEnt);
+          Items[High(Items)].Tag := 513;
+          Items[High(Items)].Typ := 4;
+          Items[High(Items)].Count := 1;
+          Items[High(Items)].Kind := 2;
+          Items[High(Items)].Img := Parts;
+          SetLength(Vals, 1);
+          Vals[0] := Length(Jpeg);
+          Push(MakeLongArray(514, Vals));
+          HasImage := True;
+        end;
+      end;
+    end;
+  end;
+  if not HasImage then
+    Exit;
+  N := Length(Items);
+  if (N < 1) or (N > 512) then
+    Exit;
+  SetLength(Dir, 14 + N * 12);
+  FillChar(Dir[0], Length(Dir), 0);
+  if LE then
+  begin
+    Dir[0] := Ord('I');
+    Dir[1] := Ord('I');
+  end
+  else
+  begin
+    Dir[0] := Ord('M');
+    Dir[1] := Ord('M');
+  end;
+  Put16(Dir, 2, 42);
+  Put32(Dir, 4, 8);
+  Put16(Dir, 8, Word(N));
+  SetLength(Pay, 0);
+  for I := 0 to N - 1 do
+  begin
+    EntAt := 10 + I * 12;
+    Put16(Dir, EntAt, Items[I].Tag);
+    Put16(Dir, EntAt + 2, Items[I].Typ);
+    Put32(Dir, EntAt + 4, Items[I].Count);
+    if Items[I].Kind = 0 then
+    begin
+      Dir[EntAt + 8] := Items[I].InlineB[0];
+      Dir[EntAt + 9] := Items[I].InlineB[1];
+      Dir[EntAt + 10] := Items[I].InlineB[2];
+      Dir[EntAt + 11] := Items[I].InlineB[3];
+    end
+    else if Items[I].Kind = 1 then
+      Put32At(Dir, EntAt + 8, Cardinal(AppendPay(Items[I].Meta)))
+    else
+    begin
+      SetLength(Offs, Length(Items[I].Img));
+      for J := 0 to High(Items[I].Img) do
+        Offs[J] := AppendPay(Items[I].Img[J]);
+      if Length(Offs) = 1 then
+        Put32At(Dir, EntAt + 8, Cardinal(Offs[0]))
+      else if Length(Offs) > 1 then
+      begin
+        SetLength(Arr, Length(Offs) * 4);
+        for J := 0 to High(Offs) do
+          Put32(Arr, J * 4, Cardinal(Offs[J]));
+        Put32At(Dir, EntAt + 8, Cardinal(AppendPay(Arr)));
+      end;
+    end;
+  end;
+  SetLength(Result, Length(Dir) + Length(Pay));
+  if Length(Dir) > 0 then
+    Move(Dir[0], Result[0], Length(Dir));
+  if Length(Pay) > 0 then
+    Move(Pay[0], Result[Length(Dir)], Length(Pay));
+end;
+
+function DecodeEncodedBgra(const AEnc: TBytes; out APixels: TBytes;
+  out AW, AH: Integer): Boolean;
+var
+  Img: ISkImage;
+  Info: TSkImageInfo;
+begin
+  Result := False;
+  SetLength(APixels, 0);
+  AW := 0;
+  AH := 0;
+  if Length(AEnc) < 8 then
+    Exit;
+  try
+    Img := TSkImage.MakeFromEncoded(AEnc);
+    if Img = nil then
+      Exit;
+    AW := Img.Width;
+    AH := Img.Height;
+    if (AW < 1) or (AH < 1) or (AW > TiffEmbedEdge) or (AH > TiffEmbedEdge) then
+    begin
+      AW := 0;
+      AH := 0;
+      Exit;
+    end;
+    Info := TSkImageInfo.Create(AW, AH, TSkColorType.BGRA8888, TSkAlphaType.Unpremul);
+    SetLength(APixels, Int64(AW) * AH * 4);
+    Result := Img.ReadPixels(Info, @APixels[0], NativeUInt(AW) * 4);
+    if not Result then
+    begin
+      SetLength(APixels, 0);
+      AW := 0;
+      AH := 0;
+    end;
+  except
+    Result := False;
+    SetLength(APixels, 0);
+    AW := 0;
+    AH := 0;
+  end;
+end;
+
+function FitBgraDown(var APixels: TBytes; var AW, AH: Integer;
+  AMaxEdge: Integer): Boolean;
+var
+  Img: ISkImage;
+  SrcInfo, DstInfo: TSkImageInfo;
+  DstW, DstH: Integer;
+  Scale: Double;
+  Dst: TBytes;
+begin
+  Result := False;
+  if (AW < 1) or (AH < 1) or (Length(APixels) < Int64(AW) * AH * 4) then
+    Exit;
+  if (AMaxEdge >= 8) and (AW <= AMaxEdge) and (AH <= AMaxEdge) then
+    Exit(True);
+  if AMaxEdge < 8 then
+    Exit(True);
+  Scale := Min(AMaxEdge / AW, AMaxEdge / AH);
+  if Scale > 1 then
+    Scale := 1;
+  DstW := Max(1, Round(AW * Scale));
+  DstH := Max(1, Round(AH * Scale));
+  if (DstW = AW) and (DstH = AH) then
+    Exit(True);
+  try
+    SrcInfo := TSkImageInfo.Create(AW, AH, TSkColorType.BGRA8888, TSkAlphaType.Unpremul);
+    Img := TSkImage.MakeRasterCopy(SrcInfo, @APixels[0], NativeUInt(AW) * 4);
+    if Img = nil then
+      Exit;
+    DstInfo := TSkImageInfo.Create(DstW, DstH, TSkColorType.BGRA8888, TSkAlphaType.Unpremul);
+    SetLength(Dst, Int64(DstW) * DstH * 4);
+    if not Img.ScalePixels(DstInfo, @Dst[0], NativeUInt(DstW) * 4,
+      TSkSamplingOptions.Medium) then
+      Exit;
+    APixels := Dst;
+    AW := DstW;
+    AH := DstH;
+    Result := True;
+  except
+    Result := False;
+  end;
+end;
+
+function TiffOverDecoderLimit(const APath: string): Boolean;
+var
+  Ext: string;
+  Sz: Int64;
+begin
+  Result := False;
+  if APath = '' then
+    Exit;
+  Ext := LowerCase(ExtractFileExt(APath));
+  if (Ext <> '.tif') and (Ext <> '.tiff') then
+    Exit;
+  try
+    if not TFile.Exists(APath) then
+      Exit;
+    Sz := TFile.GetSize(APath);
+  except
+    Exit;
+  end;
+  Result := Sz > HugeTiffBytes;
+end;
+
+function TryTiffEmbeddedPixels(const APath: string; AMaxEdge: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+var
+  R: TTiffReader;
+  Ifd0, Next, Next1: Int64;
+  Ents0, Ents1, Ents: TArray<TTiffEnt>;
+  Cands: TArray<Int64>;
+  I, Edge, W, H, Area, BestArea, BestW, BestH: Integer;
+  Pix, BestPix: TBytes;
+
+  procedure AddCand(AOff: Int64);
+  var
+    K: Integer;
+  begin
+    if AOff < 8 then
+      Exit;
+    if AOff = Ifd0 then
+      Exit;
+    if (R = nil) or (R.FS = nil) or (AOff >= R.FS.Size) then
+      Exit;
+    if Length(Cands) >= 8 then
+      Exit;
+    for K := 0 to High(Cands) do
+      if Cands[K] = AOff then
+        Exit;
+    SetLength(Cands, Length(Cands) + 1);
+    Cands[High(Cands)] := AOff;
+  end;
+
+  procedure AddSubs(const AEnts: TArray<TTiffEnt>);
+  var
+    E: TTiffEnt;
+    S: TArray<UInt64>;
+    K: Integer;
+  begin
+    if not R.FindTag(AEnts, 330, E) then
+      Exit;
+    if not R.EntInts(E, S) then
+      Exit;
+    for K := 0 to High(S) do
+      AddCand(Int64(S[K]));
+  end;
+
+  function TryOne(const AEnts: TArray<TTiffEnt>; out OP: TBytes;
+    out OW, OH: Integer): Boolean;
+  var
+    E: TTiffEnt;
+    Jpg, Mini: TBytes;
+  begin
+    Result := False;
+    SetLength(OP, 0);
+    OW := 0;
+    OH := 0;
+    if R.FindTag(AEnts, 254, E) and ((R.EntU(E) and 4) <> 0) then
+      Exit;
+    if R.FindTag(AEnts, 256, E) and (Integer(R.EntU(E)) > TiffEmbedEdge) then
+      Exit;
+    if R.FindTag(AEnts, 257, E) and (Integer(R.EntU(E)) > TiffEmbedEdge) then
+      Exit;
+    Jpg := R.JpegBytes(AEnts);
+    if (Length(Jpg) > 0) and DecodeEncodedBgra(Jpg, OP, OW, OH) then
+      Exit(True);
+    SetLength(OP, 0);
+    if R.RawPixels(AEnts, OP, OW, OH) then
+      Exit(True);
+    Mini := R.BuildMini(AEnts);
+    if Length(Mini) > 0 then
+      Result := DecodeEncodedBgra(Mini, OP, OW, OH);
+  end;
+
+begin
+  Result := False;
+  SetLength(APixels, 0);
+  AOutW := 0;
+  AOutH := 0;
+  Edge := AMaxEdge;
+  if Edge < 8 then
+    Edge := 8;
+  if Edge > 2048 then
+    Edge := 2048;
+  R := TTiffReader.Create;
+  try
+    try
+      if not R.Open(APath) then
+        Exit;
+      if not R.ReadHeader(Ifd0) then
+        Exit;
+      if not R.ReadIFD(Ifd0, Ents0, Next) then
+        Exit;
+      SetLength(Cands, 0);
+      AddCand(Next);
+      AddSubs(Ents0);
+      if Next >= 8 then
+      begin
+        if R.ReadIFD(Next, Ents1, Next1) then
+          AddSubs(Ents1);
+      end;
+      BestArea := 0;
+      BestW := 0;
+      BestH := 0;
+      SetLength(BestPix, 0);
+      for I := 0 to High(Cands) do
+      begin
+        if not R.ReadIFD(Cands[I], Ents, Next1) then
+          Continue;
+        if not TryOne(Ents, Pix, W, H) then
+          Continue;
+        if (W < 1) or (H < 1) or (Length(Pix) < Int64(W) * H * 4) then
+          Continue;
+        Area := W * H;
+        if Area > BestArea then
+        begin
+          BestArea := Area;
+          BestW := W;
+          BestH := H;
+          SetLength(BestPix, Length(Pix));
+          Move(Pix[0], BestPix[0], Length(Pix));
+        end;
+      end;
+      if (BestArea < 1) or (Length(BestPix) < 4) then
+        Exit;
+      if not FitBgraDown(BestPix, BestW, BestH, Edge) then
+        Exit;
+      APixels := BestPix;
+      AOutW := BestW;
+      AOutH := BestH;
+      Result := (AOutW > 0) and (AOutH > 0);
+    except
+      Result := False;
+      SetLength(APixels, 0);
+      AOutW := 0;
+      AOutH := 0;
+    end;
+  finally
+    R.Free;
+  end;
+end;
+
+function RenderRasterThumbRaw(const APath: string; AWidth, AHeight: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer;
+  ATrustContent: Boolean = False): Boolean;
 var
   Img: ISkImage;
   Enc: TBytes;
@@ -1212,8 +2399,13 @@ begin
   AOutH := 0;
   if (AWidth < 8) or (AHeight < 8) or (APath = '') then
     Exit;
-  if not IsRasterThumbExt(ThumbExtOf(APath, '')) then
+  if (not ATrustContent) and (not IsRasterThumbExt(ThumbExtOf(APath, ''))) then
     Exit;
+  if TiffOverDecoderLimit(APath) then
+  begin
+    Result := TryTiffEmbeddedPixels(APath, Min(AWidth, AHeight), APixels, AOutW, AOutH);
+    Exit;
+  end;
   try
     Img := TSkImage.MakeFromEncodedFile(APath);
     if Img = nil then
@@ -1370,14 +2562,21 @@ begin
   inherited Create;
   FCache := TDictionary<string, TCachedThumb>.Create;
   FNoThumb := TDictionary<string, TThumbStamp>.Create;
+  FHtmlBlank := TDictionary<string, THtmlBlankNote>.Create;
+  FSniffMiss := TDictionary<string, THtmlBlankNote>.Create;
+  FHugeMiss := TDictionary<string, THtmlBlankNote>.Create;
   FPending := TDictionary<string, Boolean>.Create;
   FWait := TQueue<TThumbJob>.Create;
+  FHtmlWait := TQueue<TThumbJob>.Create;
   FOrder := TStringList.Create;
+  FAlias := TDictionary<string, string>.Create;
+  FCarryExt := TDictionary<string, string>.Create;
   FSlots := TDictionary<TObject, TThumbFocusSlot>.Create;
   FSlotOrder := TList<TObject>.Create;
   FLock := TCriticalSection.Create;
   FShuttingDown := False;
   FBusy := 0;
+  FHtmlBusy := 0;
   FQueued := 0;
   FEnabled := True;
   FWorkersEnabled := False;
@@ -1463,6 +2662,11 @@ begin
     FCache.Remove(APath);
   end;
   FNoThumb.Remove(APath);
+  FHtmlBlank.Remove(APath);
+  if FSniffMiss <> nil then
+    FSniffMiss.Remove(APath);
+  if FHugeMiss <> nil then
+    FHugeMiss.Remove(APath);
   Idx := FOrder.IndexOf(APath);
   if Idx >= 0 then
     FOrder.Delete(Idx);
@@ -1523,7 +2727,7 @@ end;
 
 function TThumbCache.Quiescent: Boolean;
 begin
-  Result := (FBusy = 0) and (FQueued = 0);
+  Result := (FBusy = 0) and (FHtmlBusy = 0) and (FQueued = 0);
 end;
 
 procedure TThumbCache.Shutdown;
@@ -1533,6 +2737,8 @@ begin
   FLock.Enter;
   try
     FWait.Clear;
+    if FHtmlWait <> nil then
+      FHtmlWait.Clear;
     FPending.Clear;
   finally
     FLock.Leave;
@@ -1545,9 +2751,15 @@ begin
   Clear;
   FCache.Free;
   FNoThumb.Free;
+  FHtmlBlank.Free;
+  FSniffMiss.Free;
+  FHugeMiss.Free;
   FPending.Free;
   FWait.Free;
+  FHtmlWait.Free;
   FOrder.Free;
+  FAlias.Free;
+  FCarryExt.Free;
   FSlots.Free;
   FSlotOrder.Free;
   FLock.Free;
@@ -1564,9 +2776,19 @@ begin
       Item.Bitmap.Free;
     FCache.Clear;
     FNoThumb.Clear;
+    FHtmlBlank.Clear;
+    if FSniffMiss <> nil then
+      FSniffMiss.Clear;
+    if FHugeMiss <> nil then
+      FHugeMiss.Clear;
     FPending.Clear;
     FWait.Clear;
+    if FHtmlWait <> nil then
+      FHtmlWait.Clear;
     FOrder.Clear;
+    FAlias.Clear;
+    if FCarryExt <> nil then
+      FCarryExt.Clear;
   finally
     FLock.Leave;
   end;
@@ -1586,11 +2808,59 @@ begin
   end;
 end;
 
+function TThumbCache.FolderResetSince(const APath: string; AStarted: Integer): Boolean;
+var
+  I: Integer;
+  Folder: string;
+begin
+  Result := False;
+  if APath = '' then
+    Exit;
+  Folder := ExcludeTrailingPathDelimiter(ExtractFilePath(APath));
+  for I := 0 to High(FEpochFolder) do
+    if (FEpochValue[I] > AStarted) and (FEpochFolder[I] <> '') and
+       (SameText(Folder, FEpochFolder[I]) or
+        StartsText(IncludeTrailingPathDelimiter(FEpochFolder[I]), APath)) then
+      Exit(True);
+end;
+
 procedure TThumbCache.InvalidateFolder(const AFolder: string);
 var
   Prefix: string;
   Keys: TArray<string>;
   K: string;
+
+  function InFolder(const APath: string): Boolean;
+  begin
+    Result := StartsText(Prefix, IncludeTrailingPathDelimiter(ExtractFilePath(APath))) or
+      SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(APath)),
+        ExcludeTrailingPathDelimiter(AFolder));
+  end;
+
+  procedure DropQueued(Q: TQueue<TThumbJob>);
+  var
+    Kept: TList<TThumbJob>;
+    Job: TThumbJob;
+  begin
+    if Q = nil then
+      Exit;
+    Kept := TList<TThumbJob>.Create;
+    try
+      while Q.Count > 0 do
+      begin
+        Job := Q.Dequeue;
+        if (not Assigned(Job.OnReady)) and InFolder(Job.Path) then
+          FPending.Remove(Job.Path)
+        else
+          Kept.Add(Job);
+      end;
+      for Job in Kept do
+        Q.Enqueue(Job);
+    finally
+      Kept.Free;
+    end;
+  end;
+
 begin
   if AFolder = '' then
     Exit;
@@ -1609,6 +2879,360 @@ begin
          SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(K)),
            ExcludeTrailingPathDelimiter(AFolder)) then
         FNoThumb.Remove(K);
+    Keys := FHtmlBlank.Keys.ToArray;
+    for K in Keys do
+      if StartsText(Prefix, IncludeTrailingPathDelimiter(ExtractFilePath(K))) or
+         SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(K)),
+           ExcludeTrailingPathDelimiter(AFolder)) then
+        FHtmlBlank.Remove(K);
+    if FSniffMiss <> nil then
+    begin
+      Keys := FSniffMiss.Keys.ToArray;
+      for K in Keys do
+        if StartsText(Prefix, IncludeTrailingPathDelimiter(ExtractFilePath(K))) or
+           SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(K)),
+             ExcludeTrailingPathDelimiter(AFolder)) then
+          FSniffMiss.Remove(K);
+    end;
+    if FHugeMiss <> nil then
+    begin
+      Keys := FHugeMiss.Keys.ToArray;
+      for K in Keys do
+        if StartsText(Prefix, IncludeTrailingPathDelimiter(ExtractFilePath(K))) or
+           SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(K)),
+             ExcludeTrailingPathDelimiter(AFolder)) then
+          FHugeMiss.Remove(K);
+    end;
+    DropQueued(FWait);
+    DropQueued(FHtmlWait);
+    Keys := FPending.Keys.ToArray;
+    for K in Keys do
+      if InFolder(K) then
+        FPending.Remove(K);
+    Inc(FThumbEpoch);
+    FEpochAt := (FEpochAt + 1) and 15;
+    FEpochFolder[FEpochAt] := ExcludeTrailingPathDelimiter(AFolder);
+    FEpochValue[FEpochAt] := FThumbEpoch;
+    Inc(FGeneration);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TThumbCache.NoteHtmlBlankLocked(const APath: string;
+  const AStamp: TThumbStamp);
+var
+  Note: THtmlBlankNote;
+  Item: TCachedThumb;
+begin
+  if (not FHtmlBlank.TryGetValue(APath, Note)) or
+     (not SameStamp(Note.Stamp, AStamp)) then
+  begin
+    Note.Stamp := AStamp;
+    Note.Count := 1;
+  end
+  else
+    Inc(Note.Count);
+  if Note.Count >= 2 then
+  begin
+    FHtmlBlank.Remove(APath);
+    FNoThumb.AddOrSetValue(APath, AStamp);
+    { Старий вдалий кадр лишається, але штамп оновлюємо, щоб не крутити WebView знову. }
+    if FCache.TryGetValue(APath, Item) then
+    begin
+      Item.Stamp := AStamp;
+      FCache.AddOrSetValue(APath, Item);
+    end;
+  end
+  else
+    FHtmlBlank.AddOrSetValue(APath, Note);
+end;
+
+procedure TThumbCache.NoteSniffMissLocked(const APath: string;
+  const AStamp: TThumbStamp);
+var
+  Note: THtmlBlankNote;
+begin
+  if FSniffMiss = nil then
+    Exit;
+  if (not FSniffMiss.TryGetValue(APath, Note)) or
+     (not SameStamp(Note.Stamp, AStamp)) then
+  begin
+    Note.Stamp := AStamp;
+    Note.Count := 1;
+  end
+  else
+    Inc(Note.Count);
+  if Note.Count >= 2 then
+  begin
+    FSniffMiss.Remove(APath);
+    RemoveCachedLocked(APath);
+    FNoThumb.AddOrSetValue(APath, AStamp);
+    Inc(FGeneration);
+  end
+  else
+    FSniffMiss.AddOrSetValue(APath, Note);
+end;
+
+procedure TThumbCache.NoteHugeTiffMissLocked(const APath: string;
+  const AStamp: TThumbStamp);
+var
+  Note: THtmlBlankNote;
+begin
+  if FHugeMiss = nil then
+    Exit;
+  if (not FHugeMiss.TryGetValue(APath, Note)) or
+     (not SameStamp(Note.Stamp, AStamp)) then
+  begin
+    Note.Stamp := AStamp;
+    Note.Count := 1;
+  end
+  else
+    Inc(Note.Count);
+  if Note.Count >= 2 then
+  begin
+    FHugeMiss.Remove(APath);
+    RemoveCachedLocked(APath);
+    FNoThumb.AddOrSetValue(APath, AStamp);
+    Inc(FGeneration);
+  end
+  else
+    FHugeMiss.AddOrSetValue(APath, Note);
+end;
+
+procedure TThumbCache.DropQueuedLocked(const APath: string);
+var
+  Want: string;
+
+  procedure Keep(Q: TQueue<TThumbJob>);
+  var
+    Kept: TList<TThumbJob>;
+    Job: TThumbJob;
+  begin
+    if Q = nil then
+      Exit;
+    Kept := TList<TThumbJob>.Create;
+    try
+      while Q.Count > 0 do
+      begin
+        Job := Q.Dequeue;
+        if SameText(ExcludeTrailingPathDelimiter(Job.Path), Want) then
+          FPending.Remove(Job.Path)
+        else
+          Kept.Add(Job);
+      end;
+      for Job in Kept do
+        Q.Enqueue(Job);
+    finally
+      Kept.Free;
+    end;
+  end;
+
+begin
+  Want := ExcludeTrailingPathDelimiter(APath);
+  Keep(FWait);
+  Keep(FHtmlWait);
+end;
+
+procedure TThumbCache.EnqueueJobLocked(const AJob: TThumbJob);
+begin
+  if IsHtmlPageThumbExt(ThumbExtOf(AJob.Path, AJob.NameHint)) then
+    FHtmlWait.Enqueue(AJob)
+  else
+    FWait.Enqueue(AJob);
+end;
+
+function VibeRenameTemp(const APath: string): Boolean;
+var
+  Name, Tail: string;
+  I: Integer;
+begin
+  Name := ExtractFileName(ExcludeTrailingPathDelimiter(APath));
+  if StartsText('.__vibe_', Name) and SameText(ExtractFileExt(Name), '.tmp') then
+    Exit(True);
+  I := Pos('.~vibe', LowerCase(Name));
+  if I < 1 then
+    Exit(False);
+  Tail := Copy(Name, I + Length('.~vibe'), MaxInt);
+  if Tail = '' then
+    Exit(True);
+  for I := 1 to Length(Tail) do
+    if not CharInSet(Tail[I], ['0'..'9']) then
+      Exit(False);
+  Result := True;
+end;
+
+procedure TThumbCache.DiscardRenamedLocked(const AOldPath, AOldWant: string);
+var
+  Keys: TArray<string>;
+  K: string;
+  I: Integer;
+begin
+  RemoveCachedLocked(AOldPath);
+  if not SameText(AOldPath, AOldWant) then
+    RemoveCachedLocked(AOldWant);
+  Keys := FCache.Keys.ToArray;
+  for K in Keys do
+    if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+      RemoveCachedLocked(K);
+  Keys := FNoThumb.Keys.ToArray;
+  for K in Keys do
+    if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+      FNoThumb.Remove(K);
+  Keys := FHtmlBlank.Keys.ToArray;
+  for K in Keys do
+    if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+      FHtmlBlank.Remove(K);
+  if FSniffMiss <> nil then
+  begin
+    Keys := FSniffMiss.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+        FSniffMiss.Remove(K);
+  end;
+  if FHugeMiss <> nil then
+  begin
+    Keys := FHugeMiss.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+        FHugeMiss.Remove(K);
+  end;
+  Keys := FPending.Keys.ToArray;
+  for K in Keys do
+    if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+      FPending.Remove(K);
+  for I := FOrder.Count - 1 downto 0 do
+    if SameText(ExcludeTrailingPathDelimiter(FOrder[I]), AOldWant) then
+      FOrder.Delete(I);
+  Keys := FAlias.Keys.ToArray;
+  for K in Keys do
+    if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) or
+       SameText(ExcludeTrailingPathDelimiter(FAlias[K]), AOldWant) then
+      FAlias.Remove(K);
+  if FCarryExt <> nil then
+  begin
+    Keys := FCarryExt.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), AOldWant) then
+        FCarryExt.Remove(K);
+  end;
+  DropQueuedLocked(AOldWant);
+  Inc(FGeneration);
+end;
+
+function TThumbCache.ResolveAliasLocked(const APath: string): string;
+var
+  N: Integer;
+  Next: string;
+begin
+  Result := APath;
+  for N := 1 to 8 do
+  begin
+    if not FAlias.TryGetValue(Result, Next) or (Next = '') or SameStr(Next, Result) then
+      Break;
+    Result := Next;
+  end;
+end;
+
+procedure TThumbCache.Retarget(const AOldPath, ANewPath: string);
+var
+  OldWant, NewKey, K, OldCache, Next, Carry, NewExt: string;
+  Keys: TArray<string>;
+  Item, Prev: TCachedThumb;
+  I: Integer;
+begin
+  if FShuttingDown or (AOldPath = '') or (ANewPath = '') then
+    Exit;
+  OldWant := ExcludeTrailingPathDelimiter(AOldPath);
+  NewKey := ANewPath;
+  if SameStr(OldWant, ExcludeTrailingPathDelimiter(NewKey)) then
+    Exit;
+  FLock.Enter;
+  try
+    Carry := '';
+    if (FCarryExt <> nil) and VibeRenameTemp(OldWant) then
+      FCarryExt.TryGetValue(OldWant, Carry);
+    if Carry = '' then
+      Carry := ExtractFileExt(OldWant);
+    NewExt := ExtractFileExt(ExcludeTrailingPathDelimiter(NewKey));
+    { Проміжне .\~vibe ще не кінцевий тип. Інше розширення — новий кадр. }
+    if (not VibeRenameTemp(NewKey)) and (not SameText(Carry, NewExt)) then
+    begin
+      DiscardRenamedLocked(AOldPath, OldWant);
+      Exit;
+    end;
+    Keys := FAlias.Keys.ToArray;
+    for K in Keys do
+    begin
+      Next := FAlias[K];
+      if SameText(ExcludeTrailingPathDelimiter(Next), OldWant) then
+        FAlias[K] := NewKey;
+    end;
+    FAlias.AddOrSetValue(AOldPath, NewKey);
+    if not SameStr(AOldPath, OldWant) then
+      FAlias.AddOrSetValue(OldWant, NewKey);
+
+    OldCache := '';
+    if FCache.ContainsKey(AOldPath) then
+      OldCache := AOldPath
+    else
+    begin
+      Keys := FCache.Keys.ToArray;
+      for K in Keys do
+        if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+        begin
+          OldCache := K;
+          Break;
+        end;
+    end;
+    if OldCache <> '' then
+    begin
+      Item := FCache[OldCache];
+      FCache.Remove(OldCache);
+      if FCache.TryGetValue(NewKey, Prev) and (Prev.Bitmap <> Item.Bitmap) then
+        Prev.Bitmap.Free;
+      FCache.AddOrSetValue(NewKey, Item);
+      if not SameStr(OldCache, AOldPath) then
+        FAlias.AddOrSetValue(OldCache, NewKey);
+      FNoThumb.Remove(NewKey);
+    end;
+
+    Keys := FNoThumb.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+        FNoThumb.Remove(K);
+    Keys := FHtmlBlank.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+        FHtmlBlank.Remove(K);
+    if FSniffMiss <> nil then
+    begin
+      Keys := FSniffMiss.Keys.ToArray;
+      for K in Keys do
+        if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+          FSniffMiss.Remove(K);
+    end;
+    if FHugeMiss <> nil then
+    begin
+      Keys := FHugeMiss.Keys.ToArray;
+      for K in Keys do
+        if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+          FHugeMiss.Remove(K);
+    end;
+    Keys := FPending.Keys.ToArray;
+    for K in Keys do
+      if SameText(ExcludeTrailingPathDelimiter(K), OldWant) then
+        FPending.Remove(K);
+    for I := FOrder.Count - 1 downto 0 do
+      if SameText(ExcludeTrailingPathDelimiter(FOrder[I]), OldWant) then
+        FOrder.Delete(I);
+    if OldCache <> '' then
+      TouchLocked(NewKey);
+    DropQueuedLocked(OldWant);
+    if (FCarryExt <> nil) and VibeRenameTemp(OldWant) then
+      FCarryExt.Remove(OldWant);
+    if (FCarryExt <> nil) and VibeRenameTemp(NewKey) then
+      FCarryExt.AddOrSetValue(ExcludeTrailingPathDelimiter(NewKey), Carry);
   finally
     FLock.Leave;
   end;
@@ -1618,7 +3242,8 @@ function TThumbCache.HasWork: Boolean;
 begin
   FLock.Enter;
   try
-    Result := (FPending.Count > 0) or (FWait.Count > 0) or (FBusy > 0) or (FQueued > 0);
+    Result := (FPending.Count > 0) or (FWait.Count > 0) or (FHtmlWait.Count > 0) or
+      (FBusy > 0) or (FHtmlBusy > 0) or (FQueued > 0);
   finally
     FLock.Leave;
   end;
@@ -1628,7 +3253,7 @@ function TThumbCache.PendingCount: Integer;
 begin
   FLock.Enter;
   try
-    Result := FWait.Count + FBusy;
+    Result := FWait.Count + FHtmlWait.Count + FBusy + FHtmlBusy;
   finally
     FLock.Leave;
   end;
@@ -1673,14 +3298,36 @@ begin
     FLock.Enter;
     try
       if FShuttingDown or (FBusy >= MaxWorkers) or (FWait.Count = 0) then
-        Exit;
+        Break;
       Job := FWait.Dequeue;
       Inc(FBusy);
     finally
       FLock.Leave;
     end;
-    StartJob(Job);
+    StartJob(Job, False);
   end;
+  PumpHtml;
+end;
+
+procedure TThumbCache.PumpHtml;
+var
+  Job: TThumbJob;
+begin
+  Job.Path := '';
+  Job.Size := 0;
+  Job.Stamp := Default(TThumbStamp);
+  Job.NameHint := '';
+  Job.OnReady := nil;
+  FLock.Enter;
+  try
+    if FShuttingDown or (FHtmlBusy > 0) or (FHtmlWait.Count = 0) then
+      Exit;
+    Job := FHtmlWait.Dequeue;
+    Inc(FHtmlBusy);
+  finally
+    FLock.Leave;
+  end;
+  StartJob(Job, True);
 end;
 
 function LooksLikeLottieBytes(const ABuf: TBytes): Boolean;
@@ -2448,18 +4095,125 @@ begin
   end;
 end;
 
-procedure TThumbCache.StartJob(const AJob: TThumbJob);
+function RenderSniffThumb(const APath: string; ASize: Integer;
+  out ABmp: TBitmap; out ARaw: TBytes; out ARawW, ARawH: Integer): TSniffRender;
+var
+  Head: TBytes;
+  Sig: TImageSig;
+  WaitMs: Cardinal;
+  Got: Boolean;
+begin
+  ABmp := nil;
+  SetLength(ARaw, 0);
+  ARawW := 0;
+  ARawH := 0;
+  Result := srNone;
+  if (APath = '') or (ASize < 8) then
+    Exit;
+  WaitMs := 0;
+  if IsRemotePath(APath) then
+    WaitMs := ThumbSniffHeadMs;
+  if not ReadFileHead(APath, ThumbSniffHeadBytes, WaitMs, Head) then
+    Exit(srSlow);
+  Sig := SniffImageBytes(Head);
+  case Sig of
+    isJpeg, isPng, isGif, isWebp, isBmp, isHeic, isAvif, isJxl:
+      begin
+        Got := RenderRasterThumbRaw(APath, ASize, ASize, ARaw, ARawW, ARawH, True);
+        if Got and (ARawW > 0) and (Length(ARaw) > 0) then
+          Result := srFrame
+        else
+        begin
+          SetLength(ARaw, 0);
+          ARawW := 0;
+          ARawH := 0;
+          Result := srSoft;
+        end;
+      end;
+    isIco, isCur:
+      begin
+        try
+          ABmp := BestCursorFrame(APath, ASize);
+        except
+          FreeAndNil(ABmp);
+        end;
+        if Assigned(ABmp) and (ABmp.Width > 0) then
+          Result := srFrame
+        else
+        begin
+          FreeAndNil(ABmp);
+          Result := srSoft;
+        end;
+      end;
+    isSvg:
+      begin
+        Got := RenderSvgThumbRaw(APath, ASize, ASize, ARaw, ARawW, ARawH, True);
+        if Got and (ARawW > 0) and (Length(ARaw) > 0) then
+          Result := srFrame
+        else
+        begin
+          SetLength(ARaw, 0);
+          ARawW := 0;
+          ARawH := 0;
+          Result := srSoft;
+        end;
+      end;
+    isPdf:
+      begin
+        Got := RenderPdfThumbRaw(APath, ASize, ASize, ARaw, ARawW, ARawH, True);
+        if Got and (ARawW > 0) and (Length(ARaw) > 0) then
+          Result := srFrame
+        else
+        begin
+          SetLength(ARaw, 0);
+          ARawW := 0;
+          ARawH := 0;
+          Result := srSoft;
+        end;
+      end;
+    isPe, isZip:
+      Result := srNone;
+  else
+    if not TextBytesLookLike(Head) then
+      Exit(srNone);
+    ABmp := TBitmap.Create;
+    try
+      Got := RenderTextA4Thumb(APath, ASize, ASize, ABmp, True);
+      if Got and (ABmp.Width > 0) then
+        Result := srFrame
+      else
+      begin
+        FreeAndNil(ABmp);
+        Result := srSoft;
+      end;
+    except
+      FreeAndNil(ABmp);
+      Result := srSoft;
+    end;
+  end;
+end;
+
+procedure TThumbCache.StartJob(const AJob: TThumbJob; AHtmlLane: Boolean);
 var
   Path, NameHint: string;
   Size: Integer;
   Age: TThumbStamp;
   Ready: TThumbReadyProc;
+  HtmlLane: Boolean;
+  StartedEpoch: Integer;
 begin
   Path := AJob.Path;
   Size := AJob.Size;
   Age := AJob.Stamp;
   NameHint := AJob.NameHint;
   Ready := AJob.OnReady;
+  HtmlLane := AHtmlLane;
+  FLock.Enter;
+  try
+    StartedEpoch := FThumbEpoch;
+  finally
+    FLock.Leave;
+  end;
   TThread.CreateAnonymousThread(
     procedure
     var
@@ -2472,11 +4226,19 @@ begin
       Unk: IUnknown;
       Local, Ext, ReadPath, OwnTemp, ArcName, InnerName: string;
       SkipFallback, ArcEnc: Boolean;
+      HtmlKind: THtmlThumbKind;
       ArcBytes, MeshCap: Int64;
       ArcWhen: TDateTime;
+      NativeTried, SniffSoft, SkipShell, HugeTiff: Boolean;
+      SniffKind: TSniffRender;
     begin
       Bmp := nil;
       Success := False;
+      NativeTried := False;
+      SniffSoft := False;
+      SkipShell := False;
+      HugeTiff := False;
+      HtmlKind := htkIcon;
       Stamp := Age;
       RawW := 0;
       RawH := 0;
@@ -2498,7 +4260,10 @@ begin
               RenderSize := 256;
 
             Ext := ThumbExtOf(Path, NameHint);
-            SkipFallback := False;
+            SkipFallback := HtmlLane;
+            HugeTiff := TiffOverDecoderLimit(Path);
+            if HugeTiff then
+              SkipFallback := True;
             ReadPath := Path;
             OwnTemp := '';
             if SplitArchivePath(Path, ArcName, InnerName) and (InnerName <> '') then
@@ -2526,6 +4291,7 @@ begin
             end;
             if IsHdrExt(Ext) and (Bmp = nil) and (ReadPath <> '') then
             begin
+              NativeTried := True;
               try
                 Bmp := RenderHdrThumb(ReadPath, RenderSize);
                 Success := Assigned(Bmp) and (Bmp.Width > 0);
@@ -2537,10 +4303,14 @@ begin
               end;
             end;
             if not Success and IsRasterThumbExt(Ext) then
+            begin
+              NativeTried := True;
               Success := RenderRasterThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            end;
             if not Success and (Bmp = nil) and (Ext = '.cur') then
             begin
               { Не shell: иначе в кэш попадёт значок типа, а не рисунок курсора. }
+              NativeTried := True;
               SkipFallback := True;
               if ReadPath <> '' then
               try
@@ -2554,11 +4324,21 @@ begin
               end;
             end;
             if not Success and IsPdfThumbExt(Path) then
+            begin
+              NativeTried := True;
               Success := RenderPdfThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            end;
             if not Success and IsSvgThumbExt(Path) then
-              Success := RenderSvgThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            begin
+              NativeTried := True;
+              Success := RenderSvgThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH,
+                False);
+            end;
             if not Success and IsPsdThumbExt(Path) then
+            begin
+              NativeTried := True;
               Success := RenderPsdThumbRaw(ReadPath, RenderSize, RenderSize, Raw, RawW, RawH);
+            end;
             if not Success and (Bmp = nil) and IsMeshExt(Ext) then
             begin
               { 3MF: зіпсований zip лишає системну іконку. Інші сітки — ні. }
@@ -2580,6 +4360,7 @@ begin
             begin
               if IsSpreadsheetThumbExt(Path) or IsDocumentThumbExt(Path) then
               begin
+                NativeTried := True;
                 Bmp := TBitmap.Create;
                 try
                   if IsSpreadsheetThumbExt(Path) then
@@ -2600,6 +4381,7 @@ begin
 
             if not Success and (Bmp = nil) and (Ext = '.dxf') then
             begin
+              NativeTried := True;
               Bmp := TBitmap.Create;
               try
                 Success := RenderDxfTile(ReadPath, RenderSize, Bmp);
@@ -2616,6 +4398,7 @@ begin
 
             if not Success and (Bmp = nil) and IsMetaThumbExt(Ext) then
             begin
+              NativeTried := True;
               Bmp := TBitmap.Create;
               try
                 Success := RenderMetaTile(ReadPath, RenderSize, Bmp);
@@ -2632,6 +4415,7 @@ begin
 
             if not Success and (Bmp = nil) and IsCdrThumbExt(Ext) then
             begin
+              NativeTried := True;
               Bmp := TBitmap.Create;
               try
                 { Сетевой файл: только маленькое превью из ZIP, без чтения десятков МБ. }
@@ -2670,13 +4454,16 @@ begin
                 SkipFallback := True;
             end;
 
-            if not SkipFallback and not Success and (Bmp = nil) and
+            if HtmlLane and (not Success) and (Bmp = nil) and
                IsHtmlPageThumbExt(Ext) then
             begin
+              NativeTried := True;
               SkipFallback := True;
               Bmp := TBitmap.Create;
               try
-                Success := RenderHtmlPageThumb(ReadPath, RenderSize, RenderSize, Bmp);
+                HtmlKind := htkIcon;
+                Success := RenderHtmlPageThumb(ReadPath, RenderSize, RenderSize, Bmp,
+                  HtmlKind);
                 if not Success or (Bmp.Width <= 0) then
                 begin
                   Success := False;
@@ -2691,6 +4478,7 @@ begin
             if not SkipFallback and not Success and (Bmp = nil) and
                IsListedTextExt(Ext) and not IsRemotePath(Path) then
             begin
+              NativeTried := True;
               Bmp := TBitmap.Create;
               try
                 Success := RenderTextA4Thumb(ReadPath, RenderSize, RenderSize, Bmp);
@@ -2704,6 +4492,39 @@ begin
                 FreeAndNil(Bmp);
               end;
             end;
+
+            { Нюх лише тут, у воркері. Відоме розширення вже спробували вище. }
+            if (not HugeTiff) and (not Success) and (Bmp = nil) and (Length(Raw) = 0) and
+               (HtmlKind <> htkEmpty) and (ReadPath <> '') and
+               (not TDirectory.Exists(Path)) and
+               ThumbShouldSniff(Path, Ext, NativeTried, Stamp.Bytes, SkipShell) then
+            begin
+              if SkipShell then
+                SkipFallback := True;
+              SniffKind := RenderSniffThumb(ReadPath, RenderSize, Bmp, Raw, RawW, RawH);
+              case SniffKind of
+                srFrame:
+                  Success := Assigned(Bmp) or ((Length(Raw) > 0) and (RawW > 0));
+                srSoft:
+                  begin
+                    SniffSoft := True;
+                    SkipFallback := True;
+                    FreeAndNil(Bmp);
+                    SetLength(Raw, 0);
+                  end;
+                srSlow:
+                  begin
+                    SkipFallback := True;
+                    FreeAndNil(Bmp);
+                    SetLength(Raw, 0);
+                  end;
+              else
+                FreeAndNil(Bmp);
+                SetLength(Raw, 0);
+              end;
+            end
+            else if SkipShell then
+              SkipFallback := True;
 
 {$IFDEF MSWINDOWS}
             if not SkipFallback and not Success then
@@ -2719,7 +4540,7 @@ begin
                TDirectory.Exists(Path) then
               ClearFolderThumbPlate(Raw, RawW, RawH);
 {$IFDEF MSWINDOWS}
-            if not Success and IsRasterThumbExt(Ext) and
+            if (not HugeTiff) and (not Success) and IsRasterThumbExt(Ext) and
                (IsPortableDevicePath(Path) or IsDeviceNamespacePath(Path) or
                 IsVirtualShellPath(Path)) then
             begin
@@ -2737,6 +4558,8 @@ begin
                 end;
               end;
             end;
+            if HugeTiff and (not Success) and (Bmp = nil) and (Length(Raw) = 0) then
+              Success := GetCachedShellThumbnailRaw(Path, 256, Raw, RawW, RawH);
 {$ENDIF}
           end;
         except
@@ -2765,9 +4588,11 @@ begin
             Old: TCachedThumb;
             UiBmp: TBitmap;
             NotifyBmp: TBitmap;
+            StorePath: string;
           begin
             UiBmp := nil;
             NotifyBmp := nil;
+            StorePath := Path;
             try
               if FShuttingDown or (GlobalThumbCache = nil) then
               begin
@@ -2799,31 +4624,82 @@ begin
 
               FLock.Enter;
               try
-                FPending.Remove(Path);
-                if Success and Assigned(UiBmp) then
-                begin
-                  if FCache.TryGetValue(Path, Old) and (Old.Bitmap <> UiBmp) then
-                    Old.Bitmap.Free;
-                  Stored.Bitmap := UiBmp;
-                  Stored.Stamp := Stamp;
-                  FCache.AddOrSetValue(Path, Stored);
-                  FNoThumb.Remove(Path);
-                  TouchLocked(Path);
-                  EvictLocked;
-                  Inc(FGeneration);
-                  NotifyBmp := Stored.Bitmap;
-                  UiBmp := nil;
-                end
+                if (not Assigned(Ready)) and FolderResetSince(Path, StartedEpoch) then
+                  FreeAndNil(UiBmp)
                 else
                 begin
+                StorePath := ResolveAliasLocked(Path);
+                FPending.Remove(Path);
+                if not SameStr(StorePath, Path) then
+                  FPending.Remove(StorePath);
+                if Success and Assigned(UiBmp) then
+                begin
+                  { Кадр уже лежить на новому шляху. Другий декод його не замінює. }
+                  if (not SameStr(StorePath, Path)) and FCache.ContainsKey(StorePath) then
+                    FreeAndNil(UiBmp)
+                  else
+                  begin
+                    if FCache.TryGetValue(StorePath, Old) and (Old.Bitmap <> UiBmp) then
+                      Old.Bitmap.Free;
+                    if not SameStr(StorePath, Path) then
+                      RemoveCachedLocked(Path);
+                    Stored.Bitmap := UiBmp;
+                    Stored.Stamp := Stamp;
+                    FCache.AddOrSetValue(StorePath, Stored);
+                    FNoThumb.Remove(StorePath);
+                    FNoThumb.Remove(Path);
+                    FHtmlBlank.Remove(StorePath);
+                    FHtmlBlank.Remove(Path);
+                    if FSniffMiss <> nil then
+                    begin
+                      FSniffMiss.Remove(StorePath);
+                      FSniffMiss.Remove(Path);
+                    end;
+                    if FHugeMiss <> nil then
+                    begin
+                      FHugeMiss.Remove(StorePath);
+                      FHugeMiss.Remove(Path);
+                    end;
+                    TouchLocked(StorePath);
+                    EvictLocked;
+                    Inc(FGeneration);
+                    NotifyBmp := Stored.Bitmap;
+                    UiBmp := nil;
+                  end;
+                end
+                else if (HtmlKind = htkEmpty) and SameStr(StorePath, Path) then
+                begin
+                  NoteHtmlBlankLocked(Path, Stamp);
+                  FreeAndNil(UiBmp);
+                end
+                else if SniffSoft and SameStr(StorePath, Path) then
+                begin
+                  NoteSniffMissLocked(Path, Stamp);
+                  FreeAndNil(UiBmp);
+                end
+                else if HugeTiff and (not Success) and SameStr(StorePath, Path) then
+                begin
+                  NoteHugeTiffMissLocked(Path, Stamp);
+                  FreeAndNil(UiBmp);
+                end
+                else if SameStr(StorePath, Path) then
+                begin
+                  FHtmlBlank.Remove(Path);
+                  if FSniffMiss <> nil then
+                    FSniffMiss.Remove(Path);
+                  if FHugeMiss <> nil then
+                    FHugeMiss.Remove(Path);
                   FNoThumb.AddOrSetValue(Path, Stamp);
+                  FreeAndNil(UiBmp);
+                end
+                else
                   FreeAndNil(UiBmp);
                 end;
               finally
                 FLock.Leave;
               end;
               if Assigned(Ready) and Assigned(NotifyBmp) then
-                Ready(Path, NotifyBmp);
+                Ready(StorePath, NotifyBmp);
             finally
               AtomicDecrement(FQueued);
             end;
@@ -2835,12 +4711,20 @@ begin
 {$ENDIF}
         FLock.Enter;
         try
-          if FBusy > 0 then
+          if HtmlLane then
+          begin
+            if FHtmlBusy > 0 then
+              Dec(FHtmlBusy);
+          end
+          else if FBusy > 0 then
             Dec(FBusy);
         finally
           FLock.Leave;
         end;
-        PumpJobs;
+        if HtmlLane then
+          PumpHtml
+        else
+          PumpJobs;
       end;
     end).Start;
 end;
@@ -2938,6 +4822,14 @@ begin
           else
             FPending.Remove(Job.Path);
         end;
+        while FHtmlWait.Count > 0 do
+        begin
+          Job := FHtmlWait.Dequeue;
+          if Assigned(Job.OnReady) then
+            Foreign.Add(Job)
+          else
+            FPending.Remove(Job.Path);
+        end;
 
         for S := 0 to Slots.Count - 1 do
         begin
@@ -2982,12 +4874,12 @@ begin
             if Have.TryGetValue(Path, St) then
               Job.Stamp := St;
             FPending.Add(Path, True);
-            FWait.Enqueue(Job);
+            EnqueueJobLocked(Job);
           end;
         end;
 
         for I := 0 to Foreign.Count - 1 do
-          FWait.Enqueue(Foreign[I]);
+          EnqueueJobLocked(Foreign[I]);
       finally
         FLock.Leave;
       end;
@@ -3087,7 +4979,7 @@ begin
     Job.Stamp := Current;
     Job.NameHint := ANameHint;
     Job.OnReady := AOnReady;
-    FWait.Enqueue(Job);
+    EnqueueJobLocked(Job);
   finally
     FLock.Leave;
   end;

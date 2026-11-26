@@ -4,7 +4,7 @@ interface
 
 uses
 Winapi.Windows, Winapi.Messages, Winapi.DwmApi, Winapi.UxTheme,
-  Winapi.ShlObj, Winapi.CommCtrl, System.Win.ComObj, FMX.Platform.Win,
+  Winapi.ShlObj, System.Win.ComObj, FMX.Platform.Win,
   System.SysUtils, System.Classes, System.UITypes, System.IOUtils, System.Types,
   System.Generics.Collections,
   FMX.Forms, FMX.Types, FMX.Layouts, FMX.StdCtrls, FMX.Objects,
@@ -42,6 +42,8 @@ type
     FBtnMin: TRectangle;
     FBtnMax: TRectangle;
     FBtnClose: TRectangle;
+    FCaptionActive: Boolean;
+    FCloseHot: Boolean;
 
     FMidBar: TRectangle;
     FMidGroup: TLayout;
@@ -125,6 +127,8 @@ type
     FFirstPaintLogged: Boolean;
     FLeftReady: Boolean;
     FRightReady: Boolean;
+    FLeftReadyHold: Boolean;
+    FStartupListsContinued: Boolean;
     FSessionTimer: TTimer;
     FSessionDirty: Boolean;
     FSessionSnap: Boolean;
@@ -201,6 +205,8 @@ type
     procedure ApplyCustomFrame;
     procedure HideFmxAppWindow;
     procedure UpdateWindowButtons;
+    procedure SyncMicaWinGlyphs;
+    procedure SyncCaptionActive(AActive: Boolean);
     function WindowAnimEnabled: Boolean;
     function CaptionHitTest(const AFormPt: TPointF): NativeInt;
     function IsWindowMaximized: Boolean;
@@ -225,6 +231,9 @@ type
     procedure StartupIdleTick(Sender: TObject);
     procedure StartupIdlePlusTick(Sender: TObject);
     procedure StartupStaleTick(Sender: TObject);
+    function PanelsHaveRecycle: Boolean;
+    procedure StartupRecycleIdle(Sender: TObject);
+    procedure ContinueStartupLists;
     procedure LeftListReady(Sender: TObject);
     procedure RightListReady(Sender: TObject);
     procedure StyleLogoText(AText: TText; ASize: Single; ABold: Boolean);
@@ -329,6 +338,10 @@ type
     procedure SplitterMouseUp(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
     procedure SplitterMouseEnter(Sender: TObject);
     procedure SplitterMouseLeave(Sender: TObject);
+    procedure BindMidSplitter(AControl: TControl);
+    procedure SetMidSplitCursor(ASplit: Boolean);
+    procedure MidBarDblClick(Sender: TObject);
+    procedure SaveSplitterRatio;
     procedure WorkAreaResize(Sender: TObject);
     procedure FormResizeHandler(Sender: TObject);
     procedure DockOpenFolder(Sender: TObject; const APath: string);
@@ -373,7 +386,8 @@ uses
   Winapi.MultiMon,
   System.Win.Registry, System.IniFiles,
   FMX.Platform,
-  uFileOpProgressForm, uDriveBar, uFilePreview, uUpdate, uDeps;
+  uFileOpProgressForm, uDriveBar, uFilePreview, uUpdate, uDeps,
+  uBinConfirmDialog;
 
 const
   APP_MUTEX_NAME = 'Local\VibeCmd.SingleInstance';
@@ -382,7 +396,7 @@ const
   LAUNCH_PATH_CHARS = 2048;
   TITLEBAR_HEIGHT = 40;
   CAPTION_BTN_W = 47;
-  APP_VERSION_FALLBACK = '1.0.0';
+  APP_VERSION_FALLBACK = '1.0.1';
   VIBE_NEON = $FF00D4FF;
   VIBE_MONO_FONT = 'Cascadia Mono';
   ICON_CHROME_MIN = #$E921;
@@ -969,6 +983,7 @@ begin
   FColors := GetThemeColors(FSettings.Theme);
   Fill.Kind := TBrushKind.Solid;
   Fill.Color := FColors.Background;
+  FCaptionActive := True;
 
   BuildTitleBar;
   BuildDock;
@@ -1696,10 +1711,34 @@ begin
       end;
     end;
 
+    WM_NCACTIVATE:
+      if Assigned(GHookForm) then
+      begin
+        var ActiveNow := wParam <> 0;
+        TThread.ForceQueue(nil,
+          procedure
+          begin
+            if Assigned(GHookForm) then
+              GHookForm.SyncCaptionActive(ActiveNow);
+          end);
+      end;
+
 
 
     WM_SYSKEYDOWN:
-      if wParam = VK_F5 then
+      if (wParam = VK_F4) and (GetKeyState(VK_CONTROL) >= 0) then
+      begin
+        { Alt+F4 — выход. Не отдавать в FMX: F4 там открывает поиск. }
+        if (lParam and $40000000) = 0 then
+          TThread.ForceQueue(nil,
+            procedure
+            begin
+              if Assigned(GHookForm) then
+                GHookForm.Close;
+            end);
+        Exit(0);
+      end
+      else if wParam = VK_F5 then
       begin
         TThread.ForceQueue(nil,
           procedure
@@ -1984,6 +2023,7 @@ begin
   SetWindowPos(Wnd, 0, 0, 0, 0, 0,
     SWP_NOMOVE or SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE or SWP_FRAMECHANGED);
   HideFmxAppWindow;
+  SyncCaptionActive(GetForegroundWindow = Wnd);
   {$ENDIF}
 end;
 
@@ -2674,18 +2714,72 @@ begin
     FLeftPanel.RestoreTabs(FSettings.Left);
   if Assigned(FRightPanel) and Assigned(FSettings) then
     FRightPanel.RestoreTabs(FSettings.Right);
+  if PanelsHaveRecycle then
+    BeginStartupRecycleGate(StartupRecycleIdle);
   ApplyLaunchOpen(False);
-  if Assigned(FLeftPanel) and not FLaunchLeftOwned then
+  if PanelsHaveRecycle or StartupRecycleHolds then
+  begin
+    if not StartupRecycleHolds then
+      BeginStartupRecycleGate(StartupRecycleIdle);
+    try
+      if Assigned(FLeftPanel) then
+        FLeftPanel.BeginStartupRecycleLoads;
+      if Assigned(FRightPanel) then
+        FRightPanel.BeginStartupRecycleLoads;
+    finally
+      EndStartupRecycleGate;
+    end;
+  end
+  else if Assigned(FLeftPanel) and not FLaunchLeftOwned then
     FLeftPanel.LoadActiveTab;
   if Assigned(FIdlePlusTimer) then
     FIdlePlusTimer.Enabled := True;
   MarkSessionDirty;
 end;
 
+function TMainForm.PanelsHaveRecycle: Boolean;
+begin
+  Result := (Assigned(FLeftPanel) and FLeftPanel.HasRecycleTab) or
+    (Assigned(FRightPanel) and FRightPanel.HasRecycleTab);
+end;
+
+procedure TMainForm.StartupRecycleIdle(Sender: TObject);
+begin
+  ContinueStartupLists;
+end;
+
+procedure TMainForm.ContinueStartupLists;
+var
+  LeftRetry, RightRetry: Boolean;
+begin
+  if FStartupListsContinued or StartupRecycleHolds then
+    Exit;
+  FStartupListsContinued := True;
+  LeftRetry := Assigned(FLeftPanel) and FLeftPanel.TakeStartupEmptyRetry;
+  RightRetry := Assigned(FRightPanel) and FRightPanel.TakeStartupEmptyRetry;
+  if LeftRetry then
+    FLeftReadyHold := False;
+  if FLeftReadyHold then
+  begin
+    FLeftReadyHold := False;
+    LeftListReady(FLeftPanel);
+  end
+  else if Assigned(FLeftPanel) and not FLeftReady and
+          (LeftRetry or not FLaunchLeftOwned) then
+    FLeftPanel.LoadActiveTab;
+  if RightRetry and FLaunchRightOwned and Assigned(FRightPanel) then
+    FRightPanel.LoadActiveTab;
+end;
+
 procedure TMainForm.LeftListReady(Sender: TObject);
 begin
   if FLeftReady then
     Exit;
+  if StartupRecycleHolds then
+  begin
+    FLeftReadyHold := True;
+    Exit;
+  end;
   FLeftReady := True;
   StartupLog('left list ready');
   if (FLaunchNoticeL <> '') and Assigned(FLeftPanel) then
@@ -2829,6 +2923,7 @@ begin
   FBtnMax := MakeWinBtn(FCaptionBar, ICON_CHROME_MAX, OnMaxClick);
   FBtnMin := MakeWinBtn(FCaptionBar, ICON_CHROME_MIN, OnMinClick);
   FBtnSettings := MakeWinBtn(FCaptionBar, ICON_CHROME_SETTINGS, OnSettingsClick);
+  SyncMicaWinGlyphs;
 
   FAppIcon := TImage.Create(Self);
   FAppIcon.Parent := FTitleBar;
@@ -3091,9 +3186,9 @@ begin
     Exit;
   if Sender = FBtnClose then
   begin
+    FCloseHot := True;
     TRectangle(Sender).Fill.Color := $FFE81123;
-    if TRectangle(Sender).TagObject is TText then
-      TText(TRectangle(Sender).TagObject).TextSettings.FontColor := TAlphaColors.White;
+    SyncMicaWinGlyphs;
   end
   else
     TRectangle(Sender).Fill.Color := FColors.ItemHover;
@@ -3103,9 +3198,10 @@ procedure TMainForm.WinBtnLeave(Sender: TObject);
 begin
   if not (Sender is TRectangle) then
     Exit;
+  if Sender = FBtnClose then
+    FCloseHot := False;
   TRectangle(Sender).Fill.Color := TAlphaColors.Null;
-  if TRectangle(Sender).TagObject is TText then
-    TText(TRectangle(Sender).TagObject).TextSettings.FontColor := FColors.TextColor;
+  SyncMicaWinGlyphs;
 end;
 
 function TMainForm.WindowAnimEnabled: Boolean;
@@ -3144,6 +3240,61 @@ end;
 procedure TMainForm.OnCloseClick(Sender: TObject);
 begin
   Close;
+end;
+
+procedure TMainForm.SyncCaptionActive(AActive: Boolean);
+begin
+  if FCaptionActive = AActive then
+    Exit;
+  FCaptionActive := AActive;
+  if not AActive then
+  begin
+    FCloseHot := False;
+    if Assigned(FBtnClose) then
+      FBtnClose.Fill.Color := TAlphaColors.Null;
+  end;
+  SyncMicaWinGlyphs;
+end;
+
+procedure TMainForm.SyncMicaWinGlyphs;
+{ Mica малює системні min/max/close. Свої гліфи ховаємо, крім хрестика на червоному hover.
+  Неактивне вікно сірить шестірню так само, як системні кнопки. }
+const
+  CAPTION_IDLE_OPACITY = 93 / 255;
+var
+  Mica: Boolean;
+  Glyph: TText;
+begin
+  Mica := Assigned(FSettings) and
+    (MaterialForWindows(FSettings.WindowMaterial) = wmMica);
+  if Assigned(FBtnMin) and (FBtnMin.TagObject is TText) then
+    TText(FBtnMin.TagObject).Visible := not Mica;
+  if Assigned(FBtnMax) and (FBtnMax.TagObject is TText) then
+    TText(FBtnMax.TagObject).Visible := not Mica;
+  if Assigned(FBtnClose) and (FBtnClose.TagObject is TText) then
+  begin
+    Glyph := TText(FBtnClose.TagObject);
+    Glyph.Visible := (not Mica) or FCloseHot;
+    if FCloseHot then
+    begin
+      Glyph.TextSettings.FontColor := TAlphaColors.White;
+      Glyph.Opacity := 1;
+    end
+    else if not Mica then
+    begin
+      Glyph.TextSettings.FontColor := FColors.TextColor;
+      Glyph.Opacity := 1;
+    end;
+  end;
+  if Assigned(FBtnSettings) and (FBtnSettings.TagObject is TText) then
+  begin
+    Glyph := TText(FBtnSettings.TagObject);
+    Glyph.TextSettings.FontColor := FColors.TextColor;
+    if Mica and not FCaptionActive then
+      Glyph.Opacity := CAPTION_IDLE_OPACITY
+    else
+      Glyph.Opacity := 1;
+  end;
 end;
 
 procedure TMainForm.UpdateWindowButtons;
@@ -3351,11 +3502,16 @@ type
     Box: TRectangle;
     Ico: TText;
     Title: TText;
+    SubClip: TLayout;
     Sub: TText;
     Pct: TText;
     Track: TRectangle;
     Fill: TRectangle;
     XBtn: TRectangle;
+    SubShown: string;
+    SubShift: Single;
+    SubHold: Integer;
+    SubAtEnd: Boolean;
   end;
 
 function MeasurePillText(const AText: string; ASize: Single): Single;
@@ -3558,6 +3714,69 @@ var
   Same: Boolean;
   XCap: TText;
   BarW: Single;
+
+  procedure StepSub(ARow: TOpRow; const AText: string);
+  const
+    Speed = 3;
+    HoldTicks = 8;
+  var
+    Line: string;
+    HostW, TextW, Limit: Single;
+    Fresh: Boolean;
+  begin
+    if not Assigned(ARow.SubClip) or not Assigned(ARow.Sub) then
+      Exit;
+    Line := StringReplace(AText, #13#10, ' ', [rfReplaceAll]);
+    Line := StringReplace(Line, #10, ' ', [rfReplaceAll]);
+    Line := StringReplace(Line, #13, ' ', [rfReplaceAll]);
+    HostW := ARow.SubClip.Width;
+    if HostW < 8 then
+      HostW := 8;
+    Fresh := ARow.SubShown <> Line;
+    if Fresh then
+    begin
+      ARow.SubShown := Line;
+      ARow.Sub.Text := Line;
+      ARow.SubShift := 0;
+      ARow.SubAtEnd := False;
+      ARow.SubHold := HoldTicks;
+    end;
+    TextW := MeasurePillText(Line, 11);
+    if TextW <= HostW + 1 then
+    begin
+      ARow.SubShift := 0;
+      ARow.Sub.SetBounds(0, 0, HostW, ARow.SubClip.Height);
+      Exit;
+    end;
+    if Fresh then
+    begin
+      ARow.Sub.SetBounds(0, 0, TextW + 8, ARow.SubClip.Height);
+      Exit;
+    end;
+    Limit := TextW - HostW + 16;
+    if ARow.SubHold > 0 then
+    begin
+      Dec(ARow.SubHold);
+      if (ARow.SubHold = 0) and ARow.SubAtEnd then
+      begin
+        ARow.SubShift := 0;
+        ARow.SubAtEnd := False;
+        ARow.SubHold := HoldTicks;
+      end;
+    end
+    else
+    begin
+      ARow.SubShift := ARow.SubShift + Speed;
+      if ARow.SubShift >= Limit then
+      begin
+        ARow.SubShift := Limit;
+        ARow.SubAtEnd := True;
+        ARow.SubHold := HoldTicks;
+      end;
+    end;
+    ARow.Sub.SetBounds(-ARow.SubShift, 0, TextW + 8, ARow.SubClip.Height);
+  end;
+
 begin
   if not Assigned(FOpBody) or not Assigned(FOpRows) then
     Exit;
@@ -3617,15 +3836,21 @@ begin
       R.Title.TextSettings.Trimming := TTextTrimming.Character;
       R.Title.TextSettings.WordWrap := False;
 
+      R.SubClip := TLayout.Create(Self);
+      R.SubClip.Parent := R.Box;
+      R.SubClip.Align := TAlignLayout.None;
+      R.SubClip.HitTest := False;
+      R.SubClip.ClipChildren := True;
+      R.SubClip.SetBounds(32, 24, BodyW - 48, 16);
       R.Sub := TText.Create(Self);
-      R.Sub.Parent := R.Box;
+      R.Sub.Parent := R.SubClip;
       R.Sub.Align := TAlignLayout.None;
       R.Sub.HitTest := False;
-      R.Sub.SetBounds(32, 24, BodyW - 48, 16);
+      R.Sub.SetBounds(0, 0, R.SubClip.Width, R.SubClip.Height);
       ApplyFluentText(R.Sub, 11, False);
       R.Sub.TextSettings.HorzAlign := TTextAlign.Leading;
       R.Sub.TextSettings.VertAlign := TTextAlign.Center;
-      R.Sub.TextSettings.Trimming := TTextTrimming.Character;
+      R.Sub.TextSettings.Trimming := TTextTrimming.None;
       R.Sub.TextSettings.WordWrap := False;
 
       R.Pct := TText.Create(Self);
@@ -3691,7 +3916,7 @@ begin
     R.Box.SetBounds(0, I * RowH, BodyW, RowH);
     R.Ico.Text := V.IconText;
     R.Title.Text := V.Title;
-    R.Sub.Text := V.Detail;
+    StepSub(R, V.Detail);
     R.Pct.Text := V.PercentText;
     R.Title.TextSettings.FontColor := FColors.TextColor;
     R.Sub.TextSettings.FontColor := FColors.SubTextColor;
@@ -4163,6 +4388,9 @@ begin
   FMidGroup.Height := Y;
   FMidStackH := Y;
   BuildOpPill;
+  { Пустое место панели — сплиттер. Кнопки и пилюля сами ловят свой клик. }
+  BindMidSplitter(FMidBar);
+  BindMidSplitter(FMidGroup);
   ApplyMinWindowHeight;
 
   FLastSelectMask := '*.*';
@@ -4812,6 +5040,8 @@ begin
   FSplitDragging := True;
   FSplitStartX := FWorkArea.AbsoluteToLocal(AbsPt).X;
   FSplitStartLeftW := FLeftPanel.Width;
+  if (Sender = FMidBar) or (Sender = FMidGroup) then
+    SetMidSplitCursor(True);
 end;
 
 procedure TMainForm.SplitterMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
@@ -4829,12 +5059,69 @@ end;
 
 procedure TMainForm.SplitterMouseUp(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Single);
+var
+  Mid: Boolean;
 begin
+  Mid := (Sender = FMidBar) or (Sender = FMidGroup);
   if not FSplitDragging then
+  begin
+    if Mid then
+      SetMidSplitCursor(False);
     Exit;
+  end;
   FSplitDragging := False;
   if (FLeftPanel.Width + FRightPanel.Width) > 0 then
     FLeftPanelRatio := FLeftPanel.Width / (FLeftPanel.Width + FRightPanel.Width);
+  SaveSplitterRatio;
+  if Mid then
+    SetMidSplitCursor(False);
+end;
+
+procedure TMainForm.BindMidSplitter(AControl: TControl);
+begin
+  if AControl = nil then
+    Exit;
+  AControl.HitTest := True;
+  AControl.AutoCapture := True;
+  AControl.OnMouseDown := SplitterMouseDown;
+  AControl.OnMouseMove := SplitterMouseMove;
+  AControl.OnMouseUp := SplitterMouseUp;
+  AControl.OnDblClick := MidBarDblClick;
+end;
+
+procedure TMainForm.SetMidSplitCursor(ASplit: Boolean);
+var
+  CS: IFMXCursorService;
+  C: TCursor;
+begin
+  if ASplit then
+    C := crHSplit
+  else
+    C := crDefault;
+  if Assigned(FMidBar) then
+    FMidBar.Cursor := C;
+  if Assigned(FMidGroup) then
+    FMidGroup.Cursor := C;
+  { SetCursor сам не шле курсор, якщо миша вже вийшла з панелі. }
+  if TPlatformServices.Current.SupportsPlatformService(IFMXCursorService, CS) then
+    CS.SetCursor(C);
+end;
+
+procedure TMainForm.MidBarDblClick(Sender: TObject);
+begin
+  { Другий клік приходить після MouseDown, який уже підняв FSplitDragging. }
+  FSplitDragging := False;
+  SetMidSplitCursor(False);
+  FLeftPanelRatio := 0.5;
+  LayoutWorkArea;
+  SaveSplitterRatio;
+end;
+
+procedure TMainForm.SaveSplitterRatio;
+begin
+  if Assigned(FSettings) then
+    FSettings.SplitterPos := FLeftPanelRatio;
+  MarkSessionDirty;
 end;
 
 procedure TMainForm.SplitterMouseEnter(Sender: TObject);
@@ -5716,6 +6003,7 @@ begin
     TText(FBtnMax.TagObject).TextSettings.FontColor := AColors.TextColor;
   if Assigned(FBtnClose) and (FBtnClose.TagObject is TText) then
     TText(FBtnClose.TagObject).TextSettings.FontColor := AColors.TextColor;
+  SyncMicaWinGlyphs;
 
   if Assigned(FDock) then
     FDock.ApplyTheme(Chrome);
@@ -6106,26 +6394,8 @@ begin
 end;
 
 function BinConfirm(AOwner: TCommonCustomForm; const AText: string): Boolean;
-{$IFDEF MSWINDOWS}
-var
-  Cfg: TTaskDialogConfig;
-  Btn: Integer;
-{$ENDIF}
 begin
-  {$IFDEF MSWINDOWS}
-  FillChar(Cfg, SizeOf(Cfg), 0);
-  Cfg.cbSize := SizeOf(Cfg);
-  if AOwner <> nil then
-    Cfg.hwndParent := FormToHWND(AOwner);
-  Cfg.dwFlags := TDF_ALLOW_DIALOG_CANCELLATION or TDF_POSITION_RELATIVE_TO_WINDOW;
-  Cfg.pszWindowTitle := PChar(L('bin.title'));
-  Cfg.pszMainInstruction := PChar(AText);
-  Cfg.dwCommonButtons := TDCBF_YES_BUTTON or TDCBF_NO_BUTTON;
-  Cfg.nDefaultButton := IDNO;
-  Result := Succeeded(TaskDialogIndirect(Cfg, @Btn, nil, nil)) and (Btn = IDYES);
-  {$ELSE}
-  Result := False;
-  {$ENDIF}
+  Result := ShowBinConfirm(AOwner, AText);
 end;
 
 procedure TMainForm.RecycleAct(Sender: TObject; AEmpty: Boolean);
@@ -6279,11 +6549,19 @@ end;
 procedure TMainForm.OnBtnRefreshClick(Sender: TObject);
 begin
   if Assigned(FLeftPanel) then
+  begin
     FLeftPanel.InvalidateFolderSizes;
+    FLeftPanel.ReloadTilePreviews;
+  end;
   if Assigned(FRightPanel) then
+  begin
     FRightPanel.InvalidateFolderSizes;
-  FLeftPanel.Refresh;
-  FRightPanel.Refresh;
+    FRightPanel.ReloadTilePreviews;
+  end;
+  if Assigned(FLeftPanel) then
+    FLeftPanel.Refresh;
+  if Assigned(FRightPanel) then
+    FRightPanel.Refresh;
 end;
 
 procedure TMainForm.OnBtnViewDetailsClick(Sender: TObject);
@@ -6669,6 +6947,18 @@ begin
   if KeyChar = '*' then Key := vkMultiply;
   if KeyChar = '+' then Key := vkAdd;
   if KeyChar = '-' then Key := vkSubtract;
+  { До заміни Tab на 442: інакше Ctrl+Tab іде на іншу панель, а FMX зсуває фокус. }
+  if (Key = vkTab) and (ssCtrl in Shift) and not (ssAlt in Shift) and
+     not (Assigned(FActivePanel) and
+       (FActivePanel.IsPathEditing or FActivePanel.IsInlineRenaming)) and
+     not (Assigned(FQuickSearch) and FQuickSearch.EditorFocused) then
+  begin
+    if Assigned(FActivePanel) then
+      FActivePanel.CycleTab(not (ssShift in Shift));
+    Key := 0;
+    KeyChar := #0;
+    Exit;
+  end;
   if Key = 9 then Key := 442;
 
   if (Key = vkF5) and (ssAlt in Shift) then
@@ -6829,7 +7119,10 @@ begin
     end;
   end;
 
-  if (Key = vkF1) and (ssCtrl in Shift) and (ssShift in Shift) then
+  if ((Key = vkF1) and (ssCtrl in Shift) and (ssShift in Shift)) or
+     ((ssCtrl in Shift) and not (ssAlt in Shift) and
+      ((Key = vkTilde) or (KeyChar = '~') or (KeyChar = '`') or (KeyChar = '''') or
+       (KeyChar = '₴') or (KeyChar = 'Ё') or (KeyChar = 'ё'))) then
   begin
     if Assigned(FActivePanel) then
     begin
@@ -6840,6 +7133,15 @@ begin
       UpdateViewButtons;
     end;
     Key := 0;
+    KeyChar := #0;
+  end
+  else if (Key = vkApps) and not (ssCtrl in Shift) and not (ssAlt in Shift) then
+  begin
+    if Assigned(FActivePanel) and not FActivePanel.IsPathEditing and
+       not FActivePanel.IsInlineRenaming then
+      FActivePanel.ShowCursorContextMenu;
+    Key := 0;
+    KeyChar := #0;
   end
   else if (Key = vkQ) and (ssCtrl in Shift) then
   begin
@@ -6858,8 +7160,11 @@ begin
   end
   else if Key = vkF4 then
   begin
-    OnBtnSearchClick(nil);
+    { Alt+F4 закрывает окно через FrameWndProc. Здесь поиск только без Alt. }
+    if not (ssAlt in Shift) then
+      OnBtnSearchClick(nil);
     Key := 0;
+    KeyChar := #0;
   end
   else if Key = vkF5 then
   begin

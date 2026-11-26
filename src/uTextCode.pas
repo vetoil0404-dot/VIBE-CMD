@@ -29,6 +29,7 @@ type
 
 function IsListedTextExt(const AExt: string): Boolean;
 function TextDefaultIsCode(const AExt: string): Boolean;
+function TextBytesLookLike(const ABytes: TBytes): Boolean;
 function TextFileLooksLike(const APath: string): Boolean;
 function TextLangOfExt(const AExt: string): TTextLang;
 function LoadTextViewIsCode(const AExt: string): Boolean;
@@ -45,7 +46,7 @@ function TokenizeLine(const ALine: string; ALang: TTextLang;
 function TextRoleColor(ARole: TTextRole; const AColors: TThemeColors): TAlphaColor;
 
 function RenderTextA4Thumb(const APath: string; AWidth, AHeight: Integer;
-  ABitmap: TBitmap): Boolean;
+  ABitmap: TBitmap; ATrustContent: Boolean = False): Boolean;
 
 implementation
 
@@ -150,12 +151,50 @@ begin
   end;
 end;
 
+function TextBytesLookLike(const ABytes: TBytes): Boolean;
+var
+  I, N, Good, Zeros, Pairs, UtfGood: Integer;
+  B, Lo, Hi: Byte;
+begin
+  N := Length(ABytes);
+  if N = 0 then
+    Exit(True);
+  if (N >= 2) and (((ABytes[0] = $FF) and (ABytes[1] = $FE)) or
+     ((ABytes[0] = $FE) and (ABytes[1] = $FF))) then
+    Exit(True);
+  Good := 0;
+  Zeros := 0;
+  for I := 0 to N - 1 do
+  begin
+    B := ABytes[I];
+    if B = 0 then
+      Inc(Zeros)
+    else if (B = 9) or (B = 10) or (B = 13) or (B >= 32) then
+      Inc(Good);
+  end;
+  if Zeros = 0 then
+    Exit(Good / N >= 0.85);
+  Pairs := N div 2;
+  if Pairs < 4 then
+    Exit(False);
+  UtfGood := 0;
+  for I := 0 to Pairs - 1 do
+  begin
+    Lo := ABytes[I * 2];
+    Hi := ABytes[I * 2 + 1];
+    if (Hi = 0) and ((Lo = 9) or (Lo = 10) or (Lo = 13) or (Lo >= 32)) then
+      Inc(UtfGood)
+    else if (Lo = 0) and ((Hi = 9) or (Hi = 10) or (Hi = 13) or (Hi >= 32)) then
+      Inc(UtfGood);
+  end;
+  Result := UtfGood / Pairs >= 0.85;
+end;
+
 function TextFileLooksLike(const APath: string): Boolean;
 var
   FS: TFileStream;
   Buf: TBytes;
-  I, N, Good, Zeros, Pairs, UtfGood: Integer;
-  B, Lo, Hi: Byte;
+  N: Integer;
 begin
   Result := False;
   if (APath = '') or not TFile.Exists(APath) then
@@ -174,35 +213,7 @@ begin
   except
     Exit(False);
   end;
-  if (N >= 2) and (((Buf[0] = $FF) and (Buf[1] = $FE)) or
-     ((Buf[0] = $FE) and (Buf[1] = $FF))) then
-    Exit(True);
-  Good := 0;
-  Zeros := 0;
-  for I := 0 to N - 1 do
-  begin
-    B := Buf[I];
-    if B = 0 then
-      Inc(Zeros)
-    else if (B = 9) or (B = 10) or (B = 13) or (B >= 32) then
-      Inc(Good);
-  end;
-  if Zeros = 0 then
-    Exit(Good / N >= 0.85);
-  Pairs := N div 2;
-  if Pairs < 4 then
-    Exit(False);
-  UtfGood := 0;
-  for I := 0 to Pairs - 1 do
-  begin
-    Lo := Buf[I * 2];
-    Hi := Buf[I * 2 + 1];
-    if (Hi = 0) and ((Lo = 9) or (Lo = 10) or (Lo = 13) or (Lo >= 32)) then
-      Inc(UtfGood)
-    else if (Lo = 0) and ((Hi = 9) or (Hi = 10) or (Hi = 13) or (Hi >= 32)) then
-      Inc(UtfGood);
-  end;
-  Result := UtfGood / Pairs >= 0.85;
+  Result := TextBytesLookLike(Buf);
 end;
 
 function MbTake(const ABytes: TBytes; AFrom: Integer; ACodePage, AFlags: Cardinal;
@@ -889,7 +900,7 @@ begin
 end;
 
 function RenderTextA4Thumb(const APath: string; AWidth, AHeight: Integer;
-  ABitmap: TBitmap): Boolean;
+  ABitmap: TBitmap; ATrustContent: Boolean): Boolean;
 var
   FS: TFileStream;
   Buf: TBytes;
@@ -902,7 +913,7 @@ begin
   if (ABitmap = nil) or (APath = '') or not TFile.Exists(APath) then
     Exit;
   Ext := LowerCase(ExtractFileExt(APath));
-  if not IsListedTextExt(Ext) then
+  if (not ATrustContent) and (not IsListedTextExt(Ext)) then
     Exit;
   try
     Sz := TFile.GetSize(APath);

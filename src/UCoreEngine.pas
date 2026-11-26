@@ -42,6 +42,9 @@ function GetFileThumbnailRaw(const AFilePath: string; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 function GetFileThumbnailOnly(const AFilePath: string; ASize: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+{ Лише кадр, який оболонка вже тримає в кеші. Провайдер не запускається. }
+function GetCachedShellThumbnailRaw(const AFilePath: string; ASize: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
 procedure ClearFolderThumbPlate(var APixels: TBytes; AWidth, AHeight: Integer);
 function GetShellItemThumbnailRaw(const AItem: IUnknown; AWidth, AHeight: Integer;
   out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
@@ -2078,6 +2081,107 @@ begin
     True, APixels, AOutW, AOutH);
   if Result and ((AOutW < 96) or (AOutH < 96)) then
   begin
+    Result := False;
+    SetLength(APixels, 0);
+    AOutW := 0;
+    AOutH := 0;
+  end;
+end;
+
+type
+  TWTSThumbnailID = record
+    Key: array[0..15] of Byte;
+  end;
+
+  ISharedBitmap = interface(IUnknown)
+    ['{091162A4-BC96-411F-AAE8-C5122CD03363}']
+    function GetSharedBitmap(out phbm: HBITMAP): HResult; stdcall;
+    function GetSize(out pSize: TSize): HResult; stdcall;
+    function GetFormat(out pAlpha: Cardinal): HResult; stdcall;
+    function InitializeBitmap(hbm: HBITMAP; wtsAT: Cardinal): HResult; stdcall;
+    function Detach(out phbm: HBITMAP): HResult; stdcall;
+  end;
+
+  IThumbnailCache = interface(IUnknown)
+    ['{F676C15D-596A-4CE2-8234-33996F445DB1}']
+    function GetThumbnail(const pShellItem: IShellItem; cxyRequestedThumbSize: Cardinal;
+      flags: Cardinal; out ppvThumb: ISharedBitmap; out pOutFlags: Cardinal;
+      out pThumbnailID: TWTSThumbnailID): HResult; stdcall;
+    function GetThumbnailByID(const thumbnailID: TWTSThumbnailID;
+      cxyRequestedThumbSize: Cardinal; out ppvThumb: ISharedBitmap;
+      out pOutFlags: Cardinal): HResult; stdcall;
+  end;
+
+function GetCachedShellThumbnailRaw(const AFilePath: string; ASize: Integer;
+  out APixels: TBytes; out AOutW, AOutH: Integer): Boolean;
+const
+  CLSID_LocalThumbnailCache: TGUID = '{50EF4544-AC9F-4A8E-B21B-8A26180DB13F}';
+  WTS_INCACHEONLY = Cardinal(1);
+var
+  Item: IShellItem;
+  Cache: IThumbnailCache;
+
+  function TryCached(AEdge: Integer): Boolean;
+  var
+    Shared: ISharedBitmap;
+    Flags: Cardinal;
+    ID: TWTSThumbnailID;
+    Hb: HBITMAP;
+    Hr: HRESULT;
+  begin
+    Result := False;
+    Shared := nil;
+    Hb := 0;
+    Flags := 0;
+    FillChar(ID, SizeOf(ID), 0);
+    Hr := Cache.GetThumbnail(Item, Cardinal(AEdge), WTS_INCACHEONLY, Shared, Flags, ID);
+    if Failed(Hr) or (Shared = nil) then
+      Exit;
+    if Failed(Shared.GetSharedBitmap(Hb)) or (Hb = 0) then
+      Exit;
+    Result := HBitmapToBgra(Hb, AEdge, True, APixels, AOutW, AOutH) and
+      (AOutW > 0) and (AOutH > 0) and (Length(APixels) >= AOutW * AOutH * 4);
+    if not Result then
+    begin
+      SetLength(APixels, 0);
+      AOutW := 0;
+      AOutH := 0;
+    end;
+    Shared := nil;
+  end;
+
+begin
+  Result := False;
+  SetLength(APixels, 0);
+  AOutW := 0;
+  AOutH := 0;
+  if (AFilePath = '') or (ASize < 0) then
+    Exit;
+  if not TryMakeShellItem(AFilePath, Item) then
+    Exit;
+  Cache := nil;
+  try
+    if Failed(CoCreateInstance(CLSID_LocalThumbnailCache, nil, CLSCTX_INPROC_SERVER,
+      IThumbnailCache, Cache)) or (Cache = nil) then
+      Exit;
+    if (ASize <> 256) and (ASize <> 96) and (ASize >= 32) and (ASize <= 1024) then
+    begin
+      if TryCached(ASize) then
+      begin
+        Result := True;
+        Exit;
+      end;
+      SetLength(APixels, 0);
+      AOutW := 0;
+      AOutH := 0;
+    end;
+    SetLength(APixels, 0);
+    AOutW := 0;
+    AOutH := 0;
+    if not TryCached(256) then
+      TryCached(96);
+    Result := (AOutW > 0) and (AOutH > 0) and (Length(APixels) >= AOutW * AOutH * 4);
+  except
     Result := False;
     SetLength(APixels, 0);
     AOutW := 0;

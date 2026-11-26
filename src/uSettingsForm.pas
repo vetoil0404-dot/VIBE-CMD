@@ -60,8 +60,8 @@ type
     FCbSelExplorer, FCbSelVibe: TFluentCheckRow;
     FCbHidden, FCbFolderSize, FCbNetwork: TFluentCheckRow;
     FCbAutoStart, FCbSingleInstance: TFluentCheckRow;
-    FEdUpdRepo, FEdUpdMask: TFluentEdit;
-    FUpdRepoLbl, FUpdMaskLbl: TText;
+    FEdUpdRepo: TFluentEdit;
+    FUpdRepoLbl: TText;
     FUpdHost: TLayout;
     FCbUpdAuto, FCbUpdStable, FCbUpdTest: TFluentCheckRow;
     FBtnUpdCheck: TFluentButton;
@@ -1092,7 +1092,7 @@ begin
   RebuildLangPage;
 
   Card := AddCard(FPages[4], 'set.card.update');
-  Card.Height := 320;
+  Card.Height := 260;
   Card.BeginUpdate;
   try
     FUpdRepoLbl := AddSub(Card, 'set.upd.repo');
@@ -1103,14 +1103,6 @@ begin
     FEdUpdRepo.FillMode := fefSubtle;
     FEdUpdRepo.Text := FSettings.UpdateRepo;
     FEdUpdRepo.OnChange := OptionChanged;
-    FUpdMaskLbl := AddSub(Card, 'set.upd.mask');
-    FEdUpdMask := CreateFluentEdit(Self, Card);
-    FEdUpdMask.Align := TAlignLayout.Top;
-    FEdUpdMask.Height := 32;
-    FEdUpdMask.Margins.Rect := TRectF.Create(0, 0, 0, 6);
-    FEdUpdMask.FillMode := fefSubtle;
-    FEdUpdMask.Text := FSettings.UpdateMask;
-    FEdUpdMask.OnChange := OptionChanged;
     FCbUpdAuto := AddCheck(Card, 'set.upd.auto', FSettings.UpdateAuto, OptionChanged);
     FCbUpdStable := AddCheck(Card, 'set.upd.stable', not FSettings.UpdatePrerelease,
       UpdateChannelClick);
@@ -1325,8 +1317,6 @@ begin
   FSettings.SingleInstance := FCbSingleInstance.Checked;
   if Assigned(FEdUpdRepo) then
     FSettings.UpdateRepo := Trim(FEdUpdRepo.Text);
-  if Assigned(FEdUpdMask) then
-    FSettings.UpdateMask := Trim(FEdUpdMask.Text);
   if Assigned(FCbUpdAuto) then
     FSettings.UpdateAuto := FCbUpdAuto.Checked;
   if Assigned(FCbUpdTest) then
@@ -1366,18 +1356,14 @@ begin
     if Assigned(FUpdRepoLbl) then
       FUpdRepoLbl.Position.Y := 10;
     FEdUpdRepo.Position.Y := 20;
-    if Assigned(FUpdMaskLbl) then
-      FUpdMaskLbl.Position.Y := 30;
-    if Assigned(FEdUpdMask) then
-      FEdUpdMask.Position.Y := 40;
     if Assigned(FCbUpdAuto) then
-      FCbUpdAuto.Position.Y := 50;
+      FCbUpdAuto.Position.Y := 30;
     if Assigned(FCbUpdStable) then
-      FCbUpdStable.Position.Y := 60;
+      FCbUpdStable.Position.Y := 40;
     if Assigned(FCbUpdTest) then
-      FCbUpdTest.Position.Y := 70;
+      FCbUpdTest.Position.Y := 50;
     if Assigned(FUpdHost) then
-      FUpdHost.Position.Y := 80;
+      FUpdHost.Position.Y := 60;
   finally
     Card.EndUpdate;
   end;

@@ -272,9 +272,15 @@ begin
         begin
           if Sig[3] = Ord('X') then
           begin
+            { Прапори (1) і резерв (3) вже позаду. Полотно: 3 байти ширини−1, потім 3 байти висоти−1. }
+            if FS.Size < 30 then
+              Exit;
             FS.Position := 24;
-            W := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
-            H := Integer(ReadU32LE(FS) and $FFFFFF) + 1;
+            FS.ReadBuffer(Sig, 6);
+            W := (Integer(Sig[0]) or (Integer(Sig[1]) shl 8) or
+              (Integer(Sig[2]) shl 16)) + 1;
+            H := (Integer(Sig[3]) or (Integer(Sig[4]) shl 8) or
+              (Integer(Sig[5]) shl 16)) + 1;
             Result := (W > 0) and (H > 0);
           end
           else if Sig[3] = Ord('L') then

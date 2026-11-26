@@ -16,6 +16,11 @@ type
     isPdf, isSvg, isHeic, isAvif, isJxl, isPe, isZip);
 
 function SniffImageFile(const APath: string): TImageSig;
+{ Перші байти, не більше 64. Той самий розбір, що в SniffImageFile. }
+function SniffImageBytes(const ABytes: TBytes): TImageSig;
+{ ATimeoutMs = 0 читає на місці. Інакше голова обривається: файл цілком не читається. }
+function ReadFileHead(const APath: string; AMax: Integer; ATimeoutMs: Cardinal;
+  out ABytes: TBytes): Boolean;
 function ImageSigName(ASig: TImageSig): string;
 function ImageSigExt(ASig: TImageSig): string;
 function ImageExtMatches(ASig: TImageSig; const AExt: string): Boolean;
@@ -34,33 +39,168 @@ function SaveImage(const ABitmap: TBitmap; const APath: string;
 implementation
 
 uses
-  System.Classes, System.Math, System.UITypes, System.IOUtils,
+  System.Classes, System.Math, System.UITypes, System.IOUtils, System.SyncObjs,
   FMX.Types, FMX.Surfaces, FMX.Skia, System.Skia;
 
-function SniffImageFile(const APath: string): TImageSig;
+function ReadFileHeadNow(const APath: string; AMax: Integer;
+  out ABytes: TBytes): Boolean;
 var
   FS: TFileStream;
+  N: Integer;
+begin
+  Result := False;
+  SetLength(ABytes, 0);
+  if (APath = '') or (AMax < 1) or not System.IOUtils.TFile.Exists(APath) then
+    Exit;
+  try
+    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      N := Integer(Min(Int64(AMax), FS.Size));
+      SetLength(ABytes, N);
+      if N > 0 then
+        FS.ReadBuffer(ABytes[0], N);
+      Result := True;
+    finally
+      FS.Free;
+    end;
+  except
+    Result := False;
+    SetLength(ABytes, 0);
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+type
+  THeadRead = class
+    Path: string;
+    MaxN: Integer;
+    Bytes: TBytes;
+    Ok: Boolean;
+    Done: TEvent;
+    Gate: Integer;
+    procedure Execute;
+  end;
+
+procedure THeadRead.Execute;
+var
+  H: THandle;
+  N: DWORD;
+begin
+  Ok := False;
+  SetLength(Bytes, 0);
+  try
+    H := CreateFile(PChar(Path), GENERIC_READ,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if H <> INVALID_HANDLE_VALUE then
+    try
+      SetLength(Bytes, MaxN);
+      N := 0;
+      if (MaxN > 0) and ReadFile(H, Bytes[0], DWORD(MaxN), N, nil) then
+      begin
+        SetLength(Bytes, N);
+        Ok := True;
+      end
+      else
+        SetLength(Bytes, 0);
+    finally
+      CloseHandle(H);
+    end;
+  except
+    Ok := False;
+    SetLength(Bytes, 0);
+  end;
+  if TInterlocked.Increment(Gate) = 1 then
+    Done.SetEvent
+  else
+  begin
+    Done.Free;
+    Free;
+  end;
+end;
+{$ENDIF}
+
+function ReadFileHead(const APath: string; AMax: Integer; ATimeoutMs: Cardinal;
+  out ABytes: TBytes): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Job: THeadRead;
+  Thr: TThread;
+{$ENDIF}
+begin
+  SetLength(ABytes, 0);
+  if (APath = '') or (AMax < 1) then
+    Exit(False);
+  if ATimeoutMs = 0 then
+    Exit(ReadFileHeadNow(APath, AMax, ABytes));
+{$IFDEF MSWINDOWS}
+  Job := THeadRead.Create;
+  Job.Path := APath;
+  Job.MaxN := AMax;
+  Job.Gate := 0;
+  Job.Ok := False;
+  Job.Done := TEvent.Create(nil, True, False, '');
+  Thr := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      Job.Execute;
+    end);
+  Thr.FreeOnTerminate := False;
+  Thr.Start;
+  try
+    if Job.Done.WaitFor(ATimeoutMs) = wrSignaled then
+    begin
+      Result := Job.Ok;
+      if Result then
+        ABytes := Job.Bytes;
+      Thr.WaitFor;
+      Thr.Free;
+      Job.Done.Free;
+      Job.Free;
+      Exit;
+    end;
+    CancelSynchronousIo(Thr.Handle);
+    if Job.Done.WaitFor(400) = wrSignaled then
+    begin
+      Thr.WaitFor;
+      Thr.Free;
+      Job.Done.Free;
+      Job.Free;
+      Exit(False);
+    end;
+    if TInterlocked.Increment(Job.Gate) = 1 then
+    begin
+      Thr.FreeOnTerminate := True;
+      Exit(False);
+    end;
+    Thr.WaitFor;
+    Thr.Free;
+    Job.Done.Free;
+    Job.Free;
+    Result := False;
+  except
+    Result := False;
+    SetLength(ABytes, 0);
+  end;
+{$ELSE}
+  Result := ReadFileHeadNow(APath, AMax, ABytes);
+{$ENDIF}
+end;
+
+function SniffImageBytes(const ABytes: TBytes): TImageSig;
+var
   B: TBytes;
   N: Integer;
   S: string;
 begin
   Result := isNone;
-  if (APath = '') or not System.IOUtils.TFile.Exists(APath) then
+  N := Length(ABytes);
+  if N > 64 then
+    N := 64;
+  if N < 4 then
     Exit;
-  try
-    FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
-    try
-      N := Integer(Min(Int64(64), FS.Size));
-      if N < 4 then
-        Exit;
-      SetLength(B, N);
-      FS.ReadBuffer(B[0], N);
-    finally
-      FS.Free;
-    end;
-  except
-    Exit;
-  end;
+  SetLength(B, N);
+  Move(ABytes[0], B[0], N);
   if (B[0] = $FF) and (B[1] = $D8) and (B[2] = $FF) then
     Exit(isJpeg);
   if (B[0] = $89) and (B[1] = $50) and (B[2] = $4E) and (B[3] = $47) then
@@ -110,6 +250,16 @@ begin
   S := LowerCase(S);
   if (Pos('<svg', S) > 0) or ((Pos('<?xml', S) > 0) and (Pos('svg', S) > 0)) then
     Exit(isSvg);
+end;
+
+function SniffImageFile(const APath: string): TImageSig;
+var
+  B: TBytes;
+begin
+  Result := isNone;
+  if not ReadFileHead(APath, 64, 0, B) then
+    Exit;
+  Result := SniffImageBytes(B);
 end;
 
 function ImageSigName(ASig: TImageSig): string;

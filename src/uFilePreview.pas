@@ -318,6 +318,7 @@ type
     FFileArgs: string;
     FFileWork: string;
     FFileUrl: string;
+    FFileNote: string;
     FOnDiskChanged: TNotifyEvent;
     FMediaBar: TLayout;
     FBtnPlay: TFluentButton;
@@ -445,7 +446,7 @@ type
     procedure PeHexClick(Sender: TObject);
     procedure PlacePeHex;
     procedure AcceptPe(AToken: Integer; const AKey, APath: string; const AInfo: TPeInfo);
-    procedure ShowFileCard(const APath: string);
+    procedure ShowFileCard(const APath: string; const ANote: string = '');
     procedure HideFileCard;
     procedure PaintFileCard(Sender: TObject; Canvas: TCanvas);
     procedure FileHexClick(Sender: TObject);
@@ -508,6 +509,8 @@ type
     procedure ApplySpreadsheet(ABook: TSpreadWorkbook);
     procedure ApplyDocument(ADoc: TDocDocument);
     procedure StartHeavyLoad(const APath: string; AKind: Integer);
+    procedure StartHugeTiffPreview(const APath: string);
+    procedure ShowEmbeddedRaster(const APixels: TBytes; AW, AH: Integer);
     procedure ShowPdfPage(AIndex: Integer; AResetView: Boolean = True);
     function OpenPdfDoc: Boolean;
     procedure ApplyPdfSizeText;
@@ -2476,6 +2479,12 @@ begin
     end;
   end;
   Result := LoadAsSkiaImage(APath);
+  if TiffOverDecoderLimit(APath) then
+  begin
+    if Result then
+      ShowImageTools(True);
+    Exit;
+  end;
   if not Result and ExtIn(Ext, ['.jpg', '.jpeg', '.png', '.bmp', '.gif']) then
   try
     FImage.Bitmap.LoadFromFile(APath);
@@ -2510,16 +2519,20 @@ end;
 
 function TFilePreview.LoadAsThumb(const APath: string): Boolean;
 var
+  Pix: TBytes;
   W, H: Integer;
 begin
+  { Только настоящий кадр. RESIZETOFIT отдаёт иконку типа на весь FImage. }
   Result := False;
-  W := Max(200, Round(FBody.Width));
-  H := Max(200, Round(FBody.Height));
-  if W < 400 then W := 800;
-  if H < 300 then H := 600;
+  if not Assigned(FImage) then
+    Exit;
   try
-    Result := GetFileThumbnail(APath, W, H, FImage.Bitmap) and
-      (FImage.Bitmap.Width > 0);
+    Result := GetFileThumbnailOnly(APath, 480, Pix, W, H) and (W > 0) and (H > 0);
+    if Result then
+    begin
+      BgraToFmxBitmap(Pix, W, H, FImage.Bitmap);
+      Result := FImage.Bitmap.Width > 0;
+    end;
   except
     Result := False;
   end;
@@ -2673,13 +2686,8 @@ begin
   OkPlay := StartMpv(APath, not Audio); { видео — с HWND, аудио — без }
 {$ENDIF}
   if not Audio and not OkPlay then
-  begin
-    if LoadAsThumb(APath) then
-      Result := True
-    else if LoadAsImage(APath) then
-      Result := True;
-  end;
-  if OkPlay or Result or IsMediaMetaExt(Ext) then
+    Exit;
+  if OkPlay or Audio then
   begin
     ShowMediaChrome(Audio);
     if Audio then
@@ -2687,7 +2695,6 @@ begin
     else
       SetKindKey('');
     Result := True;
-    Exit;
   end;
 end;
 
@@ -5425,6 +5432,15 @@ begin
   Canvas.FillText(TRectF.Create(128, Y + 32, W - 12, Y + 88), FFileType, True, 1, [],
     TTextAlign.Leading, TTextAlign.Leading);
   Y := Y + 112;
+  if FFileNote <> '' then
+  begin
+    Canvas.Font.Size := 13;
+    Canvas.Font.Style := [];
+    Canvas.Fill.Color := FColors.SubTextColor;
+    Canvas.FillText(TRectF.Create(18, Y, W - 16, Y + 36), FFileNote, True, 1, [],
+      TTextAlign.Leading, TTextAlign.Leading);
+    Y := Y + 40;
+  end;
   Row(L('qv.file.size'), FFileSize);
   Row(L('qv.file.modified'), FFileModified);
   Row(L('qv.file.created'), FFileCreated);
@@ -5454,7 +5470,7 @@ begin
   FFileContentH := Y + FFileScroll + 48;
 end;
 
-procedure TFilePreview.ShowFileCard(const APath: string);
+procedure TFilePreview.ShowFileCard(const APath: string; const ANote: string);
 var
   Token: Integer;
   Ext, Opens: string;
@@ -5494,6 +5510,7 @@ begin
   FFileArgs := '';
   FFileWork := '';
   FFileUrl := '';
+  FFileNote := ANote;
   FreeAndNil(FFileThumb);
   Ext := LowerCase(ExtractFileExt(APath));
   FillChar(SFI, SizeOf(SFI), 0);
@@ -5613,7 +5630,10 @@ begin
     begin
       CoInitialize(nil);
       try
-        Ok := GetFileThumbnailOnly(APath, 480, Pix, TW, TH);
+        if TiffOverDecoderLimit(APath) then
+          Ok := GetCachedShellThumbnailRaw(APath, 256, Pix, TW, TH)
+        else
+          Ok := GetFileThumbnailOnly(APath, 480, Pix, TW, TH);
       finally
         CoUninitialize;
       end;
@@ -5903,14 +5923,7 @@ var
 begin
   Result := False;
   if not IsArchiveFileName(APath) then
-  begin
-    if LoadAsThumb(APath) then
-    begin
-      SetKindKey('qv.kind.archive');
-      Exit(True);
-    end;
     Exit(False);
-  end;
   Kind := DetectArchiveKind(APath);
   KindName := ArchiveKindCaption(Kind);
   if (KindName = '') or (Kind = akOther) then
@@ -6783,8 +6796,14 @@ begin
             end
             else
             begin
-              ShowInfoKey('qv.doc.parsefail');
-              SetKindKey('qv.kind.doc');
+              {$IFDEF MSWINDOWS}
+              if LoadNativePreview(Path) then
+              begin
+                SetKindKey('qv.kind.doc');
+                Exit;
+              end;
+              {$ENDIF}
+              ShowFileCard(Path, L('qv.doc.parsefail'));
             end;
           except
             Book.Free;
@@ -6793,6 +6812,69 @@ begin
           end;
         end);
     end).Start;
+end;
+
+procedure TFilePreview.StartHugeTiffPreview(const APath: string);
+var
+  Gen: Integer;
+  Path: string;
+begin
+  Gen := FLoadGen;
+  Path := APath;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Pix: TBytes;
+      W, H: Integer;
+      Ok: Boolean;
+      Hr: HResult;
+    begin
+      Hr := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
+      try
+        Ok := TryTiffEmbeddedPixels(Path, 2048, Pix, W, H);
+      finally
+        if (Hr = S_OK) or (Hr = S_FALSE) then
+          CoUninitialize;
+      end;
+      TThread.Queue(nil,
+        procedure
+        begin
+          if FDestroying or (csDestroying in ComponentState) or (FLoadGen <> Gen) then
+            Exit;
+          if Ok and (W > 0) and (H > 0) then
+            ShowEmbeddedRaster(Pix, W, H)
+          else
+            ShowFileCard(Path);
+        end);
+    end).Start;
+end;
+
+procedure TFilePreview.ShowEmbeddedRaster(const APixels: TBytes; AW, AH: Integer);
+begin
+  if (not Assigned(FImage)) or (AW < 1) or (AH < 1) or
+     (Length(APixels) < Int64(AW) * AH * 4) then
+  begin
+    ShowFileCard(FPath);
+    Exit;
+  end;
+  try
+    BgraToFmxBitmap(APixels, AW, AH, FImage.Bitmap);
+  except
+    ShowFileCard(FPath);
+    Exit;
+  end;
+  if (FImage.Bitmap.Width < 1) or (FImage.Bitmap.Height < 1) then
+  begin
+    ShowFileCard(FPath);
+    Exit;
+  end;
+  FImgKind := ivRaster;
+  FViewW := FImage.Bitmap.Width;
+  FViewH := FImage.Bitmap.Height;
+  FFrameW := FViewW;
+  FFrameH := FViewH;
+  ShowRasterImage;
+  ShowImageTools(True);
 end;
 
 procedure TFilePreview.PaintSvg(Sender: TObject; const ACanvas: ISkCanvas;
@@ -8223,6 +8305,24 @@ begin
       end;
       if ExtIn(Ext, ['.tgs', '.lottie', '.json']) then
         Exit(False);
+    end;
+    if TiffOverDecoderLimit(APath) then
+    begin
+      if TryTiffEmbeddedPixels(APath, 2048, Bytes, W, H) and (W > 0) and (H > 0) then
+      begin
+        BgraToFmxBitmap(Bytes, W, H, FImage.Bitmap);
+        Result := (FImage.Bitmap.Width > 0) and (FImage.Bitmap.Height > 0);
+        if Result then
+        begin
+          FImgKind := ivRaster;
+          FViewW := FImage.Bitmap.Width;
+          FViewH := FImage.Bitmap.Height;
+          FFrameW := FViewW;
+          FFrameH := FViewH;
+          ShowRasterImage;
+        end;
+      end;
+      Exit;
     end;
     Img := TSkImage.MakeFromEncodedFile(APath);
     if Img = nil then
@@ -13487,6 +13587,77 @@ begin
   end;
 end;
 
+function RegSz(ARoot: HKEY; const APath, AName: string; AAccess: DWORD): string;
+var
+  Key: HKEY;
+  Kind, N: DWORD;
+  Buf: array[0..1023] of Char;
+begin
+  Result := '';
+  if RegOpenKeyEx(ARoot, PChar(APath), 0, AAccess, Key) <> ERROR_SUCCESS then
+    Exit;
+  try
+    N := SizeOf(Buf);
+    Kind := 0;
+    if (RegQueryValueEx(Key, PChar(AName), nil, @Kind, @Buf[0], @N) = ERROR_SUCCESS) and
+       ((Kind = REG_SZ) or (Kind = REG_EXPAND_SZ)) then
+      Result := PChar(@Buf[0]);
+  finally
+    RegCloseKey(Key);
+  end;
+end;
+
+function PreviewTextIsIcon(const AText: string): Boolean;
+var
+  S: string;
+begin
+  S := LowerCase(AText);
+  Result := (Pos('thumbnail', S) > 0) or (Pos('icon', S) > 0);
+end;
+
+function PreviewHandlerDrawsContent(const ACls: TCLSID): Boolean;
+var
+  Id, Name, Server, Path: string;
+  Access: DWORD;
+  Roots: array[0..1] of HKEY;
+  R, A: Integer;
+begin
+  Result := False;
+  Id := GUIDToString(ACls);
+  Name := '';
+  Server := '';
+  Roots[0] := HKEY_LOCAL_MACHINE;
+  Roots[1] := HKEY_CURRENT_USER;
+  for R := 0 to 1 do
+    for A := 0 to 1 do
+    begin
+      if A = 0 then
+        Access := KEY_READ or KEY_WOW64_64KEY
+      else
+        Access := KEY_READ or KEY_WOW64_32KEY;
+      if Name = '' then
+      begin
+        Path := 'SOFTWARE\Microsoft\Windows\CurrentVersion\PreviewHandlers\' + Id;
+        Name := RegSz(Roots[R], Path, '', Access);
+      end;
+      if Server = '' then
+      begin
+        Path := 'SOFTWARE\Classes\CLSID\' + Id + '\InprocServer32';
+        Server := RegSz(Roots[R], Path, '', Access);
+      end;
+      if Name = '' then
+      begin
+        Path := 'SOFTWARE\Classes\CLSID\' + Id;
+        Name := RegSz(Roots[R], Path, '', Access);
+      end;
+    end;
+  if PreviewTextIsIcon(Name) or PreviewTextIsIcon(Server) then
+    Exit;
+  if (Name = '') and (Server = '') then
+    Exit;
+  Result := True;
+end;
+
 function TFilePreview.LoadNativePreview(const APath: string): Boolean;
 var
   Ext: string;
@@ -13512,6 +13683,8 @@ begin
     PChar(Ext), PChar(PreviewHandlerIID), Buf, @Len)) then
     Exit;
   if Failed(CLSIDFromString(Buf, Cls)) then
+    Exit;
+  if not PreviewHandlerDrawsContent(Cls) then
     Exit;
   EnsureHostWnd;
   if FHostWnd = 0 then
@@ -14304,10 +14477,7 @@ begin
       if LoadAsThumb(Local) then
         AdoptRasterView
       else
-      begin
-        ShowInfoKey('qv.kind.nocodec');
-        SetKindKey('qv.kind.nocodec');
-      end;
+        ShowFileCard(Local);
       Exit;
     end;
   end;
@@ -14315,6 +14485,11 @@ begin
 
   if Kind = PK_IMAGE then
   begin
+    if TiffOverDecoderLimit(Local) then
+    begin
+      StartHugeTiffPreview(Local);
+      Exit;
+    end;
     if LoadAsImage(Local) then
       Exit;
     if Ext = '.dxf' then
@@ -14362,12 +14537,8 @@ begin
   begin
     if LoadAsMedia(Local) then
       Exit;
-    if LoadAsThumb(Local) then
-    begin
-      SetKindKey('qv.kind.media');
-      AdoptRasterView;
-      Exit;
-    end;
+    ShowFileCard(Local);
+    Exit;
   end
   else if Kind = PK_FONT then
   begin
@@ -14400,14 +14571,7 @@ begin
       Exit;
     end;
     {$ENDIF}
-    if LoadAsThumb(Local) then
-    begin
-      SetKindKey('qv.kind.pdf');
-      AdoptRasterView;
-      Exit;
-    end;
-    ShowInfoKey('qv.pdf.fail');
-    SetKindKey('qv.kind.pdf');
+    ShowFileCard(Local, L('qv.pdf.fail'));
     Exit;
   end
 
@@ -14460,12 +14624,8 @@ begin
       Exit;
     end;
     {$ENDIF}
-    if LoadAsThumb(Local) then
-    begin
-      SetKindKey('qv.kind.doc');
-      AdoptRasterView;
-      Exit;
-    end;
+    ShowFileCard(Local);
+    Exit;
   end
   else if Kind = PK_MESH then
   begin

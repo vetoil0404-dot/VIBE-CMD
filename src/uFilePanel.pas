@@ -91,6 +91,10 @@ type
     KeepLive: Boolean;
     { Обновление каталога наблюдателем: не прокручивать к курсору. }
     HoldScroll: Boolean;
+    { Старт: корзина вже дочитана, LoadActiveTab не відкриває її вдруге. }
+    StartupPrimed: Boolean;
+    { Вже врахована у лічильнику стартових потоків корзини. }
+    StartupAccounted: Boolean;
   end;
 
   TFilePanel = class(TLayout, ISelectionAdapter)
@@ -169,12 +173,15 @@ type
     FMarkOrigin: Integer;
     FMarkAcc: TArray<Integer>;
     FPendingExplorerMenu: Boolean;
+    FMenuAnchor: TPointF;
+    FMenuAnchorOn: Boolean;
     FMouseModeMenu: TFluentPopupMenu;
     FDropHighlightIndex: Integer;
     FDropTargetHot: Boolean;
     FThumbTimer: TTimer;
     FThumbGen: Integer;
     FThumbKey: string;
+    FForceThumbOrder: Boolean;
     FThumbIconKey: string;
     FThumbDirty: Boolean;
     FThumbMoveTick: UInt64;
@@ -236,6 +243,8 @@ type
     FDeferDirLoad: Boolean;
     FWatchEnabled: Boolean;
     FListReadyFired: Boolean;
+    { Перше читання звичайної папки вийшло порожнім, поки корзина ще тримала shell. }
+    FStartupEmptyRetry: Boolean;
     FShowHiddenFiles: Boolean;
     FShowDriveBar: Boolean;
     FShowDriveHome: Boolean;
@@ -632,6 +641,12 @@ type
     procedure StartDirLoadAt(ATabIndex: Integer; const APath, ASelectPath: string;
       AKeepSelection: Boolean);
     procedure AbandonTabLoad(ATabIndex: Integer);
+    procedure SignalListReady;
+    function AllowStartupListReady(const APath: string; ACount: Integer;
+      AActive: Boolean): Boolean;
+    procedure TrackStartupRecycle(AThr: TThread);
+    procedure AccountStartupRecycle(AIndex: Integer; AThr: TThread);
+    procedure StartupRecycleThreadDone(Sender: TObject);
     function ActiveLoadCount: Integer;
     function IndexOfLoadThread(AThr: TThread): Integer;
     procedure ContinueAfterLoad(ATabIndex: Integer);
@@ -668,6 +683,7 @@ type
     function CanDropTo(const ADest: string; const ASources: TArray<string>): Boolean;
     procedure Navigate(const APath: string; const ASelectPath: string = '');
     procedure Refresh(const ASelectPath: string = ''; AKeepSelection: Boolean = False);
+    procedure ReloadTilePreviews;
     procedure ReloadRecycleTabs;
     procedure RefreshRecycleHomeIcon;
     procedure InvalidateFolderSizes;
@@ -675,6 +691,8 @@ type
     procedure InvalidateView;
     procedure AddTab(const APath: string = ''; const ASelectPath: string = '');
     procedure CloseCurrentTab;
+    { Наступна або попередня вкладка. Той самий SelectTab, що клік. }
+    procedure CycleTab(AForward: Boolean);
     procedure SetViewMode(AMode: TPanelViewMode);
     procedure ApplyTheme(const AColors: TThemeColors);
     procedure ApplyLanguage;
@@ -709,6 +727,7 @@ type
     function IsInlineRenaming: Boolean;
     function SelectedEntries: TArray<TFileEntry>;
     function GetFocusedEntry(out AEntry: TFileEntry): Boolean;
+    procedure ShowCursorContextMenu;
     function HandleSelectionKey(var AKey: Word; AShift: TShiftState): Boolean;
     function FocusByMask(const AMask: string): Boolean;
     procedure ClearSelection;
@@ -735,6 +754,10 @@ type
     procedure CancelPendingIO;
     procedure RestoreTabs(const AState: TSideState);
     procedure LoadActiveTab;
+    function HasRecycleTab: Boolean;
+    { Лише вкладки Корзини. Звичайний диск і мережа тут не стартують. }
+    procedure BeginStartupRecycleLoads;
+    function TakeStartupEmptyRetry: Boolean;
     { Снять отложенную загрузку вкладок, не перечитывая текущую. }
     procedure ReleaseDeferredLoad;
     function LoadNextStaleTab: Boolean;
@@ -778,7 +801,16 @@ type
     procedure SetStatusRightInset(ARight: Single);
   end;
 
+{ Перше завантаження після RestoreTabs. Поки ворота відкриті, друга панель
+  не стартує: OnDone(nil) корзини ще не кінець читання. }
+procedure BeginStartupRecycleGate(AOnIdle: TNotifyEvent);
+procedure EndStartupRecycleGate;
+function StartupRecycleHolds: Boolean;
+
 implementation
+
+uses
+  uMapDriveDialog;
 
 type
   TInAppFileDrag = record
@@ -798,6 +830,67 @@ var
   GHomeShellIcons: TDictionary<string, FMX.Graphics.TBitmap>;
   GHomeStayWnd: HWND;
   GHomeStayOld: Pointer;
+  GStartupRecycleAlive: Integer;
+  GStartupRecycleArming: Integer;
+  GStartupRecycleWatch: Boolean;
+  GStartupRecycleIdlePending: Boolean;
+  GOnStartupRecycleIdle: TNotifyEvent;
+
+procedure FireStartupRecycleIdle;
+var
+  Ev: TNotifyEvent;
+begin
+  if not GStartupRecycleIdlePending then
+    Exit;
+  if (GStartupRecycleAlive > 0) or (GStartupRecycleArming > 0) then
+    Exit;
+  GStartupRecycleIdlePending := False;
+  GStartupRecycleWatch := False;
+  Ev := GOnStartupRecycleIdle;
+  GOnStartupRecycleIdle := nil;
+  if Assigned(Ev) then
+    Ev(nil);
+end;
+
+procedure NoteStartupRecycleFinished(ANotify: Boolean);
+begin
+  if GStartupRecycleAlive > 0 then
+    Dec(GStartupRecycleAlive);
+  if not ANotify then
+  begin
+    if GStartupRecycleAlive = 0 then
+    begin
+      GStartupRecycleIdlePending := False;
+      GStartupRecycleWatch := False;
+      GOnStartupRecycleIdle := nil;
+    end;
+    Exit;
+  end;
+  if (GStartupRecycleAlive = 0) and (GStartupRecycleArming = 0) and
+     GStartupRecycleIdlePending then
+    FireStartupRecycleIdle;
+end;
+
+procedure BeginStartupRecycleGate(AOnIdle: TNotifyEvent);
+begin
+  GOnStartupRecycleIdle := AOnIdle;
+  GStartupRecycleWatch := True;
+  GStartupRecycleIdlePending := True;
+  Inc(GStartupRecycleArming);
+end;
+
+procedure EndStartupRecycleGate;
+begin
+  if GStartupRecycleArming > 0 then
+    Dec(GStartupRecycleArming);
+  if (GStartupRecycleAlive = 0) and GStartupRecycleIdlePending then
+    FireStartupRecycleIdle;
+end;
+
+function StartupRecycleHolds: Boolean;
+begin
+  Result := GStartupRecycleIdlePending or (GStartupRecycleAlive > 0);
+end;
 
 function HomeShellIcon(const APath: string): FMX.Graphics.TBitmap;
 var
@@ -942,6 +1035,7 @@ begin
   FDeferDirLoad := False;
   FWatchEnabled := False;
   FListReadyFired := False;
+  FStartupEmptyRetry := False;
   inherited Create(AOwner);
   FTabs := TList<TFileTab>.Create;
   FActiveTabIndex := -1;
@@ -4286,6 +4380,17 @@ begin
   end;
   if Assigned(FStatusText) then
   begin
+    if (FActiveTabIndex >= 0) and (FActiveTabIndex < FTabs.Count) and
+       (FTabs[FActiveTabIndex].LoadError = L('op.noaccess')) and
+       not IsRemotePath(FTabs[FActiveTabIndex].Path) then
+    begin
+      Entries := GetCurrentEntries;
+      if not Assigned(Entries) or (Entries.Count = 0) then
+      begin
+        FStatusText.Text := L('op.noaccess');
+        Exit;
+      end;
+    end;
     var Phrase := ManualStatusPhrase;
     if Phrase <> '' then
     begin
@@ -6073,6 +6178,8 @@ begin
   Tab.LoadSeenWatch := 0;
   Tab.WaitShared := False;
   Tab.KeepLive := False;
+  Tab.StartupPrimed := False;
+  Tab.StartupAccounted := False;
 
   FTabs.Add(Tab);
 
@@ -6111,6 +6218,35 @@ procedure TFilePanel.CloseCurrentTab;
 begin
   if FTabs.Count <= 1 then Exit;
   FTabsBar.RemoveTab(FActiveTabIndex);
+end;
+
+procedure TFilePanel.CycleTab(AForward: Boolean);
+var
+  N, Idx: Integer;
+begin
+  if not FActive or (FTabsBar = nil) then
+    Exit;
+  N := FTabsBar.TabCount;
+  if N <= 1 then
+    Exit;
+  Idx := FTabsBar.ActiveIndex;
+  if (Idx < 0) or (Idx >= N) then
+    Idx := 0;
+  if AForward then
+  begin
+    Inc(Idx);
+    if Idx >= N then
+      Idx := 0;
+  end
+  else
+  begin
+    Dec(Idx);
+    if Idx < 0 then
+      Idx := N - 1;
+  end;
+  if Idx = FTabsBar.ActiveIndex then
+    Exit;
+  FTabsBar.SelectTab(Idx);
 end;
 
 procedure TFilePanel.HandleTabChange(Sender: TObject; AIndex: Integer);
@@ -6790,6 +6926,21 @@ end;
 
 
 
+procedure TFilePanel.ReloadTilePreviews;
+var
+  Path: string;
+begin
+  if FDestroying or (ViewMode <> vmTiles) then
+    Exit;
+  Path := GetCurrentPathImpl;
+  FThumbKey := '';
+  FForceThumbOrder := True;
+  if Assigned(GlobalThumbCache) and (Path <> '') and
+     not GlobalThumbCache.ShuttingDown then
+    GlobalThumbCache.InvalidateFolder(Path);
+  InvalidateView;
+end;
+
 procedure TFilePanel.Refresh(const ASelectPath: string; AKeepSelection: Boolean);
 var
   Path: string;
@@ -7008,6 +7159,7 @@ procedure TFilePanel.AbandonTabLoad(ATabIndex: Integer);
 var
   Tab: TFileTab;
   T: TThread;
+  WasGate: Boolean;
 begin
   if (ATabIndex < 0) or (ATabIndex >= FTabs.Count) then
     Exit;
@@ -7021,8 +7173,18 @@ begin
   Tab.PendingKeepSel := False;
   Tab.LoadPath := '';
   T := Tab.LoadThread;
+  WasGate := Tab.StartupAccounted;
+  if WasGate then
+    Tab.StartupAccounted := False;
   Tab.LoadThread := nil;
   FTabs[ATabIndex] := Tab;
+  if (T <> nil) and (T is TDirLoadThread) and TDirLoadThread(T).StartupGate then
+  begin
+    TDirLoadThread(T).StartupGate := False;
+    WasGate := True;
+  end;
+  if WasGate then
+    NoteStartupRecycleFinished(not FDestroying);
   if T = nil then
     Exit;
   T.OnTerminate := nil;
@@ -7437,6 +7599,8 @@ begin
       Tab.Offline := False;
       Tab.LoadError := '';
       Tab.LoadPath := '';
+      if GStartupRecycleWatch and IsRecycleBinPath(Tab.Path) then
+        Tab.StartupPrimed := True;
       if (AIndex = FActiveTabIndex) and (FNameFilter <> '') then
       begin
         var KeepPaths := TStringList.Create;
@@ -7520,7 +7684,12 @@ begin
     Exit;
   Tab := FTabs[FActiveTabIndex];
   if not IsRemotePath(Tab.Path) then
+  begin
+    if (Tab.LoadError = L('op.noaccess')) and
+       (not Assigned(Tab.Entries) or (Tab.Entries.Count = 0)) then
+      AStatus := L('op.noaccess');
     Exit;
+  end;
   N := Tab.LoadSeen;
   if (N <= 0) and Assigned(Tab.Entries) then
     N := Tab.Entries.Count;
@@ -7963,6 +8132,11 @@ begin
     { Сверять с путём ПОТОКА, не Tab.Path: Navigate уже подменяет Path. }
     if SameDirHistoryPath(Tab.LoadPath, Path) then
     begin
+      if IsRecycleBinPath(Path) and GStartupRecycleWatch then
+      begin
+        AccountStartupRecycle(ATabIndex, Tab.LoadThread);
+        Exit;
+      end;
       if Remote then
       begin
         if ATabIndex = FActiveTabIndex then
@@ -8009,6 +8183,8 @@ begin
     Tab.LoadError := '';
     Tab.Offline := False;
     FTabs[ATabIndex] := Tab;
+    if IsRecycleBinPath(Path) then
+      AccountStartupRecycle(ATabIndex, nil);
     if Remote or IsRecycleBinPath(Path) then
       UpdateLoadChrome;
     Exit;
@@ -8142,7 +8318,13 @@ begin
             if IsRecycleBinPath(Path) then
               RefreshThumbs;
           end;
+          { nil не замінює список і не стартує сусіда, поки потік ще живий. }
           ContinueAfterLoad(TabIdx);
+          if IsRecycleBinPath(Path) and (TabIdx = FActiveTabIndex) and
+             Thr.Finished and not StartupRecycleHolds and
+             (TabIdx < FTabs.Count) and FTabs[TabIdx].Loaded and
+             not FTabs[TabIdx].Loading then
+            SignalListReady;
           Exit;
         end;
 
@@ -8278,10 +8460,36 @@ begin
       end
       else if not Remote then
       begin
-        Cur.LoadError := '';
-        FTabs[TabIdx] := Cur;
-        if UnopenedArchiveRoot(Cur, Path) then
-          RevertUnopenedArchive(TabIdx, Path, AError);
+        if AError = L('op.noaccess') then
+        begin
+          Cur.LoadError := L('op.noaccess');
+          Cur.Offline := False;
+          Cur.Partial := False;
+          Cur.Loaded := True;
+          if not Assigned(Cur.Entries) then
+            Cur.Entries := uFileModel.TFileEntryList.Create
+          else
+            Cur.Entries.Clear;
+          if Assigned(Cur.SelectedIndices) then
+            Cur.SelectedIndices.Clear;
+          if Assigned(Cur.Watcher) then
+            Cur.Watcher.Stop;
+          FTabs[TabIdx] := Cur;
+          if TabIdx = FActiveTabIndex then
+          begin
+            if Assigned(FSelectionManager) then
+              FSelectionManager.ResetState(0);
+            UpdateStatusText;
+            RebuildContent;
+          end;
+        end
+        else
+        begin
+          Cur.LoadError := '';
+          FTabs[TabIdx] := Cur;
+          if UnopenedArchiveRoot(Cur, Path) then
+            RevertUnopenedArchive(TabIdx, Path, AError);
+        end;
       end
       else
         FTabs[TabIdx] := Cur;
@@ -8351,6 +8559,8 @@ begin
   Tab.Offline := False;
   Tab.WaitShared := False;
   FTabs[ATabIndex] := Tab;
+  if IsRecycleBinPath(Path) then
+    AccountStartupRecycle(ATabIndex, Thr);
   Thr.Start;
 end;
 
@@ -10213,6 +10423,66 @@ begin
   EndInlineRename(False);
 end;
 
+procedure TFilePanel.ShowCursorContextMenu;
+var
+  Idx, RH, TS, Cols, Col, Row: Integer;
+  PB: TPaintBox;
+  SB: TVertScrollBox;
+  TileH, SlotW, PadX, X, Y: Single;
+  NameL, NameR, TypeL, TypeR, SizeL, SizeR, DateL, DateR: Single;
+begin
+  if FDestroying or (FSelectionManager = nil) or IsInlineRenaming or IsPathEditing then
+    Exit;
+  Idx := FSelectionManager.CurrentIndex;
+  if (Idx < 0) or (Idx >= VisualCount) then
+    Exit;
+  EnsureIndexVisible(Idx);
+  PB := CurrentPaintBox;
+  SB := CurrentScrollBox;
+  FMenuAnchorOn := False;
+  if (PB <> nil) and (SB <> nil) then
+  begin
+    if ViewMode = vmDetails then
+    begin
+      RH := RowHeight;
+      if RH > 0 then
+      begin
+        GetColumnBounds(SB.Width, NameL, NameR, TypeL, TypeR, SizeL, SizeR, DateL, DateR);
+        X := NameL;
+        Y := Idx * RH - SB.ViewportPosition.Y + RH - 2;
+        if Y < 4 then
+          Y := 4;
+        if Y > SB.Height - 4 then
+          Y := SB.Height - 4;
+        FMenuAnchor := SB.LocalToScreen(TPointF.Create(X, Y));
+        FMenuAnchorOn := True;
+      end;
+    end
+    else
+    begin
+      GetTileLayout(Max(1, SB.Width - SCROLLBAR_RESERVE), Cols, TS, TileH, SlotW, PadX);
+      if (Cols > 0) and (TileH > 0) then
+      begin
+        Col := Idx mod Cols;
+        Row := Idx div Cols;
+        X := Col * SlotW + PadX + 4;
+        Y := Row * TileH - SB.ViewportPosition.Y + TS + TILE_TEXT_ZONE - 2;
+        if Y < 4 then
+          Y := 4;
+        if Y > SB.Height - 4 then
+          Y := SB.Height - 4;
+        FMenuAnchor := SB.LocalToScreen(TPointF.Create(X, Y));
+        FMenuAnchorOn := True;
+      end;
+    end;
+  end;
+  try
+    OpenExplorerItemMenu(Idx);
+  finally
+    FMenuAnchorOn := False;
+  end;
+end;
+
 procedure TFilePanel.ShowShellMenuForIndex(AVisualIdx: Integer);
 {$IFDEF MSWINDOWS}
 var
@@ -10246,7 +10516,10 @@ begin
     SetLength(Files, 1);
     Files[0] := Entry.FullPath;
   end;
-  GetCursorPos(Pt);
+  if FMenuAnchorOn then
+    Pt := DpToPx(FMenuAnchor)
+  else
+    GetCursorPos(Pt);
   Wnd := 0;
   if Root is TCommonCustomForm then
     Wnd := FormToHWND(TCommonCustomForm(Root));
@@ -10570,7 +10843,10 @@ begin
   if Added = 0 then
     Exit;
   FNetHistMenu.ApplyTheme(FColors);
-  FNetHistMenu.PopupAtCursor;
+  if FMenuAnchorOn then
+    FNetHistMenu.PopupAtScreen(FMenuAnchor)
+  else
+    FNetHistMenu.PopupAtCursor;
 end;
 
 function TFilePanel.OpenBareRouter(const AEntry: TFileEntry): Boolean;
@@ -10615,91 +10891,41 @@ function TFilePanel.AskMapLetter(out ALetter: string; out ARestore: Boolean): Bo
 var
   Mask: DWORD;
   C: Char;
-  Frm: TForm;
-  Lbl: TLabel;
-  Combo: TComboBox;
-  Check: TCheckBox;
-  OkBtn, CancelBtn: TButton;
+  Letters: TArray<string>;
+  N: Integer;
+  OwnerForm: TCommonCustomForm;
+  Node: TFmxObject;
 begin
   ALetter := '';
   ARestore := True;
   Result := False;
   Mask := GetLogicalDrives;
-  Frm := nil;
-  Combo := nil;
-  Check := nil;
-  { Пароля в діалозі немає: чужу шару питає системне вікно. }
+  SetLength(Letters, 0);
   for C := 'A' to 'Z' do
     if (Mask and (1 shl (Ord(C) - Ord('A')))) = 0 then
     begin
-      if Combo = nil then
-      begin
-        Frm := TForm.CreateNew(nil);
-        Frm.Caption := L('panel.net.map');
-        Frm.BorderStyle := TFmxFormBorderStyle.Single;
-        Frm.Position := TFormPosition.MainFormCenter;
-        Frm.Width := 360;
-        Frm.Height := 230;
-        Frm.Fill.Kind := TBrushKind.Solid;
-        Frm.Fill.Color := FColors.CardBackground;
-        Lbl := TLabel.Create(Frm);
-        Lbl.Parent := Frm;
-        Lbl.Position.X := 16;
-        Lbl.Position.Y := 16;
-        Lbl.Width := 320;
-        Lbl.Text := L('panel.net.map.letter');
-        Lbl.StyledSettings := Lbl.StyledSettings - [TStyledSetting.FontColor];
-        Lbl.TextSettings.FontColor := FColors.TextColor;
-        Combo := TComboBox.Create(Frm);
-        Combo.Parent := Frm;
-        Combo.Position.X := 16;
-        Combo.Position.Y := 44;
-        Combo.Width := 320;
-        Check := TCheckBox.Create(Frm);
-        Check.Parent := Frm;
-        Check.Position.X := 16;
-        Check.Position.Y := 92;
-        Check.Width := 320;
-        Check.Text := L('panel.net.map.restore');
-        Check.IsChecked := True;
-        Check.StyledSettings := Check.StyledSettings - [TStyledSetting.FontColor];
-        Check.TextSettings.FontColor := FColors.TextColor;
-        OkBtn := TButton.Create(Frm);
-        OkBtn.Parent := Frm;
-        OkBtn.Position.X := 16;
-        OkBtn.Position.Y := 148;
-        OkBtn.Width := 150;
-        OkBtn.Height := 36;
-        OkBtn.Text := L('panel.net.map.ok');
-        OkBtn.ModalResult := mrOk;
-        CancelBtn := TButton.Create(Frm);
-        CancelBtn.Parent := Frm;
-        CancelBtn.Position.X := 186;
-        CancelBtn.Position.Y := 148;
-        CancelBtn.Width := 150;
-        CancelBtn.Height := 36;
-        CancelBtn.Text := L('panel.net.map.cancel');
-        CancelBtn.ModalResult := mrCancel;
-      end;
-      Combo.Items.Add(string(C) + ':');
+      N := Length(Letters);
+      SetLength(Letters, N + 1);
+      Letters[N] := string(C) + ':';
     end;
-  if Combo = nil then
+  if Length(Letters) = 0 then
   begin
     ShowNotice(L('panel.net.map.none'));
     Exit;
   end;
-  try
-    Combo.ItemIndex := 0;
-    if Frm.ShowModal <> mrOk then
-      Exit;
-    if (Combo.ItemIndex < 0) or (Combo.ItemIndex >= Combo.Items.Count) then
-      Exit;
-    ALetter := Combo.Items[Combo.ItemIndex];
-    ARestore := Check.IsChecked;
-    Result := ALetter <> '';
-  finally
-    Frm.Free;
+  OwnerForm := nil;
+  Node := Self;
+  while Node <> nil do
+  begin
+    if Node is TCommonCustomForm then
+    begin
+      OwnerForm := TCommonCustomForm(Node);
+      Break;
+    end;
+    Node := Node.Parent;
   end;
+  { Пароля немає: чужу шару питає системне вікно після Ok. }
+  Result := ShowMapDriveDialog(OwnerForm, FNetActUnc, Letters, ALetter, ARestore);
 end;
 
 procedure TFilePanel.StartNetJob(AKind: Integer);
@@ -12474,11 +12700,19 @@ begin
       UpdateStatusText;
       RebuildContent;
     end;
-    { Сортировка по имени уводит переименованный файл из кадра. }
+    { Сортування за іменем виводить перейменований файл з кадру. }
     if AInfo.Kind = lokRename then
       KeepFocusVisible;
     InvalidateView;
-    if Assigned(FThumbTimer) and not FDestroying then
+    { Своя копія лишає той самий діапазон і розмір плитки, тож ключ збігається
+      і новий шлях не замовляється. Порожній ключ і RefreshThumbs беруть
+      видимі плитки одразу, без ресайзу і скролу. }
+    if (ViewMode = vmTiles) and not FDestroying then
+    begin
+      FThumbKey := '';
+      RefreshThumbs;
+    end
+    else if Assigned(FThumbTimer) and not FDestroying then
       FThumbTimer.Enabled := True;
   end;
 end;
@@ -12616,6 +12850,8 @@ begin
     Allowed := False;
   if not Allowed or not ThumbOrderRange(StartIdx, EndIdx) then
   begin
+    if not Allowed then
+      FForceThumbOrder := False;
     if FThumbKey <> cThumbKeyIdle then
     begin
       FThumbKey := cThumbKeyIdle;
@@ -12626,8 +12862,9 @@ begin
 
   Key := GetCurrentPathImpl + #1 + IntToStr(StartIdx) + #1 + IntToStr(EndIdx) + #1 +
     IntToStr(TileSize);
-  if Key = FThumbKey then
+  if (Key = FThumbKey) and not FForceThumbOrder then
     Exit;
+  FForceThumbOrder := False;
 
   Paths := TList<string>.Create;
   Hints := TList<string>.Create;
@@ -13788,6 +14025,133 @@ begin
   FDeferDirLoad := False;
 end;
 
+procedure TFilePanel.SignalListReady;
+begin
+  if Assigned(FOnListReady) and not FListReadyFired then
+  begin
+    FListReadyFired := True;
+    FOnListReady(Self);
+  end;
+end;
+
+function TFilePanel.AllowStartupListReady(const APath: string; ACount: Integer;
+  AActive: Boolean): Boolean;
+begin
+  Result := True;
+  if not AActive then
+    Exit;
+  if not GStartupRecycleWatch then
+    Exit;
+  if (GStartupRecycleAlive <= 0) and (GStartupRecycleArming <= 0) then
+    Exit;
+  if IsRecycleBinPath(APath) or IsRemotePath(APath) then
+    Exit;
+  if ACount > 0 then
+    Exit;
+  FStartupEmptyRetry := True;
+  Result := False;
+end;
+
+procedure TFilePanel.TrackStartupRecycle(AThr: TThread);
+var
+  Thr: TDirLoadThread;
+begin
+  if not GStartupRecycleWatch or (AThr = nil) or not (AThr is TDirLoadThread) then
+    Exit;
+  if AThr.Finished then
+    Exit;
+  Thr := TDirLoadThread(AThr);
+  if Thr.StartupGate then
+    Exit;
+  Thr.StartupGate := True;
+  Thr.OnTerminate := StartupRecycleThreadDone;
+end;
+
+procedure TFilePanel.AccountStartupRecycle(AIndex: Integer; AThr: TThread);
+var
+  Tab: TFileTab;
+begin
+  if not GStartupRecycleWatch then
+    Exit;
+  if (AIndex < 0) or (AIndex >= FTabs.Count) then
+    Exit;
+  if not IsRecycleBinPath(FTabs[AIndex].Path) then
+    Exit;
+  if (AThr <> nil) and AThr.Finished then
+    Exit;
+  Tab := FTabs[AIndex];
+  if not Tab.StartupAccounted then
+  begin
+    Tab.StartupAccounted := True;
+    FTabs[AIndex] := Tab;
+    Inc(GStartupRecycleAlive);
+  end;
+  TrackStartupRecycle(AThr);
+end;
+
+procedure TFilePanel.StartupRecycleThreadDone(Sender: TObject);
+var
+  Thr: TDirLoadThread;
+begin
+  if not (Sender is TDirLoadThread) then
+    Exit;
+  Thr := TDirLoadThread(Sender);
+  if not Thr.StartupGate then
+    Exit;
+  Thr.StartupGate := False;
+  if not FDestroying and (FTabs <> nil) then
+    for var I := 0 to FTabs.Count - 1 do
+    begin
+      if not FTabs[I].StartupAccounted or FTabs[I].LoadQueued or
+         (FTabs[I].LoadThread <> nil) or FTabs[I].Loading then
+        Continue;
+      var DoneTab := FTabs[I];
+      DoneTab.StartupAccounted := False;
+      FTabs[I] := DoneTab;
+    end;
+  NoteStartupRecycleFinished(not FDestroying);
+end;
+
+function TFilePanel.HasRecycleTab: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if FTabs = nil then
+    Exit;
+  for I := 0 to FTabs.Count - 1 do
+    if IsRecycleBinPath(FTabs[I].Path) then
+      Exit(True);
+end;
+
+procedure TFilePanel.BeginStartupRecycleLoads;
+var
+  I: Integer;
+  Tab: TFileTab;
+begin
+  if FDestroying or (FTabs = nil) then
+    Exit;
+  for I := 0 to FTabs.Count - 1 do
+  begin
+    if not IsRecycleBinPath(FTabs[I].Path) then
+      Continue;
+    Tab := FTabs[I];
+    if Tab.Loaded and not Tab.Stale and not Tab.Loading and (Tab.LoadThread = nil) then
+    begin
+      Tab.StartupPrimed := True;
+      FTabs[I] := Tab;
+      Continue;
+    end;
+    StartDirLoadAt(I, Tab.Path, '', False);
+  end;
+end;
+
+function TFilePanel.TakeStartupEmptyRetry: Boolean;
+begin
+  Result := FStartupEmptyRetry;
+  FStartupEmptyRetry := False;
+end;
+
 procedure TFilePanel.LoadActiveTab;
 var
   Tab: TFileTab;
@@ -13795,14 +14159,20 @@ begin
   FDeferDirLoad := False;
   if (FActiveTabIndex < 0) or (FActiveTabIndex >= FTabs.Count) then
   begin
-    if Assigned(FOnListReady) and not FListReadyFired then
-    begin
-      FListReadyFired := True;
-      FOnListReady(Self);
-    end;
+    SignalListReady;
     Exit;
   end;
   Tab := FTabs[FActiveTabIndex];
+  { Корзина вже зібрана з chunk. Повторний Refresh знову зайняв би shell. }
+  if IsRecycleBinPath(Tab.Path) and Tab.Loaded and not Tab.Loading and
+     (Tab.LoadThread = nil) then
+  begin
+    Tab.StartupPrimed := False;
+    Tab.Stale := False;
+    FTabs[FActiveTabIndex] := Tab;
+    SignalListReady;
+    Exit;
+  end;
   Tab.Stale := False;
   FTabs[FActiveTabIndex] := Tab;
   UpdatePathLabel;
@@ -14388,11 +14758,14 @@ begin
   if Assigned(Tab.Entries) and (Tab.Entries <> List) and
      (Tab.Entries.Count > 0) and FileListsEquivalent(Tab.Entries, List) then
   begin
+    var ReadyCount := List.Count;
     List.Free;
     Tab.Loaded := True;
     Tab.Stale := False;
     FTabs[TargetIdx] := Tab;
-    if (TargetIdx = FActiveTabIndex) and Assigned(FOnListReady) and not FListReadyFired then
+    if (TargetIdx = FActiveTabIndex) and
+       AllowStartupListReady(APath, ReadyCount, True) and
+       Assigned(FOnListReady) and not FListReadyFired then
     begin
       FListReadyFired := True;
       FOnListReady(Self);
@@ -14463,7 +14836,8 @@ begin
       FThumbKey := '';
       RefreshThumbs;
     end;
-    if Assigned(FOnListReady) and not FListReadyFired then
+    if AllowStartupListReady(APath, List.Count, True) and
+       Assigned(FOnListReady) and not FListReadyFired then
     begin
       FListReadyFired := True;
       FOnListReady(Self);

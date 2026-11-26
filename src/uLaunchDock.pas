@@ -312,8 +312,7 @@ end;
 
 function DockIconsDir: string;
 begin
-  Result := System.IOUtils.TPath.Combine(System.IOUtils.TPath.GetHomePath, 'VibeCmd');
-  Result := System.IOUtils.TPath.Combine(Result, 'DockIcons');
+  Result := System.IOUtils.TPath.Combine(VibeDataDir, 'DockIcons');
 end;
 
 function DockCacheName(const APath: string): string;

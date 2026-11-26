@@ -58,9 +58,19 @@ function ListArchiveBranch(const APath: string): TArray<TArcItem>;
 function ListArchiveAll(const APath: string; out AItems: TArray<TArcItem>): Boolean;
 function ScanArchivePath(const APath: string; out AFiles: Integer; out ABytes: Int64): Boolean;
 
-procedure CopyArchiveEntry(const ASrcPath, ADstDir: string);
+{ Порожній рядок — не розпакування на диск: пропуск, приймач-архів або звичайна копія. }
+function CopyArchiveEntry(const ASrcPath, ADstDir: string): string;
+{ Один файл з архіву в уже обраний шлях на диску. Вікно конфлікту не відкриває. }
+function ExtractArchiveItemToFile(const ASrcPath, ADestFile: string): Boolean;
+{ Тихий режим уже обрав повний шлях усередині архіву. Друге вікно не відкриває. }
+procedure WriteChosenArchivePath(const ASource, ADestFile: string);
 procedure DeleteArchiveEntry(const APath: string);
-procedure DeleteArchiveEntries(const APaths: TArray<string>);
+{ AOnDeleted — шляхи однієї вже записаної пачки. nil, якщо звіт не потрібен. }
+procedure DeleteArchiveEntries(const APaths: TArray<string>;
+  const AOnDeleted: TProc<TArray<string>>);
+{ Усі імена одного архіву пишуться однією пересборкою. Порожній шлях — це ім'я не змінене. }
+procedure RenameArchiveEntries(const AOldPaths, ANewNames: TArray<string>;
+  out ANewPaths: TArray<string>);
 procedure RenameArchiveEntry(const AOldPath, ANewName: string; out ANewPath: string);
 function CreateArchiveFolder(const AParentDir, ABaseName: string): string;
 procedure PackToArchive(const ASources: TArray<string>; const ADestFile: string;
@@ -95,6 +105,13 @@ type
     Kind: TArchiveKind;
     Inner: string;
     DiskArchive: string;
+  end;
+
+  { FileName — архів, у якому лежить ChildEntry. Перший крок — файл на диску. }
+  TDelHop = record
+    FileName: string;
+    Kind: TArchiveKind;
+    ChildEntry: string;
   end;
 
   TCacheEnt = class
@@ -2179,7 +2196,7 @@ begin
   end;
 end;
 
-procedure ExtractPrefixToDisk(const ARef: TArcRef; const ADestDir: string);
+function ExtractPrefixToDisk(const ARef: TArcRef; const ADestDir: string): string;
 var
   Items: TArray<TArcItem>;
   It: TArcItem;
@@ -2187,6 +2204,8 @@ var
   OnlyFile: Boolean;
   I: Integer;
 begin
+  { Для файла — куди лягло після конфлікту. Для папки шлях збирає викликач. }
+  Result := '';
   ForceDirectories(ADestDir);
   Items := GetItems(ARef.Physical, ARef.Kind);
   Prefix := ArcNorm(ARef.Inner);
@@ -2211,7 +2230,11 @@ begin
           Rel := DecideOutFile(ARef.DiskArchive + '\' + Prefix,
             TPath.Combine(ADestDir, ArcLeaf(Prefix)), It.Size, It.Modified);
           if Rel <> '' then
+          begin
             TFile.Copy(OutFile, Rel, True);
+            if TFile.Exists(Rel) and not TDirectory.Exists(Rel) then
+              Result := Rel;
+          end;
         end;
       end
       else
@@ -2224,9 +2247,15 @@ begin
             OutDir := Tmp;
         end;
         if TDirectory.Exists(OutDir) then
-          CopyDirRecursive(OutDir, ADestDir)
+        begin
+          CopyDirRecursive(OutDir, ADestDir);
+          Result := ExcludeTrailingPathDelimiter(ADestDir);
+        end
         else if TFile.Exists(OutDir) then
+        begin
           TFile.Copy(OutDir, TPath.Combine(ADestDir, ExtractFileName(OutDir)), True);
+          Result := ExcludeTrailingPathDelimiter(ADestDir);
+        end;
       end;
     finally
       try
@@ -2254,6 +2283,8 @@ begin
     if It.IsDir then
     begin
       ForceDirectories(ArcToDiskPath(ADestDir, Rel));
+      if not OnlyFile then
+        Result := ExcludeTrailingPathDelimiter(ADestDir);
       Continue;
     end;
     OutFile := ArcToDiskPath(ADestDir, Rel);
@@ -2266,6 +2297,13 @@ begin
         TFile.SetLastWriteTime(OutFile, It.Modified);
     except
     end;
+    if OnlyFile then
+    begin
+      if TFile.Exists(OutFile) and not TDirectory.Exists(OutFile) then
+        Result := OutFile;
+    end
+    else if TFile.Exists(OutFile) or TDirectory.Exists(OutFile) then
+      Result := ExcludeTrailingPathDelimiter(ADestDir);
   end;
 end;
 
@@ -2333,18 +2371,54 @@ begin
   end;
 end;
 
-procedure RebuildZip(const AZip: string; const ADrop: array of string;
-  ARenameFrom, ARenameTo: string);
+procedure RebuildZipCore(const AZip: string; const ADrop: array of string;
+  const AFrom, ATo: TArray<string>);
 var
   Src, Dst: TZipFile;
-  Tmp, Name, Have, NewName, Rest, OldP, NewP: string;
+  Tmp, Name, Have, NewName: string;
   I: Integer;
   Stm: TStream;
   Hdr: TZipHeader;
+
+  function RenamedInner(const AHave: string): string;
+  var
+    J, Best, Len, N: Integer;
+    OldP, NewP, Rest: string;
+    Exact: Boolean;
+  begin
+    Result := AHave;
+    Best := -1;
+    N := Length(AFrom);
+    if Length(ATo) < N then
+      N := Length(ATo);
+    for J := 0 to N - 1 do
+    begin
+      OldP := ArcNorm(AFrom[J]);
+      NewP := ArcNorm(ATo[J]);
+      if (OldP = '') or (NewP = '') then
+        Continue;
+      Exact := SameText(AHave, OldP);
+      if Exact then
+        Len := Length(OldP) + 1
+      else if StartsText(OldP + '/', AHave) then
+        Len := Length(OldP)
+      else
+        Continue;
+      if Len <= Best then
+        Continue;
+      Best := Len;
+      if Exact then
+        Result := NewP
+      else
+      begin
+        Rest := Copy(AHave, Length(OldP) + 2, MaxInt);
+        Result := NewP + '/' + Rest;
+      end;
+    end;
+  end;
+
 begin
   Tmp := UniqueTempFile(ExtractFileName(AZip));
-  OldP := ArcNorm(ARenameFrom);
-  NewP := ArcNorm(ARenameTo);
   Src := nil;
   Dst := nil;
   BeginArchiveAccess(AZip);
@@ -2358,18 +2432,7 @@ begin
       Have := ArcNorm(Name);
       if ZipNameRemoved(Have, ADrop) then
         Continue;
-      NewName := Have;
-      if (OldP <> '') and (NewP <> '') then
-      begin
-        if SameText(Have, OldP) then
-          NewName := NewP
-        else if StartsText(OldP + '/', Have) then
-        begin
-          Rest := Copy(Have, Length(OldP) + 2, MaxInt);
-          NewName := NewP + '/' + Rest;
-        end;
-      end;
-      NewName := ArcSafeRel(NewName);
+      NewName := ArcSafeRel(RenamedInner(Have));
       if EndsText('/', ArcRaw(Name)) or
          (TFileAttribute.faDirectory in Src.FileInfo[I].FileAttributes) then
       begin
@@ -2394,6 +2457,21 @@ begin
     InvalidateArchive(AZip);
     DeleteFileSilent(Tmp);
   end;
+end;
+
+procedure RebuildZip(const AZip: string; const ADrop: array of string;
+  ARenameFrom, ARenameTo: string);
+var
+  FromA, ToA: TArray<string>;
+begin
+  if (ARenameFrom <> '') and (ARenameTo <> '') then
+  begin
+    SetLength(FromA, 1);
+    SetLength(ToA, 1);
+    FromA[0] := ARenameFrom;
+    ToA[0] := ARenameTo;
+  end;
+  RebuildZipCore(AZip, ADrop, FromA, ToA);
 end;
 
 procedure ZipDeleteInnerOpen(Zip: TZipFile; const AInner: string);
@@ -2455,7 +2533,7 @@ begin
 end;
 
 function InnerConflictName(const AItems: TArray<TArcItem>; const ASrcHint, ADestInner: string;
-  ASrcSize: Int64; ASrcTime: TDateTime): string; forward;
+  ASrcSize: Int64; ASrcTime: TDateTime; const AAskPath: string): string; forward;
 
 procedure CopyZipEntries(Src, Dst: TZipFile);
 var
@@ -2486,9 +2564,9 @@ begin
 end;
 
 procedure AddDiskSourcesToZip(Zip: TZipFile; const ASources: TArray<string>;
-  const AItems: TArray<TArcItem>; ACheckConflict: Boolean);
+  const AItems: TArray<TArcItem>; ACheckConflict: Boolean; const AAskDir: string);
 var
-  Src, Root, Use: string;
+  Src, Root, Use, Ask: string;
   Sz: Int64;
   Mt: TDateTime;
 begin
@@ -2501,7 +2579,10 @@ begin
       Use := Root;
       if ACheckConflict then
       begin
-        Use := InnerConflictName(AItems, Src, Root, 0, 0);
+        Ask := '';
+        if AAskDir <> '' then
+          Ask := TPath.Combine(ExcludeTrailingPathDelimiter(AAskDir), Root);
+        Use := InnerConflictName(AItems, Src, Root, 0, 0, Ask);
         if Use = '' then
           Continue;
         ZipDeleteInnerOpen(Zip, Use);
@@ -2525,7 +2606,10 @@ begin
           Mt := TFile.GetLastWriteTime(Src);
         except
         end;
-        Use := InnerConflictName(AItems, Src, Root, Sz, Mt);
+        Ask := '';
+        if AAskDir <> '' then
+          Ask := TPath.Combine(ExcludeTrailingPathDelimiter(AAskDir), Root);
+        Use := InnerConflictName(AItems, Src, Root, Sz, Mt, Ask);
         if Use = '' then
           Continue;
         ZipDeleteInnerOpen(Zip, Use);
@@ -2536,19 +2620,21 @@ begin
 end;
 
 function InnerConflictName(const AItems: TArray<TArcItem>; const ASrcHint, ADestInner: string;
-  ASrcSize: Int64; ASrcTime: TDateTime): string;
+  ASrcSize: Int64; ASrcTime: TDateTime; const AAskPath: string): string;
 var
   It: TArcItem;
   Choice: TArcConflict;
-  Dummy: string;
+  Ask: string;
 begin
   Result := ADestInner;
   if not FindItem(AItems, ADestInner, It) then
     Exit;
   if not Assigned(GConf) then
     Exit;
-  Dummy := ADestInner;
-  Choice := GConf(ASrcHint, ADestInner, ASrcSize, It.Size, ASrcTime, It.Modified);
+  Ask := ADestInner;
+  if AAskPath <> '' then
+    Ask := AAskPath;
+  Choice := GConf(ASrcHint, Ask, ASrcSize, It.Size, ASrcTime, It.Modified);
   case Choice of
     acSkip:
       Result := '';
@@ -2559,10 +2645,10 @@ begin
   end;
 end;
 
-procedure AddPathToZip(const ASource, AZip, ADestInner: string);
+procedure AddPathToZip(const ASource, AZip, ADestInner, AAskDir: string);
 var
   Zip: TZipFile;
-  Name, Prefix, Use: string;
+  Name, Prefix, Use, Ask: string;
   Items: TArray<TArcItem>;
   Sz: Int64;
   Mt: TDateTime;
@@ -2580,7 +2666,10 @@ begin
     end;
   except
   end;
-  Use := InnerConflictName(Items, ASource, Prefix, Sz, Mt);
+  Ask := '';
+  if AAskDir <> '' then
+    Ask := TPath.Combine(ExcludeTrailingPathDelimiter(AAskDir), Name);
+  Use := InnerConflictName(Items, ASource, Prefix, Sz, Mt, Ask);
   if Use = '' then
     Exit;
   Zip := nil;
@@ -2760,18 +2849,38 @@ begin
     raise Exception.Create(L('arch.addfail') + sLineBreak + Trim(Text));
 end;
 
-procedure SevenDelete(const AArchive, AInner: string);
+procedure SevenDeleteMany(const AArchive: string; const AInners: TArray<string>);
 var
-  Text: string;
-  Code: Integer;
-  Inner: string;
+  Base, Args, One, Text: string;
+  Code, I: Integer;
+
+  procedure RunArgs;
+  begin
+    if Args = Base then
+      Exit;
+    Code := Run7z(Args, Text);
+    InvalidateArchive(AArchive);
+    if Code <> 0 then
+      raise Exception.Create(L('arch.delfail') + sLineBreak + Trim(Text));
+    Args := Base;
+  end;
+
 begin
+  if Length(AInners) = 0 then
+    Exit;
   Ensure7z(DetectArchiveKind(AArchive));
-  Inner := StringReplace(ArcNorm(AInner), '/', '\', [rfReplaceAll]);
-  Code := Run7z('d -y -sccUTF-8 -- ' + QuoteArg(AArchive) + ' ' + QuoteArg(Inner), Text);
-  InvalidateArchive(AArchive);
-  if Code <> 0 then
-    raise Exception.Create(L('arch.delfail') + sLineBreak + Trim(Text));
+  Base := 'd -y -sccUTF-8 -- ' + QuoteArg(AArchive);
+  Args := Base;
+  for I := 0 to High(AInners) do
+  begin
+    One := StringReplace(ArcNorm(AInners[I]), '/', '\', [rfReplaceAll]);
+    if One = '' then
+      Continue;
+    if Length(Args) + Length(One) + 3 > 24000 then
+      RunArgs;
+    Args := Args + ' ' + QuoteArg(One);
+  end;
+  RunArgs;
 end;
 
 procedure WriteTarHeader(ADst: TStream; const AName: string; ASize: Int64;
@@ -2985,7 +3094,7 @@ begin
         SetLength(Items, 0);
         Zip := OpenZip(Tmp, True, True);
       end;
-      AddDiskSourcesToZip(Zip, ASources, Items, Keep);
+      AddDiskSourcesToZip(Zip, ASources, Items, Keep, ADestFile);
       FreeAndNil(Zip);
       ReplaceFileAtomic(ADestFile, Tmp);
       InvalidateArchive(ADestFile);
@@ -3099,7 +3208,7 @@ begin
   if not IsWritableArchiveKind(Kind) then
     raise Exception.Create(L('arch.nowrite'));
   if Kind = akZip then
-    AddPathToZip(ASource, Ref.Physical, Ref.Inner)
+    AddPathToZip(ASource, Ref.Physical, Ref.Inner, ADestArchiveDir)
   else if Need7z(Kind) then
     SevenAdd(Ref.Physical, ASource, Ref.Inner)
   else
@@ -3109,79 +3218,523 @@ begin
   end;
 end;
 
-procedure DeleteArchiveEntry(const APath: string);
+procedure WriteChosenArchivePath(const ASource, ADestFile: string);
+var
+  Parent, LeafSrc, LeafDst, Stage, Staged: string;
+  IsDir: Boolean;
 begin
-  DeleteArchiveEntries([APath]);
+  Parent := ExtractFilePath(ADestFile);
+  if (ASource = '') or (ADestFile = '') or (Parent = '') then
+    raise Exception.Create(Lf('arch.destnot', [ADestFile]));
+  Parent := ExcludeTrailingPathDelimiter(Parent);
+  LeafDst := ExtractFileName(ADestFile);
+  LeafSrc := ExtractFileName(ExcludeTrailingPathDelimiter(ASource));
+  if SameText(LeafDst, LeafSrc) then
+  begin
+    AddPathToArchive(ASource, Parent);
+    Exit;
+  end;
+  IsDir := TDirectory.Exists(ASource) and not TFile.Exists(ASource);
+  if not IsDir and not TFile.Exists(ASource) then
+    raise Exception.Create(Lf('arch.nofile', [ASource]));
+  Stage := UniqueTempDir;
+  try
+    Staged := TPath.Combine(Stage, LeafDst);
+    if IsDir then
+      CopyDirRecursive(ASource, Staged)
+    else
+      TFile.Copy(ASource, Staged, True);
+    AddPathToArchive(Staged, Parent);
+  finally
+    try
+      TDirectory.Delete(Stage, True);
+    except
+    end;
+  end;
 end;
 
-procedure DeleteArchiveEntries(const APaths: TArray<string>);
+procedure PutArchiveBytes(const AArchive, AInner, AFile: string; AKind: TArchiveKind);
 var
-  ByArc: TObjectDictionary<string, TStringList>;
-  Ref: TArcRef;
-  P, Key: string;
-  List: TStringList;
-  Drop: TArray<string>;
-  I: Integer;
-  Pair: TPair<string, TStringList>;
-  Kind: TArchiveKind;
+  Zip: TZipFile;
+  Rel, Safe, Work, Dest, Text: string;
+  Code: Integer;
 begin
-  ByArc := TObjectDictionary<string, TStringList>.Create([doOwnsValues]);
+  if AKind = akRar then
+    raise Exception.Create(L('arch.raronly'));
+  if AKind = akZip then
+  begin
+    Rel := ArcSafeRel(AInner);
+    if Rel = '' then
+      Exit;
+    Safe := UniqueTempFile(ArcLeaf(Rel));
+    TFile.Copy(AFile, Safe, True);
+    Zip := nil;
+    BeginArchiveAccess(AArchive);
+    try
+      Zip := OpenZip(AArchive, True, False);
+      Zip.UTF8Support := True;
+      ZipDeleteInnerOpen(Zip, Rel);
+      Zip.Add(Safe, Rel);
+    finally
+      Zip.Free;
+      EndArchiveAccess(AArchive);
+      InvalidateArchive(AArchive);
+      DeleteFileSilent(Safe);
+    end;
+    Exit;
+  end;
+  if Need7z(AKind) then
+  begin
+    Ensure7z(AKind);
+    Rel := StringReplace(ArcNorm(AInner), '/', '\', [rfReplaceAll]);
+    if Rel = '' then
+      Exit;
+    Work := UniqueTempDir;
+    try
+      Dest := TPath.Combine(Work, Rel);
+      ForceDirectories(ExtractFilePath(Dest));
+      TFile.Copy(AFile, Dest, True);
+      Code := Run7z('u -y -sccUTF-8 -w' + QuoteArg(Work) + ' -- ' +
+        QuoteArg(AArchive) + ' ' + QuoteArg(Rel), Text);
+    finally
+      try
+        TDirectory.Delete(Work, True);
+      except
+      end;
+    end;
+    InvalidateArchive(AArchive);
+    if Code <> 0 then
+      raise Exception.Create(L('arch.addfail') + sLineBreak + Trim(Text));
+    Exit;
+  end;
+  raise Exception.Create(Lf('arch.delvia', [ArchiveKindCaption(AKind)]));
+end;
+
+{ Не заходимо в архів, якщо видаляємо саме його. Інакше Inner стає порожнім
+  і запис у батьківському архіві лишається. }
+function ResolveDeleteTarget(const APath: string; out AHops: TArray<TDelHop>): Boolean;
+var
+  Disk, Rest, Acc, After, Seg, TryPath, Physical: string;
+  Items: TArray<TArcItem>;
+  It: TArcItem;
+  Slash: Integer;
+  Kind: TArchiveKind;
+  FoundArc: Boolean;
+
+  procedure Push(const AFile, AEntry: string; AEntryKind: TArchiveKind);
+  var
+    N: Integer;
+  begin
+    if AEntry = '' then
+      Exit;
+    N := Length(AHops);
+    SetLength(AHops, N + 1);
+    AHops[N].FileName := AFile;
+    AHops[N].Kind := AEntryKind;
+    AHops[N].ChildEntry := AEntry;
+  end;
+
+begin
+  Result := False;
+  SetLength(AHops, 0);
+  if not SplitArchivePath(APath, Disk, Rest) then
+    Exit;
+  Kind := DetectArchiveKind(Disk);
+  if Kind = akNone then
+    Exit;
+  Physical := Disk;
+  Rest := ArcNorm(Rest);
+  if Rest = '' then
+    Exit;
+  while True do
+  begin
+    Items := GetItems(Physical, Kind);
+    Acc := '';
+    After := Rest;
+    FoundArc := False;
+    while After <> '' do
+    begin
+      Slash := Pos('/', After);
+      if Slash > 0 then
+      begin
+        Seg := Copy(After, 1, Slash - 1);
+        After := Copy(After, Slash + 1, MaxInt);
+      end
+      else
+      begin
+        Seg := After;
+        After := '';
+      end;
+      if Seg = '' then
+        Continue;
+      if Acc = '' then
+        TryPath := Seg
+      else
+        TryPath := Acc + '/' + Seg;
+      if FindItem(Items, TryPath, It) and ItemIsArchiveFile(It) then
+      begin
+        Push(Physical, TryPath, Kind);
+        FoundArc := True;
+        if After = '' then
+          Exit(True);
+        Physical := MaterializeInnerArchive(Physical, Kind, TryPath);
+        Kind := DetectArchiveKind(Physical);
+        if Kind = akNone then
+          Kind := DetectArchiveKind(TryPath);
+        Rest := After;
+        Break;
+      end;
+      Acc := TryPath;
+    end;
+    if not FoundArc then
+    begin
+      Push(Physical, Rest, Kind);
+      Exit(True);
+    end;
+    if Rest = '' then
+      Exit(True);
+  end;
+end;
+
+function HopGroupKey(const AHops: TArray<TDelHop>): string;
+var
+  I: Integer;
+  B: TStringBuilder;
+begin
+  Result := '';
+  if Length(AHops) = 0 then
+    Exit;
+  B := TStringBuilder.Create;
+  try
+    if Length(AHops) = 1 then
+      B.Append('1|')
+    else
+      B.Append('2|');
+    B.Append(CacheKey(AHops[0].FileName));
+    B.Append('|');
+    B.Append(Ord(AHops[0].Kind));
+    for I := 0 to High(AHops) - 1 do
+    begin
+      B.Append('>');
+      B.Append(LowerCase(ArcNorm(AHops[I].ChildEntry)));
+    end;
+    if Length(AHops) > 1 then
+    begin
+      B.Append('|');
+      B.Append(Ord(AHops[High(AHops)].Kind));
+    end;
+    Result := B.ToString;
+  finally
+    B.Free;
+  end;
+end;
+
+procedure DropInners(const AFile: string; AKind: TArchiveKind;
+  const AInners: TArray<string>);
+begin
+  if Length(AInners) = 0 then
+    Exit;
+  if AKind = akRar then
+    raise Exception.Create(L('arch.raronly'));
+  if AKind = akZip then
+    RebuildZip(AFile, AInners, '', '')
+  else if Need7z(AKind) then
+    SevenDeleteMany(AFile, AInners)
+  else
+    raise Exception.Create(Lf('arch.delvia', [ArchiveKindCaption(AKind)]));
+end;
+
+procedure WriteHopChain(const AHops: TArray<TDelHop>);
+var
+  I: Integer;
+begin
+  for I := High(AHops) - 1 downto 0 do
+    PutArchiveBytes(AHops[I].FileName, AHops[I].ChildEntry,
+      AHops[I + 1].FileName, AHops[I].Kind);
+end;
+
+procedure DeleteArchiveEntry(const APath: string);
+begin
+  DeleteArchiveEntries([APath], nil);
+end;
+
+procedure DeleteArchiveEntries(const APaths: TArray<string>;
+  const AOnDeleted: TProc<TArray<string>>);
+var
+  Flat, Deep: TObjectDictionary<string, TStringList>;
+  Hops: TArray<TDelHop>;
+  P, Key, Err: string;
+  List: TStringList;
+  I: Integer;
+
+  procedure CommitGroup(AList: TStringList);
+  var
+    UseHops: TArray<TDelHop>;
+    Drops, DonePaths: TArray<string>;
+    N, J, HopI: Integer;
+    Disk: string;
+  begin
+    ArcCheckWait;
+    N := 0;
+    Disk := '';
+    SetLength(Drops, AList.Count);
+    SetLength(DonePaths, AList.Count);
+    SetLength(UseHops, 0);
+    for J := 0 to AList.Count - 1 do
+    begin
+      if not ResolveDeleteTarget(AList[J], Hops) or (Length(Hops) = 0) then
+        Continue;
+      for HopI := 0 to High(Hops) do
+        if Hops[HopI].Kind = akRar then
+          raise Exception.Create(L('arch.raronly'));
+      UseHops := Copy(Hops);
+      if Disk = '' then
+        Disk := UseHops[0].FileName;
+      Drops[N] := UseHops[High(UseHops)].ChildEntry;
+      DonePaths[N] := AList[J];
+      Inc(N);
+    end;
+    SetLength(Drops, N);
+    SetLength(DonePaths, N);
+    if N = 0 then
+      Exit;
+    try
+      DropInners(UseHops[High(UseHops)].FileName, UseHops[High(UseHops)].Kind, Drops);
+      WriteHopChain(UseHops);
+    except
+      if Disk <> '' then
+        InvalidateArchive(Disk);
+      raise;
+    end;
+    if Assigned(AOnDeleted) then
+      AOnDeleted(DonePaths);
+  end;
+
+  procedure RunGroups(AGroups: TObjectDictionary<string, TStringList>);
+  var
+    One: TPair<string, TStringList>;
+  begin
+    for One in AGroups do
+    try
+      CommitGroup(One.Value);
+    except
+      on E: EAbort do
+        raise;
+      on E: Exception do
+        if Err = '' then
+          Err := E.Message;
+    end;
+  end;
+
+begin
+  Err := '';
+  Flat := TObjectDictionary<string, TStringList>.Create([doOwnsValues]);
+  Deep := TObjectDictionary<string, TStringList>.Create([doOwnsValues]);
   try
     for P in APaths do
     begin
-      Ref := ResolvePath(P);
-      if (Ref.Physical = '') or (Ref.Inner = '') then
+      if not ResolveDeleteTarget(P, Hops) or (Length(Hops) = 0) then
         Continue;
-      if Ref.Kind = akRar then
-        raise Exception.Create(L('arch.raronly'));
-      Key := CacheKey(Ref.Physical);
-      if not ByArc.TryGetValue(Key, List) then
+      for I := 0 to High(Hops) do
+        if Hops[I].Kind = akRar then
+          raise Exception.Create(L('arch.raronly'));
+      Key := HopGroupKey(Hops);
+      if Length(Hops) = 1 then
+      begin
+        if not Flat.TryGetValue(Key, List) then
+        begin
+          List := TStringList.Create;
+          Flat.Add(Key, List);
+        end;
+      end
+      else if not Deep.TryGetValue(Key, List) then
       begin
         List := TStringList.Create;
-        List.Add(Ref.Physical);
-        ByArc.Add(Key, List);
+        Deep.Add(Key, List);
       end;
-      List.Add(Ref.Inner);
+      List.Add(P);
     end;
-    for Pair in ByArc do
+    { Спочатку вкладений архів, потім його батько: батьківська пересборка
+      не зітре ще не записаний тимчасовий файл. }
+    RunGroups(Deep);
+    RunGroups(Flat);
+  finally
+    Deep.Free;
+    Flat.Free;
+  end;
+  if Err <> '' then
+    raise Exception.Create(Err);
+end;
+
+procedure RenameArchiveEntries(const AOldPaths, ANewNames: TArray<string>;
+  out ANewPaths: TArray<string>);
+var
+  Groups: TObjectDictionary<string, TList<Integer>>;
+  Hops: TArray<TDelHop>;
+  I, N, K: Integer;
+  Key: string;
+  List: TList<Integer>;
+  Pair: TPair<string, TList<Integer>>;
+  Rar: Boolean;
+
+  procedure CommitRenames(AIdx: TList<Integer>);
+  var
+    UseHops: TArray<TDelHop>;
+    FromA, ToA: TArray<string>;
+    MapAt: TArray<Integer>;
+    Items: TArray<TArcItem>;
+    It: TArcItem;
+    Item, J, N, Guard: Integer;
+    OldInner, NewInner, Disk, ArcFile: string;
+    Dropped: Boolean;
+    Kind: TArchiveKind;
+
+    function StillThere(const AInner: string): Boolean;
+    var
+      T: Integer;
     begin
-      if Pair.Value.Count < 2 then
+      if not FindItem(Items, AInner, It) or (It.Path = '') then
+        Exit(False);
+      for T := 0 to N - 1 do
+        if SameText(FromA[T], AInner) then
+          Exit(False);
+      Result := True;
+    end;
+
+    function VirtPath(AItem: Integer): string;
+    begin
+      Result := TPath.Combine(ExtractFilePath(
+        ExcludeTrailingPathDelimiter(AOldPaths[AItem])), ANewNames[AItem]);
+    end;
+
+  begin
+    SetLength(FromA, AIdx.Count);
+    SetLength(ToA, AIdx.Count);
+    SetLength(MapAt, AIdx.Count);
+    N := 0;
+    Disk := '';
+    ArcFile := '';
+    SetLength(UseHops, 0);
+    for J := 0 to AIdx.Count - 1 do
+    begin
+      Item := AIdx[J];
+      if not ResolveDeleteTarget(AOldPaths[Item], Hops) or (Length(Hops) = 0) then
         Continue;
-      Kind := DetectArchiveKind(Pair.Value[0]);
-      SetLength(Drop, Pair.Value.Count - 1);
-      for I := 1 to Pair.Value.Count - 1 do
-        Drop[I - 1] := Pair.Value[I];
-      if Kind = akZip then
-        RebuildZip(Pair.Value[0], Drop, '', '')
-      else if Need7z(Kind) then
+      OldInner := ArcNorm(Hops[High(Hops)].ChildEntry);
+      NewInner := ArcSafeRel(ArcJoin(ArcParent(OldInner), ANewNames[Item]));
+      UseHops := Copy(Hops);
+      if SameStr(OldInner, NewInner) then
       begin
-        for I := 0 to High(Drop) do
-          SevenDelete(Pair.Value[0], Drop[I]);
-      end
-      else
-        raise Exception.Create(Lf('arch.delvia', [ArchiveKindCaption(Kind)]));
+        ANewPaths[Item] := VirtPath(Item);
+        Continue;
+      end;
+      FromA[N] := OldInner;
+      ToA[N] := NewInner;
+      MapAt[N] := Item;
+      Inc(N);
+    end;
+    if (N = 0) or (Length(UseHops) = 0) then
+      Exit;
+    ArcFile := UseHops[High(UseHops)].FileName;
+    Kind := UseHops[High(UseHops)].Kind;
+    Disk := UseHops[0].FileName;
+    if Kind = akRar then
+      raise Exception.Create(L('arch.raronly'));
+    if Kind <> akZip then
+      raise Exception.Create(Lf('arch.renvia', [ArchiveKindCaption(Kind)]));
+    Items := GetItems(ArcFile, Kind);
+    Guard := 0;
+    repeat
+      Dropped := False;
+      J := 0;
+      while J < N do
+      begin
+        if StillThere(ToA[J]) then
+        begin
+          FromA[J] := FromA[N - 1];
+          ToA[J] := ToA[N - 1];
+          MapAt[J] := MapAt[N - 1];
+          Dec(N);
+          Dropped := True;
+        end
+        else
+          Inc(J);
+      end;
+      Inc(Guard);
+    until (not Dropped) or (Guard > AIdx.Count + 1);
+    SetLength(FromA, N);
+    SetLength(ToA, N);
+    SetLength(MapAt, N);
+    if N = 0 then
+      Exit;
+    try
+      RebuildZipCore(ArcFile, [], FromA, ToA);
+      WriteHopChain(UseHops);
+    except
+      if Disk <> '' then
+        InvalidateArchive(Disk);
+      raise;
+    end;
+    for J := 0 to High(MapAt) do
+      ANewPaths[MapAt[J]] := VirtPath(MapAt[J]);
+  end;
+
+begin
+  N := Length(AOldPaths);
+  if Length(ANewNames) < N then
+    N := Length(ANewNames);
+  SetLength(ANewPaths, N);
+  for I := 0 to N - 1 do
+    ANewPaths[I] := '';
+  Groups := TObjectDictionary<string, TList<Integer>>.Create([doOwnsValues]);
+  try
+    for I := 0 to N - 1 do
+    begin
+      if (AOldPaths[I] = '') or (ANewNames[I] = '') then
+        Continue;
+      if not ResolveDeleteTarget(AOldPaths[I], Hops) or (Length(Hops) = 0) then
+        Continue;
+      Rar := False;
+      for K := 0 to High(Hops) do
+        if Hops[K].Kind = akRar then
+          Rar := True;
+      if Rar then
+        raise Exception.Create(L('arch.raronly'));
+      Key := HopGroupKey(Hops);
+      if not Groups.TryGetValue(Key, List) then
+      begin
+        List := TList<Integer>.Create;
+        Groups.Add(Key, List);
+      end;
+      List.Add(I);
+    end;
+    for Pair in Groups do
+    try
+      CommitRenames(Pair.Value);
+    except
+      on EAbort do
+        raise;
+      on Exception do
+        ;
     end;
   finally
-    ByArc.Free;
+    Groups.Free;
   end;
 end;
 
 procedure RenameArchiveEntry(const AOldPath, ANewName: string; out ANewPath: string);
 var
-  Ref: TArcRef;
-  NewInner: string;
+  Olds, News, Paths: TArray<string>;
 begin
   ANewPath := '';
-  Ref := ResolvePath(AOldPath);
-  if (Ref.Physical = '') or (Ref.Inner = '') then
+  SetLength(Olds, 1);
+  SetLength(News, 1);
+  Olds[0] := AOldPath;
+  News[0] := ANewName;
+  RenameArchiveEntries(Olds, News, Paths);
+  if (Length(Paths) = 0) or (Paths[0] = '') then
     raise Exception.Create(L('arch.norename'));
-  NewInner := ArcJoin(ArcParent(Ref.Inner), ANewName);
-  NewInner := ArcSafeRel(NewInner);
-  if Ref.Kind = akZip then
-    RebuildZip(Ref.Physical, [], Ref.Inner, NewInner)
-  else
-    raise Exception.Create(Lf('arch.renvia', [ArchiveKindCaption(Ref.Kind)]));
-  ANewPath := Ref.DiskArchive + '\' + StringReplace(NewInner, '/', '\', [rfReplaceAll]);
+  ANewPath := Paths[0];
 end;
 
 function CreateArchiveFolder(const AParentDir, ABaseName: string): string;
@@ -3269,16 +3822,46 @@ begin
   Result := TFile.Exists(ALocal);
 end;
 
-procedure CopyArchiveEntry(const ASrcPath, ADstDir: string);
+function ExtractArchiveItemToFile(const ASrcPath, ADestFile: string): Boolean;
+var
+  Ref: TArcRef;
+  Items: TArray<TArcItem>;
+  It: TArcItem;
+  Dir: string;
+begin
+  Result := False;
+  if (ASrcPath = '') or (ADestFile = '') then
+    Exit;
+  Dir := ExtractFilePath(ADestFile);
+  if (Dir = '') or ArchiveInvolved('', Dir) then
+    Exit;
+  Ref := ResolvePath(ASrcPath);
+  if (Ref.Physical = '') or (Ref.Kind = akNone) or (Ref.Inner = '') then
+    Exit;
+  Items := GetItems(Ref.Physical, Ref.Kind);
+  if not FindItem(Items, Ref.Inner, It) or It.IsDir then
+    Exit;
+  ForceDirectories(Dir);
+  ExtractOne(Ref.Physical, Ref.Kind, It.Path, ADestFile);
+  if It.Modified > 0 then
+  try
+    TFile.SetLastWriteTime(ADestFile, It.Modified);
+  except
+  end;
+  Result := TFile.Exists(ADestFile) and not TDirectory.Exists(ADestFile);
+end;
+
+function CopyArchiveEntry(const ASrcPath, ADstDir: string): string;
 var
   SrcRef, DstRef: TArcRef;
   SrcZipItem, DstArc: Boolean;
   TargetName, DiskDest, Z, Inner: string;
   Items: TArray<TArcItem>;
   It: TArcItem;
-  SrcFolder: Boolean;
+  SrcFolder, FolderWas: Boolean;
   Local: string;
 begin
+  Result := '';
   TargetName := TPath.GetFileName(ExcludeTrailingPathDelimiter(ASrcPath));
   SrcZipItem := SplitArchivePath(ASrcPath, Z, Inner) and (Inner <> '');
   DstArc := SplitArchivePath(ADstDir, Z, Inner) or
@@ -3304,9 +3887,20 @@ begin
     if not TDirectory.Exists(ADstDir) then
       ForceDirectories(ADstDir);
     if SrcFolder then
-      ExtractPrefixToDisk(SrcRef, TPath.Combine(ADstDir, TargetName))
+    begin
+      DiskDest := TPath.Combine(ADstDir, TargetName);
+      FolderWas := TDirectory.Exists(DiskDest);
+      Local := ExtractPrefixToDisk(SrcRef, DiskDest);
+      if TDirectory.Exists(DiskDest) and ((not FolderWas) or (Local <> '')) then
+        Result := ExcludeTrailingPathDelimiter(DiskDest);
+    end
     else
-      ExtractPrefixToDisk(SrcRef, ADstDir);
+    begin
+      Result := ExtractPrefixToDisk(SrcRef, ADstDir);
+      if (Result <> '') and
+         (not TFile.Exists(Result) or TDirectory.Exists(Result)) then
+        Result := '';
+    end;
     Exit;
   end;
 
